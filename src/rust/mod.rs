@@ -60,7 +60,9 @@ pub fn emit(input: &Input) -> Result<String, String> {
         let Some((module, annotation, value)) = all.get(&name) else {
             return Err(format!("`{}` is referred to and not defined", name));
         };
-        defs.push_str(&cx.def(*module, &name, *annotation, value)?);
+        let def = cx.def(*module, &name, *annotation, value);
+        cx.renames.borrow_mut().clear();
+        defs.push_str(&def?);
         defs.push('\n');
     }
     let types = cx.type_defs()?;
@@ -102,6 +104,15 @@ struct Cx<'a> {
     /// Loops written so far, for their labels: a `break` inside a `match`'s
     /// labeled block must name its loop.
     loops: RefCell<usize>,
+    /// The definition being written: its body's type variables, as its
+    /// signature names them. The checker checks a body against a fresh copy of
+    /// the annotation, so a lambda inside `set_insert : List(a), a -> ..` has
+    /// the copy's variable, not `a`.
+    renames: RefCell<HashMap<u32, Type>>,
+    /// The one use of a variable that hands it over rather than cloning it: `$x`
+    /// in `$x = List.append($x, y)`. The list then has one owner, and is changed
+    /// in place instead of copied, as roc does.
+    moving: RefCell<Option<NodeId>>,
 }
 
 fn sanitize(name: &str) -> String {
@@ -217,6 +228,8 @@ impl<'a> Cx<'a> {
             unions: RefCell::new(BTreeMap::new()),
             wanted: RefCell::new(BTreeSet::new()),
             loops: RefCell::new(0),
+            renames: RefCell::new(HashMap::new()),
+            moving: RefCell::new(None),
         }
     }
 
@@ -253,7 +266,9 @@ impl<'a> Cx<'a> {
     }
 
     fn ty_of(&self, e: &Expr) -> Result<Type, String> {
-        self.types.get(&e.id()).cloned().ok_or_else(|| format!("no type for {}", short(e)))
+        let t = self.types.get(&e.id()).ok_or_else(|| format!("no type for {}", short(e)))?;
+        let renames = self.renames.borrow();
+        Ok(if renames.is_empty() { t.clone() } else { subst(t, &renames) })
     }
 
     // ---- types ----
@@ -485,6 +500,12 @@ impl<'a> Cx<'a> {
         let Some(sig) = annotation.cloned().or_else(|| self.types.get(&value.id()).cloned()) else {
             return Err(format!("`{}` has no type", name));
         };
+        let mut renames = HashMap::new();
+        if let Some(body) = self.types.get(&value.id()) {
+            bind(body, &sig, &mut renames);
+            renames.retain(|v, t| *t != Type::TypeVar(*v));
+        }
+        *self.renames.borrow_mut() = renames;
         match value {
             Expr::Lambda { params, body, .. } => {
                 let Some((ps, result)) = peel(&sig, params.len()) else {
@@ -598,12 +619,7 @@ impl<'a> Cx<'a> {
             },
             Expr::BinOp { left, op, right, .. } => self.binop(left, *op, right, scope)?,
             Expr::Call { func, args, .. } => self.call(func, args, e, scope)?,
-            Expr::If { condition, then_branch, otherwise, .. } => format!(
-                "(if {} {{\n    {}\n}} else {{\n    {}\n}})",
-                self.expr(condition, scope)?,
-                indent(&self.result(then_branch, e, scope)?, 4),
-                indent(&self.result(otherwise, e, scope)?, 4)
-            ),
+            Expr::If { condition, then_branch, otherwise, .. } => self.branching(condition, then_branch, otherwise, &self.ty_of(e).ok(), scope)?,
             Expr::Let { .. } | Expr::VarDecl { .. } | Expr::Assign { .. } => self.block(e, scope)?,
             Expr::While { condition, body, .. } => {
                 let (label, inner) = self.loop_scope(scope);
@@ -664,7 +680,7 @@ impl<'a> Cx<'a> {
                 out.push_str(" __t }");
                 out
             }
-            Expr::Match { scrutinee, arms, .. } => self.matching(scrutinee, arms, e, scope)?,
+            Expr::Match { scrutinee, arms, .. } => self.matching(scrutinee, arms, &self.ty_of(e).ok(), scope)?,
             Expr::List(items, _) => {
                 let xs: Result<Vec<String>, String> = items.iter().map(|i| self.expr(i, scope)).collect();
                 format!("List::of(vec![{}])", xs?.join(", "))
@@ -740,28 +756,12 @@ impl<'a> Cx<'a> {
 
     fn read_local(&self, n: &str, e: &Expr) -> Result<String, String> {
         let t = self.ty_of(e)?;
-        Ok(if copy_type(&t) { sanitize(n) } else { format!("{}.clone()", sanitize(n)) })
+        let moved = *self.moving.borrow() == Some(e.id());
+        Ok(if copy_type(&t) || moved { sanitize(n) } else { format!("{}.clone()", sanitize(n)) })
     }
 
     fn int_lit(&self, n: i128, e: &Expr) -> String {
-        let suffix = match self.types.get(&e.id()) {
-            Some(Type::U8) => "u8",
-            Some(Type::U16) => "u16",
-            Some(Type::U32) => "u32",
-            Some(Type::U64) => "u64",
-            Some(Type::U128) => "u128",
-            Some(Type::I8) => "i8",
-            Some(Type::I16) => "i16",
-            Some(Type::I32) => "i32",
-            Some(Type::I128) => "i128",
-            Some(Type::F64) => return format!("{}f64", n),
-            // A whole-number literal the checker left as a fraction: unsuffixed,
-            // for rustc to type from where it goes (an I64 field it lost track of).
-            Some(Type::Dec) => return if n < 0 { format!("({})", n) } else { n.to_string() },
-            Some(Type::F32) => return format!("{}f32", n),
-            _ => "i64",
-        };
-        if n < 0 { format!("({}{})", n, suffix) } else { format!("{}{}", n, suffix) }
+        self.int_for(n, &self.ty_of(e).unwrap_or(Type::I64))
     }
 
     /// A statement chain: `let`s, `var`s and assignments, as a Rust block.
@@ -772,7 +772,12 @@ impl<'a> Cx<'a> {
         loop {
             match cursor {
                 Expr::Let { name, value, body, .. } => {
-                    let v = self.expr(value, &scope)?;
+                    let at_use = self.at_use(name, value, body, &scope)?;
+                    let saved = self.renames.borrow().clone();
+                    self.renames.borrow_mut().extend(at_use);
+                    let v = self.expr(value, &scope);
+                    *self.renames.borrow_mut() = saved;
+                    let v = v?;
                     if *name == "_" {
                         out.push_str(&format!("    let _ = {};\n", indent(&v, 4)));
                     } else {
@@ -788,7 +793,10 @@ impl<'a> Cx<'a> {
                     cursor = body;
                 }
                 Expr::Assign { name, value, body, .. } => {
-                    let v = self.expr(value, &scope)?;
+                    *self.moving.borrow_mut() = self_update(name, value);
+                    let v = self.expr(value, &scope);
+                    *self.moving.borrow_mut() = None;
+                    let v = v?;
                     out.push_str(&format!("    {} = {};\n", sanitize(name), indent(&v, 4)));
                     cursor = body;
                 }
@@ -798,6 +806,41 @@ impl<'a> Cx<'a> {
                 }
             }
         }
+    }
+
+    /// A local function's type variables, as its uses bind them. Roc generalizes
+    /// `ascending = |xs| List.sort_with(xs, ..)` over its element; a Rust closure
+    /// has one type, which is the one it is used at. Used at two, it is refused.
+    fn at_use(&self, name: &str, value: &Expr, body: &Expr, scope: &Scope) -> Result<HashMap<u32, Type>, String> {
+        let mut out = HashMap::new();
+        if !matches!(value, Expr::Lambda { .. }) {
+            return Ok(out);
+        }
+        let t = self.ty_of(value)?;
+        let mut free = Vec::new();
+        vars_of(&t, &mut free);
+        free.retain(|v| !scope.generics.contains(v));
+        if free.is_empty() {
+            return Ok(out);
+        }
+        let mut uses = Vec::new();
+        each_ident(body, &mut |n, node| if n == name { uses.push(self.ty_of(node)) });
+        for used in uses {
+            let mut bound = HashMap::new();
+            bind(&t, &used?, &mut bound);
+            for v in &free {
+                let Some(b) = bound.remove(v) else { continue };
+                match out.get(v) {
+                    Some(earlier) if *earlier != b => {
+                        return Err(format!("the local function `{}` is used at two types, {} and {}; a Rust closure has one", name, earlier, b));
+                    }
+                    _ => {
+                        out.insert(*v, b);
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn binop(&self, l: &Expr, op: BinOp, r: &Expr, scope: &Scope) -> Result<String, String> {
@@ -1009,19 +1052,33 @@ impl<'a> Cx<'a> {
         Ok(format!("{} {{ {} }}", rust, parts.join(", ")))
     }
 
+    fn branching(&self, condition: &Expr, then_branch: &Expr, otherwise: &Expr, whole: &Option<Type>, scope: &Scope) -> Result<String, String> {
+        Ok(format!(
+            "(if {} {{\n    {}\n}} else {{\n    {}\n}})",
+            self.expr(condition, scope)?,
+            indent(&self.result(then_branch, whole, scope)?, 4),
+            indent(&self.result(otherwise, whole, scope)?, 4)
+        ))
+    }
+
     /// An arm's or a branch's value. A lone tag there (`Solo =>` beside
-    /// `Anytime => Partner(p)`) knows only itself, an open `[Solo, ..]`; it is a
-    /// value of the whole `match` or `if`, whose type holds every arm's tags.
-    fn result(&self, body: &Expr, whole: &Expr, scope: &Scope) -> Result<String, String> {
-        if let Expr::Tag { name, args, .. } = body {
-            if let (Type::TagUnion { open: true, .. }, Ok(w @ Type::TagUnion { .. })) = (self.ty_of(body)?, self.ty_of(whole)) {
-                let Type::TagUnion { tags, .. } = &w else { unreachable!("matched") };
-                if tags.iter().any(|(n, _)| n == name) {
-                    return self.tag_typed(name, args, &w, scope);
+    /// `Anytime => Partner(p)`) knows only itself, an open `[Solo, ..]`, and a
+    /// nested `if` or `match` knows only its own tags; each is a value of the
+    /// whole `match` or `if`, whose type holds every arm's tags.
+    fn result(&self, body: &Expr, whole: &Option<Type>, scope: &Scope) -> Result<String, String> {
+        match body {
+            Expr::Tag { name, args, .. } => {
+                if let (Type::TagUnion { open: true, .. }, Some(w @ Type::TagUnion { tags, .. })) = (self.ty_of(body)?, whole) {
+                    if tags.iter().any(|(n, _)| n == name) {
+                        return self.tag_typed(name, args, w, scope);
+                    }
                 }
+                self.expr(body, scope)
             }
+            Expr::If { condition, then_branch, otherwise, .. } => self.branching(condition, then_branch, otherwise, whole, scope),
+            Expr::Match { scrutinee, arms, .. } => self.matching(scrutinee, arms, whole, scope),
+            _ => self.expr(body, scope),
         }
-        self.expr(body, scope)
     }
 
     fn tag(&self, name: &str, args: &[Expr], e: &Expr, scope: &Scope) -> Result<String, String> {
@@ -1104,7 +1161,7 @@ impl<'a> Cx<'a> {
 
     // ---- matching ----
 
-    fn matching(&self, scrutinee: &Expr, arms: &[MatchArm], e: &Expr, scope: &Scope) -> Result<String, String> {
+    fn matching(&self, scrutinee: &Expr, arms: &[MatchArm], whole: &Option<Type>, scope: &Scope) -> Result<String, String> {
         let st = self.ty_of(scrutinee)?;
         let mut out = format!("{{ let __s = {}; 'm: {{\n", self.expr(scrutinee, scope)?);
         for arm in arms {
@@ -1114,7 +1171,7 @@ impl<'a> Cx<'a> {
                 let tail = {
                     let mut probe = inner.clone();
                     self.pat_names(p, &mut probe.locals);
-                    let body = self.result(&arm.body, e, &probe)?;
+                    let body = self.result(&arm.body, whole, &probe)?;
                     match &arm.guard {
                         Some(g) => format!("if {} {{ break 'm ({}); }}", self.expr(g, &probe)?, body),
                         None => format!("break 'm ({});", body),
@@ -1259,15 +1316,21 @@ impl<'a> Cx<'a> {
         })
     }
 
+    /// A whole-number literal of type `t`; a fraction (`Dec`) is written as the
+    /// `f64` its type is.
     fn int_for(&self, n: i128, t: &Type) -> String {
         let suffix = match t {
-            Type::F64 => "f64",
-            Type::Dec => "",
             Type::U8 => "u8",
             Type::U16 => "u16",
             Type::U32 => "u32",
             Type::U64 => "u64",
+            Type::U128 => "u128",
+            Type::I8 => "i8",
+            Type::I16 => "i16",
             Type::I32 => "i32",
+            Type::I128 => "i128",
+            Type::F64 | Type::Dec => "f64",
+            Type::F32 => "f32",
             _ => "i64",
         };
         if n < 0 { format!("({}{})", n, suffix) } else { format!("{}{}", n, suffix) }
@@ -1400,55 +1463,80 @@ fn peel_all(t: &Type) -> Option<(Vec<Type>, Type)> {
 }
 
 /// Every bare name an expression reads, for a closure's captures.
+/// In `$x = f($x, ..)`, the `$x` passed on, when it is the value's only use of
+/// `$x`: the assignment replaces it, so nothing reads the old one again.
+fn self_update(name: &str, value: &Expr) -> Option<NodeId> {
+    let first = match value {
+        Expr::Call { args, .. } => args.first()?,
+        Expr::Dispatch { receiver, .. } => &**receiver,
+        _ => return None,
+    };
+    let Expr::Ident(n, id) = first else { return None };
+    let mut uses = 0;
+    each_ident(value, &mut |m, _| uses += (m == name) as usize);
+    (*n == name && uses == 1).then_some(*id)
+}
+
+/// The names a body refers to.
 fn names_in(e: &Expr, out: &mut BTreeSet<String>) {
+    each_ident(e, &mut |n, _| {
+        out.insert(n.to_string());
+    })
+}
+
+/// Every identifier in an expression, with its node.
+fn each_ident(e: &Expr, f: &mut dyn FnMut(&str, &Expr)) {
     match e {
-        Expr::Ident(n, _) => {
-            out.insert(n.to_string());
-        }
+        Expr::Ident(n, _) => f(n, e),
         Expr::BinOp { left, right, .. } => {
-            names_in(left, out);
-            names_in(right, out)
+            each_ident(left, f);
+            each_ident(right, f)
         }
         Expr::Call { func, args, .. } => {
-            names_in(func, out);
-            args.iter().for_each(|a| names_in(a, out))
+            each_ident(func, f);
+            args.iter().for_each(|a| each_ident(a, f))
         }
-        Expr::Lambda { body, .. } => names_in(body, out),
+        Expr::Lambda { body, .. } => each_ident(body, f),
         Expr::Let { value, body, .. } | Expr::VarDecl { value, body, .. } | Expr::Assign { value, body, .. } => {
-            names_in(value, out);
-            names_in(body, out)
+            each_ident(value, f);
+            each_ident(body, f)
         }
         Expr::If { condition, then_branch, otherwise, .. } => {
-            names_in(condition, out);
-            names_in(then_branch, out);
-            names_in(otherwise, out)
+            each_ident(condition, f);
+            each_ident(then_branch, f);
+            each_ident(otherwise, f)
         }
         Expr::Match { scrutinee, arms, .. } => {
-            names_in(scrutinee, out);
+            each_ident(scrutinee, f);
             for a in arms {
-                names_in(&a.body, out);
+                each_ident(&a.body, f);
                 if let Some(g) = &a.guard {
-                    names_in(g, out)
+                    each_ident(g, f)
                 }
             }
         }
-        Expr::List(xs, _) | Expr::Tuple(xs, _) => xs.iter().for_each(|x| names_in(x, out)),
-        Expr::Record(fs, _) => fs.iter().for_each(|(_, x)| names_in(x, out)),
+        Expr::List(xs, _) | Expr::Tuple(xs, _) => xs.iter().for_each(|x| each_ident(x, f)),
+        Expr::Record(fs, _) => fs.iter().for_each(|(_, x)| each_ident(x, f)),
         Expr::RecordUpdate { base, fields, .. } => {
-            names_in(base, out);
-            fields.iter().for_each(|(_, x)| names_in(x, out))
+            each_ident(base, f);
+            fields.iter().for_each(|(_, x)| each_ident(x, f))
         }
-        Expr::FieldAccess { record, .. } => names_in(record, out),
-        Expr::TupleIndex { tuple, .. } => names_in(tuple, out),
-        Expr::Tag { args, .. } => args.iter().for_each(|x| names_in(x, out)),
-        Expr::Crash(x, _) | Expr::Return(x, _) | Expr::Dbg(x, _) | Expr::Expect(x, _) => names_in(x, out),
+        Expr::FieldAccess { record, .. } => each_ident(record, f),
+        Expr::TupleIndex { tuple, .. } => each_ident(tuple, f),
+        Expr::Tag { args, .. } => args.iter().for_each(|x| each_ident(x, f)),
+        Expr::Crash(x, _) | Expr::Return(x, _) | Expr::Dbg(x, _) | Expr::Expect(x, _) => each_ident(x, f),
         Expr::Dispatch { receiver, args, .. } => {
-            names_in(receiver, out);
-            args.iter().for_each(|x| names_in(x, out))
+            each_ident(receiver, f);
+            args.iter().for_each(|x| each_ident(x, f))
         }
+        Expr::For { iterable, body, .. } => {
+            each_ident(iterable, f);
+            each_ident(body, f)
+        }
+        Expr::StrInterp(parts, _) => parts.iter().for_each(|p| if let StrPart::Expr(x) = p { each_ident(x, f) }),
         Expr::While { condition, body, .. } => {
-            names_in(condition, out);
-            names_in(body, out)
+            each_ident(condition, f);
+            each_ident(body, f)
         }
         _ => {}
     }
