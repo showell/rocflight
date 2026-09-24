@@ -538,7 +538,15 @@ impl<'a> Cx<'a> {
                 scope.generics = vars;
                 let t = self.ty(&sig)?;
                 let body = self.expr(value, &scope)?;
-                Ok(format!("pub fn {}{}() -> {} {{\n    {}\n}}\n", rust, generics, t, indent(&body, 4)))
+                if !generics.is_empty() {
+                    return Ok(format!("pub fn {}{}() -> {} {{\n    {}\n}}\n", rust, generics, t, indent(&body, 4)));
+                }
+                // A constant is computed once, as roc does: `Routes.forward`, a table of
+                // every walk, was rebuilt at each lookup.
+                Ok(format!(
+                    "pub fn {}() -> {} {{\n    thread_local! {{ static ONCE: std::cell::OnceCell<{}> = std::cell::OnceCell::new(); }}\n    ONCE.with(|once| once.get_or_init(|| {}).clone())\n}}\n",
+                    rust, t, t, indent(&body, 4)
+                ))
             }
         }
     }
