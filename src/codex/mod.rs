@@ -1013,17 +1013,15 @@ fn body_text(s: &str) -> String {
     if s.contains('\n') { format!("\n    {}", indent(s, 4)) } else { format!(" {}", s) }
 }
 
-/// A real as a Codex literal that reads back as the same double: the shortest
-/// decimal, and a whole number as its digits and `.0` rather than an exponent.
+/// A real as a Codex literal that reads back as the same double: Rust's `Display`
+/// writes the shortest such decimal and never an exponent, which Codex writes
+/// the same way (`sq-tol = 0.000000001`); a whole number gets its `.0`.
 fn real_literal(f: f64) -> Option<String> {
     if !f.is_finite() {
         return None;
     }
-    let text = format!("{:?}", f);
-    if !text.contains('e') {
-        return Some(text);
-    }
-    (f.fract() == 0.0 && f.abs() < 1e18).then(|| format!("{}.0", f as i128))
+    let text = f.to_string();
+    Some(if text.contains('.') { text } else { format!("{}.0", text) })
 }
 
 fn indent(s: &str, n: usize) -> String {
