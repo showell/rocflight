@@ -295,6 +295,9 @@ impl<'a> Cx<'a> {
                 }
                 format!("{}<{}>", record_name(&names), args.join(", "))
             }
+            Type::TagUnion { tags, open: true } if self.declared_union(tags).is_some() => {
+                return self.ty(&self.declared_union(tags).expect("guarded"));
+            }
             Type::TagUnion { tags, .. } => {
                 let names: Vec<String> = sorted_names(tags.iter().map(|(n, _)| *n));
                 if names == ["Err", "Ok"] {
@@ -332,6 +335,33 @@ impl<'a> Cx<'a> {
                 }
             }
             other => return Err(format!("the type {}", other)),
+        })
+    }
+
+    /// An open union (`[MBReady, ..]`, a lone tag's type) as the one declared
+    /// structural union holding all its tags, with the declaration's other tags:
+    /// a Rust enum is its whole set of tags.
+    fn declared_union(&self, tags: &[(&'static str, Vec<Type>)]) -> Option<Type> {
+        let mut found = self
+            .input
+            .modules
+            .iter()
+            .flat_map(|m| m.types.iter())
+            .chain(self.input.app_types.iter())
+            .filter_map(|(_, t)| match t {
+                Type::TagUnion { tags: d, .. } if tags.iter().all(|(n, _)| d.iter().any(|(m, _)| m == n)) && d.len() > tags.len() => Some(t.clone()),
+                _ => None,
+            });
+        let decl = found.next()?;
+        if found.any(|other| sorted_names(tag_names(&other).into_iter()) != sorted_names(tag_names(&decl).into_iter())) {
+            return None;
+        }
+        let mut bound = HashMap::new();
+        bind(&decl, &Type::TagUnion { tags: tags.to_vec(), open: true }, &mut bound);
+        let decl = subst(&decl, &bound);
+        Some(match decl {
+            Type::TagUnion { tags, .. } => Type::TagUnion { tags, open: false },
+            other => other,
         })
     }
 
@@ -452,11 +482,17 @@ impl<'a> Cx<'a> {
                 };
                 let mut vars = Vec::new();
                 vars_of(&sig, &mut vars);
+                // `main!`'s arguments are the platform's strings, whatever the
+                // checker left their type as, so it has no type parameters.
+                if name == "main!" {
+                    vars.clear();
+                }
                 let generics = generic_list(&vars);
                 scope.generics = vars;
                 let mut args = Vec::new();
                 for (p, t) in params.iter().zip(&ps) {
-                    args.push(format!("{}: {}", sanitize(p), self.ty(t)?));
+                    let t = if name == "main!" { "List<String>".to_string() } else { self.ty(t)? };
+                    args.push(format!("{}: {}", sanitize(p), t));
                     scope.locals.push(p.to_string());
                 }
                 // `|_args|` on `main!` is the platform's; it is unused here.
@@ -620,7 +656,10 @@ impl<'a> Cx<'a> {
             Some(Type::I16) => "i16",
             Some(Type::I32) => "i32",
             Some(Type::I128) => "i128",
-            Some(Type::F64) | Some(Type::Dec) => return format!("{}f64", n),
+            Some(Type::F64) => return format!("{}f64", n),
+            // A whole-number literal the checker left as a fraction: unsuffixed,
+            // for rustc to type from where it goes (an I64 field it lost track of).
+            Some(Type::Dec) => return if n < 0 { format!("({})", n) } else { n.to_string() },
             Some(Type::F32) => return format!("{}f32", n),
             _ => "i64",
         };
@@ -745,6 +784,12 @@ impl<'a> Cx<'a> {
         let mut args = Vec::new();
         for v in &vars {
             let t = bound.get(v).cloned().unwrap_or(Type::Unit);
+            // A numeral the checker defaulted to a fraction: rustc types it with
+            // the unsuffixed literal it is written as.
+            if matches!(t, Type::Dec) {
+                args.push("_".into());
+                continue;
+            }
             let mut free = Vec::new();
             vars_of(&t, &mut free);
             // In a function with no type parameters a leftover variable is
@@ -1068,6 +1113,8 @@ impl<'a> Cx<'a> {
 
     fn int_for(&self, n: i128, t: &Type) -> String {
         let suffix = match t {
+            Type::F64 => "f64",
+            Type::Dec => "",
             Type::U8 => "u8",
             Type::U16 => "u16",
             Type::U32 => "u32",
@@ -1118,6 +1165,13 @@ fn sorted_names<'x>(names: impl Iterator<Item = &'x str>) -> Vec<String> {
     let mut v: Vec<String> = names.map(|s| s.to_string()).collect();
     v.sort();
     v
+}
+
+fn tag_names(t: &Type) -> Vec<&'static str> {
+    match t {
+        Type::TagUnion { tags, .. } => tags.iter().map(|(n, _)| *n).collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn record_name(names: &[String]) -> String {
