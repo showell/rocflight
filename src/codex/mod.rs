@@ -574,6 +574,15 @@ impl Cx<'_> {
                 }
                 out
             }
+            // rocemit's clamp for a bounded integer: `{ val: e }.val` is `e`, when
+            // no declared record has that one field.
+            Expr::FieldAccess { record, field, .. }
+                if matches!(&**record, Expr::Record(fs, _) if fs.len() == 1 && fs[0].0 == *field)
+                    && self.record_name(&[(*field, Type::I64)]).is_none() =>
+            {
+                let Expr::Record(fs, _) = &**record else { unreachable!() };
+                self.expr(&fs[0].1)?
+            }
             Expr::FieldAccess { record, field, .. } => format!("{}.{}", paren(self.expr(record)?), kebab(field)),
             Expr::Tag { name, args, .. } => {
                 let mut out = name.to_string();
@@ -625,6 +634,8 @@ impl Cx<'_> {
             for p in &arm.patterns {
                 let pat = match p {
                     Pattern::Int(n) if on_char => self.char_literal(*n).ok_or_else(|| format!("a Char pattern {} with no printable literal", n))?,
+                    // A whole arm's wildcard; inside a constructor it is `_`.
+                    Pattern::Wildcard => "otherwise".into(),
                     other => self.pattern(other, scrutinee)?,
                 };
                 out.push_str(&format!("\n  is {} -> {}", pat, indent(&self.expr(&arm.body)?, 4)));
@@ -635,8 +646,15 @@ impl Cx<'_> {
 
     fn pattern(&self, p: &Pattern, scrutinee: &Expr) -> Result<String, String> {
         Ok(match p {
-            Pattern::Wildcard => "otherwise".into(),
+            Pattern::Wildcard => "_".into(),
             Pattern::Binding(n) => kebab(n),
+            // A Codex list is matched with its constructors: `Nil`, `Cons (h) (t)`.
+            Pattern::List { before, rest: None, after } if before.is_empty() && after.is_empty() => "Nil".into(),
+            Pattern::List { before, rest: Some(tail), after } if before.len() == 1 && after.is_empty() => format!(
+                "Cons ({}) ({})",
+                self.pattern(&before[0], scrutinee)?,
+                tail.map(kebab).unwrap_or_else(|| "_".into())
+            ),
             Pattern::Int(n) if matches!(self.ty_of(scrutinee), Some(Type::Nominal { name, .. }) if bare(name) == CHAR_MODULE) => {
                 self.char_literal(*n).ok_or_else(|| format!("a Char pattern {} with no printable literal", n))?
             }
