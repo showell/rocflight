@@ -5095,8 +5095,10 @@ impl Parser {
 
         // Parse body. A `{ ... }` block is a primary expression; anything else
         // falls through to the normal expression parser — as a block of one
-        // statement, so a `?` in it has somewhere to return from.
-        let mut body = if self.input[self.pos..].starts_with('{') {
+        // statement, so a `?` in it has somewhere to return from. A RECORD is not a
+        // block: `|b| { val: b.val + 1 }.val` reads the field inside the lambda, so
+        // it takes the normal path, where postfix and operators apply to it.
+        let mut body = if self.input[self.pos..].starts_with('{') && !self.looks_like_record(false) {
             self.parse_braced()?
         } else {
             let tries_before = self.pending_tries.len();
