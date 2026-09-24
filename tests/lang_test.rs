@@ -1779,3 +1779,18 @@ fn a_package_on_disk_is_imported_through_its_alias() {
     );
     assert_eq!(out, "Ok(\"hi\")");
 }
+
+#[test]
+fn a_module_type_named_like_its_module_is_the_type_elsewhere() {
+    // `Maybe.Maybe(Str)` in another module is the tag union, not the empty namespace
+    // `Maybe :: []` that shares its last segment.
+    let out = run_files(
+        "rocflight_module_same_name",
+        &[
+            ("Maybe.roc", "Maybe :: [].{\n\tMaybe(a) : [Just(a), None]\n\n\twith_default : Maybe.Maybe(a), a -> a\n\twith_default = |m, d| match m {\n\t\tJust(x) => x\n\t\tNone => d\n\t}\n}\n"),
+            ("Find.roc", "import Maybe\n\nFind :: [].{\n\tfirst : List(Str) -> Maybe.Maybe(Str)\n\tfirst = |xs| match List.first(xs) {\n\t\tOk(x) => Just(x)\n\t\tErr(_) => None\n\t}\n}\n"),
+            ("main.roc", "app [main!] {}\n\nimport Maybe\nimport Find\n\nmain! = |_args| Ok(Maybe.with_default(Find.first([\"given\"]), \"fallback\"))\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(\"given\")");
+}
