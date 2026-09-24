@@ -1,0 +1,1124 @@
+//! **Roc to Rust.** A checked Roc program, written out as one Rust file: every
+//! module's definitions at the top level (`Module__name`), its types, and a
+//! `main` that runs `main!` on a thread with a deep stack.
+//!
+//! Every Roc module is translated, rocemit's runtime modules (`CceText`,
+//! `CceChar`, `Prelude`) included; what is written by hand is only Roc's own
+//! builtins (`List.*`, `Str.*`, `I64.*`, ...), in `runtime.rs`, which heads every
+//! program.
+//!
+//! **Types.** A structural record or tag union (`{ p : I64 }`, `[Just(a), None]`)
+//! is the same Roc type wherever it is written, alias or not, so it is one Rust
+//! struct or enum per set of field or tag names, generic over every field or
+//! payload (`Rec_p<T0>`, `Tags_Just_None<T0>`). `[Ok(a), Err(e)]` is `Result`. A
+//! nominal (`:=`) is a named type; only a nominal can be recursive, so a field
+//! holding one is an `Rc`. A nominal over a list or a scalar (`CceText ::
+//! List(U8)`) is a type alias: Roc erases it at run time, and so does this.
+//!
+//! **Values.** Every non-copy value is cloned where it is read; a `List` is an
+//! `Rc` that copies on write, so a clone is a count. A closure is an
+//! `Rc<dyn Fn(..)>` with its captures cloned in. A `match` is a labeled block of
+//! nested `if let`s, one per arm, which takes nested patterns, guards and
+//! literals alike.
+//!
+//! What it does not know how to write it refuses, naming the form.
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use crate::ast::{BinOp, Expr, MatchArm, NodeId, Pattern};
+use crate::codex::Input;
+use crate::types::Type;
+
+const RUNTIME: &str = include_str!("runtime.rs");
+
+/// Roc's own modules, which `runtime.rs` answers.
+const BUILTIN_MODULES: [&str; 12] = ["List", "Str", "I64", "U64", "U8", "I32", "U32", "U16", "F64", "Num", "Bool", "Dict"];
+
+pub fn emit(input: &Input) -> Result<String, String> {
+    let mut cx = Cx::new(input);
+    cx.collect();
+    // Only what `main!` reaches: writing a definition records every top-level
+    // name it refers to, and those are written next, until nothing new appears.
+    let mut all: HashMap<String, (Option<&str>, Option<&Type>, &Expr)> = HashMap::new();
+    for (module, ast) in input.modules.iter().map(|m| (Some(m.name.as_str()), m.ast)).chain(std::iter::once((None, input.app))) {
+        let mut cursor = ast;
+        while let Expr::Let { name, annotation, value, body, .. } = cursor {
+            if *name != "_" {
+                all.insert(name.to_string(), (module, annotation.as_ref(), &**value));
+            }
+            cursor = body;
+        }
+    }
+    cx.wanted.borrow_mut().insert("main!".to_string());
+    let mut done: BTreeSet<String> = BTreeSet::new();
+    let mut defs = String::new();
+    loop {
+        let next = cx.wanted.borrow().iter().find(|n| !done.contains(*n)).cloned();
+        let Some(name) = next else { break };
+        done.insert(name.clone());
+        let Some((module, annotation, value)) = all.get(&name) else {
+            return Err(format!("`{}` is referred to and not defined", name));
+        };
+        defs.push_str(&cx.def(*module, &name, *annotation, value)?);
+        defs.push('\n');
+    }
+    let types = cx.type_defs()?;
+    let mut out = String::new();
+    out.push_str(RUNTIME);
+    out.push_str("\n// ---- the program's types ----\n\n");
+    out.push_str(&types);
+    out.push_str("\n// ---- the program ----\n\n");
+    out.push_str(&defs);
+    out.push_str(
+        "fn main() {\n    let t = std::thread::Builder::new().stack_size(1 << 30).spawn(|| { main__e(List::<String>::of(vec![])); }).unwrap();\n    if t.join().is_err() { std::process::exit(1); }\n}\n",
+    );
+    Ok(out)
+}
+
+/// A declared nominal: its Rust name, its type parameters in order, and what it is
+/// built over.
+#[derive(Clone)]
+struct Nominal {
+    rust: String,
+    params: Vec<u32>,
+    backing: Type,
+}
+
+struct Cx<'a> {
+    input: &'a Input<'a>,
+    types: &'a HashMap<NodeId, Type>,
+    /// Every top-level definition by its Roc name (`CceText.len`, `main!`), and
+    /// whether it is a function (a lambda) or a value (a thunk here).
+    tops: HashMap<String, bool>,
+    /// The nominals, by their bare Roc name.
+    nominals: HashMap<String, Nominal>,
+    /// Structural records and unions met, by their sorted field or tag names:
+    /// each is one generic Rust type.
+    records: RefCell<BTreeSet<Vec<String>>>,
+    unions: RefCell<BTreeMap<Vec<String>, Vec<usize>>>,
+    /// The top-level definitions referred to so far; see `emit`.
+    wanted: RefCell<BTreeSet<String>>,
+}
+
+fn sanitize(name: &str) -> String {
+    let base = name.trim_end_matches('!');
+    let bang = name.ends_with('!');
+    let s = base.replace('.', "__");
+    let s = match s.as_str() {
+        "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" | "false" | "fn" | "for" | "if" | "impl" | "in"
+        | "let" | "loop" | "match" | "mod" | "move" | "mut" | "pub" | "ref" | "return" | "self" | "Self" | "static" | "struct"
+        | "super" | "trait" | "true" | "type" | "unsafe" | "use" | "where" | "while" | "async" | "await" | "dyn" | "abstract"
+        | "become" | "box" | "do" | "final" | "macro" | "override" | "priv" | "typeof" | "unsized" | "virtual" | "yield" | "try"
+        | "gen" | "main" => format!("{}_", s),
+        _ => s,
+    };
+    if bang { format!("{}_e", s) } else { s }
+}
+
+fn bare(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
+/// The type variables of a type, in the order they first appear.
+fn vars_of(t: &Type, out: &mut Vec<u32>) {
+    match t {
+        // The parser's stand-in for a name declared elsewhere: not a variable.
+        Type::TypeVar(u32::MAX) => {}
+        Type::TypeVar(v) => {
+            if !out.contains(v) {
+                out.push(*v)
+            }
+        }
+        Type::List(e) | Type::Optional(e) | Type::Range(e) => vars_of(e, out),
+        Type::Function(a, b) => {
+            vars_of(a, out);
+            vars_of(b, out)
+        }
+        Type::Tuple(xs) => xs.iter().for_each(|x| vars_of(x, out)),
+        Type::Record { fields, .. } => fields.iter().for_each(|(_, x)| vars_of(x, out)),
+        Type::TagUnion { tags, .. } => tags.iter().flat_map(|(_, p)| p).for_each(|x| vars_of(x, out)),
+        Type::Nominal { backing, .. } if !matches!(**backing, Type::TypeVar(_)) => vars_of(backing, out),
+        _ => {}
+    }
+}
+
+/// Bind a declaration's variables by walking it beside a use of it.
+fn bind(decl: &Type, used: &Type, out: &mut HashMap<u32, Type>) {
+    match (decl, used) {
+        (Type::TypeVar(v), t) => {
+            out.entry(*v).or_insert_with(|| t.clone());
+        }
+        (Type::List(a), Type::List(b)) => bind(a, b, out),
+        (Type::Function(a1, b1), Type::Function(a2, b2)) => {
+            bind(a1, a2, out);
+            bind(b1, b2, out)
+        }
+        (Type::Tuple(xs), Type::Tuple(ys)) => xs.iter().zip(ys).for_each(|(x, y)| bind(x, y, out)),
+        (Type::Record { fields: f1, .. }, Type::Record { fields: f2, .. }) => {
+            for (n, x) in f1 {
+                if let Some((_, y)) = f2.iter().find(|(m, _)| m == n) {
+                    bind(x, y, out)
+                }
+            }
+        }
+        (Type::TagUnion { tags: t1, .. }, Type::TagUnion { tags: t2, .. }) => {
+            for (n, p1) in t1 {
+                if let Some((_, p2)) = t2.iter().find(|(m, _)| m == n) {
+                    p1.iter().zip(p2).for_each(|(x, y)| bind(x, y, out))
+                }
+            }
+        }
+        (Type::Nominal { backing: b1, .. }, Type::Nominal { backing: b2, .. }) => bind(b1, b2, out),
+        _ => {}
+    }
+}
+
+fn copy_type(t: &Type) -> bool {
+    matches!(
+        t,
+        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128 | Type::F32 | Type::F64 | Type::Bool | Type::Unit
+    )
+}
+
+/// The scope a body is written in: the locals, and the owner its bare names are
+/// looked up under first.
+#[derive(Clone)]
+struct Scope {
+    locals: Vec<String>,
+    owner: String,
+    module: Option<String>,
+}
+
+impl Scope {
+    fn local(&self, n: &str) -> bool {
+        self.locals.iter().any(|l| l == n)
+    }
+}
+
+impl<'a> Cx<'a> {
+    fn new(input: &'a Input<'a>) -> Cx<'a> {
+        Cx {
+            input,
+            types: &input.types,
+            tops: HashMap::new(),
+            nominals: HashMap::new(),
+            records: RefCell::new(BTreeSet::new()),
+            unions: RefCell::new(BTreeMap::new()),
+            wanted: RefCell::new(BTreeSet::new()),
+        }
+    }
+
+    fn collect(&mut self) {
+        let params: HashMap<&str, &Vec<u32>> = self.input.nominal_params.iter().map(|(n, p)| (n.as_str(), p)).collect();
+        for (name, ty) in self.input.modules.iter().flat_map(|m| m.types.iter()).chain(self.input.app_types.iter()) {
+            if let Type::Nominal { backing, .. } = ty {
+                if matches!(**backing, Type::TypeVar(_)) {
+                    continue;
+                }
+                let b = bare(name).to_string();
+                let ps = match params.get(*name).or_else(|| params.get(b.as_str())) {
+                    Some(p) => (*p).clone(),
+                    None => {
+                        let mut v = Vec::new();
+                        vars_of(backing, &mut v);
+                        v
+                    }
+                };
+                self.nominals.insert(b.clone(), Nominal { rust: b.trim_end_matches('_').to_string() + "_T", params: ps, backing: (**backing).clone() });
+            }
+        }
+        for ast in self.input.modules.iter().map(|m| m.ast).chain(std::iter::once(self.input.app)) {
+            let mut cursor = ast;
+            while let Expr::Let { name, value, body, .. } = cursor {
+                if *name != "_" {
+                    self.tops.insert(name.to_string(), matches!(**value, Expr::Lambda { .. }));
+                }
+                cursor = body;
+            }
+        }
+    }
+
+    fn ty_of(&self, e: &Expr) -> Result<Type, String> {
+        self.types.get(&e.id()).cloned().ok_or_else(|| format!("no type for {}", short(e)))
+    }
+
+    // ---- types ----
+
+    fn ty(&self, t: &Type) -> Result<String, String> {
+        Ok(match t {
+            Type::I8 => "i8".into(),
+            Type::I16 => "i16".into(),
+            Type::I32 => "i32".into(),
+            Type::I64 => "i64".into(),
+            Type::I128 => "i128".into(),
+            Type::U8 => "u8".into(),
+            Type::U16 => "u16".into(),
+            Type::U32 => "u32".into(),
+            Type::U64 => "u64".into(),
+            Type::U128 => "u128".into(),
+            Type::F32 => "f32".into(),
+            Type::F64 | Type::Dec => "f64".into(),
+            Type::Bool => "bool".into(),
+            Type::Str => "String".into(),
+            Type::Unit => "()".into(),
+            Type::TypeVar(v) => format!("T{}", v),
+            Type::List(e) => format!("List<{}>", self.ty(e)?),
+            Type::Tuple(xs) => {
+                let xs: Result<Vec<String>, String> = xs.iter().map(|x| self.ty(x)).collect();
+                format!("({},)", xs?.join(", "))
+            }
+            Type::Function(..) => {
+                let mut ps = Vec::new();
+                let mut cur = t;
+                while let Type::Function(a, b) = cur {
+                    if !matches!(**a, Type::Unit) || ps.is_empty() && !matches!(**b, Type::Function(..)) {
+                        ps.push(self.ty(a)?);
+                    }
+                    cur = b;
+                }
+                format!("Rc<dyn Fn({}) -> {}>", ps.join(", "), self.ty(cur)?)
+            }
+            Type::Record { fields, .. } => {
+                let names: Vec<String> = sorted_names(fields.iter().map(|(n, _)| *n));
+                self.records.borrow_mut().insert(names.clone());
+                let mut args = Vec::new();
+                for n in &names {
+                    let (_, ft) = fields.iter().find(|(f, _)| f == n).expect("named");
+                    args.push(self.ty(ft)?);
+                }
+                format!("{}<{}>", record_name(&names), args.join(", "))
+            }
+            Type::TagUnion { tags, .. } => {
+                let names: Vec<String> = sorted_names(tags.iter().map(|(n, _)| *n));
+                if names == ["Err", "Ok"] {
+                    let get = |n: &str| tags.iter().find(|(t, _)| *t == n).map(|(_, p)| p.clone()).unwrap_or_default();
+                    let ok = get("Ok");
+                    let err = get("Err");
+                    return Ok(format!("Result<{}, {}>", self.payload(&ok)?, self.payload(&err)?));
+                }
+                let arity: Vec<usize> = names.iter().map(|n| tags.iter().find(|(t, _)| *t == n).map_or(0, |(_, p)| p.len())).collect();
+                self.unions.borrow_mut().insert(names.clone(), arity);
+                let mut args = Vec::new();
+                for n in &names {
+                    let (_, p) = tags.iter().find(|(t, _)| *t == n).expect("named");
+                    for x in p {
+                        args.push(self.ty(x)?);
+                    }
+                }
+                if args.is_empty() { union_name(&names) } else { format!("{}<{}>", union_name(&names), args.join(", ")) }
+            }
+            Type::Nominal { name, backing } => {
+                let Some(n) = self.nominals.get(bare(name)) else {
+                    return Err(format!("the nominal {} is not declared", name));
+                };
+                if erased(&n.backing) {
+                    // A nominal over a list or a scalar is its backing, as at run time.
+                    return self.ty(&self.instantiate(n, backing));
+                }
+                let mut bound = HashMap::new();
+                bind(&n.backing, backing, &mut bound);
+                if n.params.is_empty() {
+                    n.rust.clone()
+                } else {
+                    let args: Result<Vec<String>, String> = n.params.iter().map(|p| self.ty(bound.get(p).unwrap_or(&Type::Unit))).collect();
+                    format!("{}<{}>", n.rust, args?.join(", "))
+                }
+            }
+            other => return Err(format!("the type {}", other)),
+        })
+    }
+
+    /// A nominal's backing with the use's arguments put in.
+    fn instantiate(&self, n: &Nominal, used_backing: &Type) -> Type {
+        if matches!(used_backing, Type::TypeVar(_)) { n.backing.clone() } else { used_backing.clone() }
+    }
+
+    /// A tag's payload as one Rust type: nothing, the one, or a tuple.
+    fn payload(&self, p: &[Type]) -> Result<String, String> {
+        Ok(match p {
+            [] => "()".into(),
+            [one] => self.ty(one)?,
+            many => {
+                let xs: Result<Vec<String>, String> = many.iter().map(|x| self.ty(x)).collect();
+                format!("({})", xs?.join(", "))
+            }
+        })
+    }
+
+    /// Is this field's type a nominal struct or enum, held behind an `Rc`?
+    fn boxed(&self, t: &Type) -> bool {
+        match t {
+            Type::Nominal { name, .. } => self.nominals.get(bare(name)).is_some_and(|n| !erased(&n.backing)),
+            _ => false,
+        }
+    }
+
+    fn field_ty(&self, t: &Type) -> Result<String, String> {
+        let s = self.ty(t)?;
+        Ok(if self.boxed(t) { format!("Rc<{}>", s) } else { s })
+    }
+
+    /// The Rust definitions of every type the program named.
+    fn type_defs(&self) -> Result<String, String> {
+        let mut out = String::new();
+        let mut noms: Vec<&Nominal> = self.nominals.values().collect();
+        noms.sort_by(|a, b| a.rust.cmp(&b.rust));
+        for n in noms {
+            if erased(&n.backing) {
+                continue;
+            }
+            let generics = if n.params.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", n.params.iter().map(|p| format!("T{}", p)).collect::<Vec<_>>().join(", "))
+            };
+            let derive = if holds_fn(&n.backing) { "#[derive(Clone)]" } else { "#[derive(Clone, PartialEq, Debug)]" };
+            match &n.backing {
+                Type::Record { fields, .. } => {
+                    out.push_str(&format!("{}\npub struct {}{} {{\n", derive, n.rust, generics));
+                    for (f, t) in fields {
+                        out.push_str(&format!("    pub {}: {},\n", sanitize(f), self.field_ty(t)?));
+                    }
+                    out.push_str("}\n\n");
+                }
+                Type::TagUnion { tags, .. } => {
+                    out.push_str(&format!("{}\npub enum {}{} {{\n", derive, n.rust, generics));
+                    for (tag, p) in tags {
+                        if p.is_empty() {
+                            out.push_str(&format!("    {},\n", tag));
+                        } else {
+                            let ps: Result<Vec<String>, String> = p.iter().map(|x| self.field_ty(x)).collect();
+                            out.push_str(&format!("    {}({}),\n", tag, ps?.join(", ")));
+                        }
+                    }
+                    out.push_str("}\n\n");
+                }
+                other => return Err(format!("a nominal over {}", other)),
+            }
+        }
+        // Types reached only while writing these definitions are written too; the
+        // structural ones are generic, so each is written once.
+        for names in self.records.borrow().iter() {
+            if names == &["len".to_string(), "start".to_string()] {
+                continue; // runtime.rs has it
+            }
+            let ps: Vec<String> = (0..names.len()).map(|i| format!("T{}", i)).collect();
+            out.push_str(&format!("#[derive(Clone, PartialEq, Debug)]\npub struct {}<{}> {{\n", record_name(names), ps.join(", ")));
+            for (i, n) in names.iter().enumerate() {
+                out.push_str(&format!("    pub {}: T{},\n", sanitize(n), i));
+            }
+            out.push_str("}\n\n");
+        }
+        for (names, arity) in self.unions.borrow().iter() {
+            let total: usize = arity.iter().sum();
+            let ps: Vec<String> = (0..total).map(|i| format!("T{}", i)).collect();
+            let generics = if total == 0 { String::new() } else { format!("<{}>", ps.join(", ")) };
+            out.push_str(&format!("#[derive(Clone, PartialEq, Debug)]\npub enum {}{} {{\n", union_name(names), generics));
+            let mut k = 0;
+            for (n, a) in names.iter().zip(arity) {
+                if *a == 0 {
+                    out.push_str(&format!("    {},\n", n));
+                } else {
+                    let xs: Vec<String> = (k..k + a).map(|i| format!("T{}", i)).collect();
+                    k += a;
+                    out.push_str(&format!("    {}({}),\n", n, xs.join(", ")));
+                }
+            }
+            out.push_str("}\n\n");
+        }
+        Ok(out)
+    }
+
+    // ---- definitions ----
+
+    fn def(&self, module: Option<&str>, name: &str, annotation: Option<&Type>, value: &Expr) -> Result<String, String> {
+        let rust = sanitize(name);
+        let owner = name.rsplit_once('.').map(|(o, _)| o.to_string()).unwrap_or_else(|| module.unwrap_or("").to_string());
+        let scope = Scope { locals: Vec::new(), owner, module: module.map(|m| m.to_string()) };
+        let Some(sig) = annotation.cloned().or_else(|| self.types.get(&value.id()).cloned()) else {
+            return Err(format!("`{}` has no type", name));
+        };
+        match value {
+            Expr::Lambda { params, body, .. } => {
+                let Some((ps, result)) = peel(&sig, params.len()) else {
+                    return Err(format!("`{}`'s type has fewer parameters than its lambda", name));
+                };
+                let mut vars = Vec::new();
+                vars_of(&sig, &mut vars);
+                let generics = if vars.is_empty() {
+                    String::new()
+                } else {
+                    format!("<{}>", vars.iter().map(|v| format!("T{}: Clone + PartialEq + std::fmt::Debug + 'static", v)).collect::<Vec<_>>().join(", "))
+                };
+                let mut scope = scope;
+                let mut args = Vec::new();
+                for (p, t) in params.iter().zip(&ps) {
+                    args.push(format!("{}: {}", sanitize(p), self.ty(t)?));
+                    scope.locals.push(p.to_string());
+                }
+                // `|_args|` on `main!` is the platform's; it is unused here.
+                let result_ty = self.ty(&result)?;
+                let body = self.expr(body, &scope)?;
+                Ok(format!("pub fn {}{}({}) -> {} {{\n    {}\n}}\n", rust, generics, args.join(", "), result_ty, indent(&body, 4)))
+            }
+            _ => {
+                let t = self.ty(&sig)?;
+                let body = self.expr(value, &scope)?;
+                Ok(format!("pub fn {}() -> {} {{\n    {}\n}}\n", rust, t, indent(&body, 4)))
+            }
+        }
+    }
+
+    // ---- names ----
+
+    /// A bare name in scope: a local, or a top-level definition looked up under
+    /// the owner, the module, and then the app.
+    fn resolve(&self, n: &str, scope: &Scope) -> Option<String> {
+        let candidates = [
+            format!("{}.{}", scope.owner, n),
+            scope.module.as_ref().map(|m| format!("{}.{}", m, n)).unwrap_or_default(),
+            n.to_string(),
+        ];
+        let found = candidates.into_iter().find(|c| !c.is_empty() && self.tops.contains_key(c));
+        if let Some(f) = &found {
+            self.wanted.borrow_mut().insert(f.clone());
+        }
+        found
+    }
+
+    fn qualified(&self, module: &str, name: &str) -> Option<String> {
+        let q = format!("{}.{}", module, name);
+        let found = self.tops.contains_key(&q).then_some(q);
+        if let Some(f) = &found {
+            self.wanted.borrow_mut().insert(f.clone());
+        }
+        found
+    }
+
+    /// A reference to a top-level definition as a value.
+    fn top_value(&self, roc: &str, e: &Expr) -> Result<String, String> {
+        let rust = sanitize(roc);
+        if self.tops[roc] {
+            // A function used as a value: a closure over it, typed by the use.
+            let t = self.ty_of(e)?;
+            let Some((ps, _)) = peel_all(&t) else {
+                return Err(format!("`{}` used as a value of type {}", roc, t));
+            };
+            let names: Vec<String> = (0..ps.len()).map(|i| format!("a{}", i)).collect();
+            let typed: Result<Vec<String>, String> = names.iter().zip(&ps).map(|(n, t)| Ok(format!("{}: {}", n, self.ty(t)?))).collect();
+            Ok(format!("(Rc::new(move |{}| {}({})) as {})", typed?.join(", "), rust, names.join(", "), self.ty(&t)?))
+        } else {
+            Ok(format!("{}()", rust))
+        }
+    }
+
+    // ---- expressions ----
+
+    fn expr(&self, e: &Expr, scope: &Scope) -> Result<String, String> {
+        Ok(match e {
+            Expr::Int(n, _) => self.int_lit(*n, e),
+            Expr::Float(f, _, _) => format!("{:?}f64", f),
+            Expr::Bool(b, _) => b.to_string(),
+            Expr::Unit(_) => "()".into(),
+            Expr::Str(s, _) => {
+                let lit = format!("String::from({:?})", s);
+                match self.ty_of(e)? {
+                    Type::Nominal { name, .. } => {
+                        let from = self.qualified(bare(name), "from_quote").ok_or_else(|| format!("a string literal as a {} with no from_quote", name))?;
+                        format!("{}({}).unwrap()", sanitize(&from), lit)
+                    }
+                    _ => lit,
+                }
+            }
+            Expr::Ident(n, _) => {
+                if scope.local(n) {
+                    self.read_local(n, e)?
+                } else if let Some(top) = self.resolve(n, scope) {
+                    self.top_value(&top, e)?
+                } else {
+                    return Err(format!("the name `{}`", n));
+                }
+            }
+            Expr::Qualified { module, name, .. } => match self.qualified(module, name) {
+                Some(top) => self.top_value(&top, e)?,
+                None => return Err(format!("`{}.{}` as a value", module, name)),
+            },
+            Expr::BinOp { left, op, right, .. } => self.binop(left, *op, right, scope)?,
+            Expr::Call { func, args, .. } => self.call(func, args, e, scope)?,
+            Expr::If { condition, then_branch, otherwise, .. } => format!(
+                "(if {} {{\n    {}\n}} else {{\n    {}\n}})",
+                self.expr(condition, scope)?,
+                indent(&self.expr(then_branch, scope)?, 4),
+                indent(&self.expr(otherwise, scope)?, 4)
+            ),
+            Expr::Let { .. } | Expr::VarDecl { .. } | Expr::Assign { .. } => self.block(e, scope)?,
+            Expr::While { condition, body, .. } => {
+                format!("{{ while {} {{ {}; }} }}", self.expr(condition, scope)?, self.expr(body, scope)?)
+            }
+            Expr::Match { scrutinee, arms, .. } => self.matching(scrutinee, arms, scope)?,
+            Expr::List(items, _) => {
+                let xs: Result<Vec<String>, String> = items.iter().map(|i| self.expr(i, scope)).collect();
+                format!("List::of(vec![{}])", xs?.join(", "))
+            }
+            Expr::Tuple(items, _) => {
+                let xs: Result<Vec<String>, String> = items.iter().map(|i| self.expr(i, scope)).collect();
+                format!("({},)", xs?.join(", "))
+            }
+            Expr::TupleIndex { tuple, index, .. } => format!("({}).{}", self.expr(tuple, scope)?, index),
+            Expr::Record(fields, _) => self.record(fields, e, scope)?,
+            Expr::RecordUpdate { base, fields, .. } => {
+                let t = self.ty_of(e)?;
+                let mut out = format!("{{ let mut r = {};", self.expr(base, scope)?);
+                for (f, v) in fields {
+                    let ft = self.field_type(&t, f)?;
+                    let v = self.expr(v, scope)?;
+                    let v = if self.boxed(&ft) { format!("Rc::new({})", v) } else { v };
+                    out.push_str(&format!(" r.{} = {};", sanitize(f), v));
+                }
+                out.push_str(" r }");
+                out
+            }
+            Expr::FieldAccess { record, field, .. } => {
+                let rt = self.ty_of(record)?;
+                let ft = self.field_type(&rt, field)?;
+                let r = self.expr(record, scope)?;
+                if self.boxed(&ft) {
+                    format!("(*({}).{}).clone()", r, sanitize(field))
+                } else {
+                    format!("({}).{}", r, sanitize(field))
+                }
+            }
+            Expr::Tag { name, args, .. } => self.tag(name, args, e, scope)?,
+            Expr::Lambda { params, body, .. } => self.lambda(params, body, e, scope)?,
+            Expr::Crash(msg, _) => format!("panic!(\"{{}}\", {})", self.expr(msg, scope)?),
+            Expr::Dispatch { receiver, method: "negate", args, .. } if args.is_empty() => format!("(-({}))", self.expr(receiver, scope)?),
+            Expr::Dispatch { receiver, method: "not", args, .. } if args.is_empty() => format!("(!({}))", self.expr(receiver, scope)?),
+            other => return Err(format!("an expression {}", short(other))),
+        })
+    }
+
+    fn read_local(&self, n: &str, e: &Expr) -> Result<String, String> {
+        let t = self.ty_of(e)?;
+        Ok(if copy_type(&t) { sanitize(n) } else { format!("{}.clone()", sanitize(n)) })
+    }
+
+    fn int_lit(&self, n: i128, e: &Expr) -> String {
+        let suffix = match self.types.get(&e.id()) {
+            Some(Type::U8) => "u8",
+            Some(Type::U16) => "u16",
+            Some(Type::U32) => "u32",
+            Some(Type::U64) => "u64",
+            Some(Type::U128) => "u128",
+            Some(Type::I8) => "i8",
+            Some(Type::I16) => "i16",
+            Some(Type::I32) => "i32",
+            Some(Type::I128) => "i128",
+            Some(Type::F64) | Some(Type::Dec) => return format!("{}f64", n),
+            Some(Type::F32) => return format!("{}f32", n),
+            _ => "i64",
+        };
+        if n < 0 { format!("({}{})", n, suffix) } else { format!("{}{}", n, suffix) }
+    }
+
+    /// A statement chain: `let`s, `var`s and assignments, as a Rust block.
+    fn block(&self, e: &Expr, scope: &Scope) -> Result<String, String> {
+        let mut scope = scope.clone();
+        let mut out = String::from("{\n");
+        let mut cursor = e;
+        loop {
+            match cursor {
+                Expr::Let { name, value, body, .. } => {
+                    let v = self.expr(value, &scope)?;
+                    if *name == "_" {
+                        out.push_str(&format!("    let _ = {};\n", indent(&v, 4)));
+                    } else {
+                        out.push_str(&format!("    let {} = {};\n", sanitize(name), indent(&v, 4)));
+                        scope.locals.push(name.to_string());
+                    }
+                    cursor = body;
+                }
+                Expr::VarDecl { name, value, body, .. } => {
+                    let v = self.expr(value, &scope)?;
+                    out.push_str(&format!("    let mut {} = {};\n", sanitize(name), indent(&v, 4)));
+                    scope.locals.push(name.to_string());
+                    cursor = body;
+                }
+                Expr::Assign { name, value, body, .. } => {
+                    let v = self.expr(value, &scope)?;
+                    out.push_str(&format!("    {} = {};\n", sanitize(name), indent(&v, 4)));
+                    cursor = body;
+                }
+                other => {
+                    out.push_str(&format!("    {}\n}}", indent(&self.expr(other, &scope)?, 4)));
+                    return Ok(out);
+                }
+            }
+        }
+    }
+
+    fn binop(&self, l: &Expr, op: BinOp, r: &Expr, scope: &Scope) -> Result<String, String> {
+        let a = self.expr(l, scope)?;
+        let b = self.expr(r, scope)?;
+        let sym = match op {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div | BinOp::IntDiv => "/",
+            BinOp::Rem => "%",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::And => "&&",
+            BinOp::Or => "||",
+            BinOp::Eq | BinOp::Ne => {
+                // A nominal's own equality where it has one; derived otherwise.
+                let t = self.ty_of(l)?;
+                if let Type::Nominal { name, .. } = &t {
+                    if let Some(eq) = self.qualified(bare(name), "is_eq") {
+                        let call = format!("{}({}, {})", sanitize(&eq), a, b);
+                        return Ok(if matches!(op, BinOp::Ne) { format!("(!{})", call) } else { call });
+                    }
+                }
+                if matches!(op, BinOp::Eq) { "==" } else { "!=" }
+            }
+        };
+        Ok(format!("({} {} {})", a, sym, b))
+    }
+
+    fn call(&self, func: &Expr, args: &[Expr], e: &Expr, scope: &Scope) -> Result<String, String> {
+        let xs: Result<Vec<String>, String> = args.iter().map(|a| self.expr(a, scope)).collect();
+        let xs = xs?;
+        let callee = match func {
+            Expr::Ident(n, _) if !scope.local(n) => {
+                if *n == "echo!" {
+                    return Ok(format!("echo({})", xs.join(", ")));
+                }
+                match self.resolve(n, scope) {
+                    Some(top) if self.tops[&top] => sanitize(&top),
+                    Some(top) => format!("({})", self.top_value(&top, func)?),
+                    None => return Err(format!("a call to `{}`", n)),
+                }
+            }
+            Expr::Qualified { module, name, .. } => match self.qualified(module, name) {
+                Some(top) if self.tops[&top] => sanitize(&top),
+                Some(top) => format!("({})", self.top_value(&top, func)?),
+                None if BUILTIN_MODULES.contains(module) => {
+                    if matches!(*module, "List" | "Str") {
+                        format!("{}__{}", module, name)
+                    } else {
+                        format!("{}::{}", module, name)
+                    }
+                }
+                None => return Err(format!("a call to `{}.{}`", module, name)),
+            },
+            other => format!("(*{})", self.expr(other, scope)?),
+        };
+        let _ = e;
+        Ok(format!("{}({})", callee, xs.join(", ")))
+    }
+
+    fn field_type(&self, t: &Type, field: &str) -> Result<Type, String> {
+        match t {
+            Type::Record { fields, .. } => fields.iter().find(|(f, _)| *f == field).map(|(_, t)| t.clone()).ok_or_else(|| format!("no field {}", field)),
+            Type::Nominal { name, backing } => {
+                let n = self.nominals.get(bare(name)).ok_or_else(|| format!("the nominal {}", name))?;
+                let decl = match &n.backing {
+                    Type::Record { fields, .. } => fields.iter().find(|(f, _)| *f == field).map(|(_, t)| t.clone()),
+                    _ => None,
+                }
+                .ok_or_else(|| format!("no field {} in {}", field, name))?;
+                let mut bound = HashMap::new();
+                bind(&n.backing, backing, &mut bound);
+                Ok(subst(&decl, &bound))
+            }
+            other => Err(format!("a field {} of {}", field, other)),
+        }
+    }
+
+    fn record(&self, fields: &[(&'static str, Expr)], e: &Expr, scope: &Scope) -> Result<String, String> {
+        let t = self.ty_of(e)?;
+        let name = match &t {
+            Type::Nominal { name, .. } => self.nominals.get(bare(name)).map(|n| n.rust.clone()).ok_or_else(|| format!("the nominal {}", name))?,
+            Type::Record { .. } => {
+                let s = self.ty(&t)?;
+                s.split('<').next().unwrap_or(&s).to_string()
+            }
+            other => return Err(format!("a record literal typed {}", other)),
+        };
+        let mut parts = Vec::new();
+        for (f, v) in fields {
+            let ft = self.field_type(&t, f)?;
+            let v = self.expr(v, scope)?;
+            parts.push(format!("{}: {}", sanitize(f), if self.boxed(&ft) { format!("Rc::new({})", v) } else { v }));
+        }
+        Ok(format!("{} {{ {} }}", name, parts.join(", ")))
+    }
+
+    fn tag(&self, name: &str, args: &[Expr], e: &Expr, scope: &Scope) -> Result<String, String> {
+        let t = self.ty_of(e)?;
+        let xs: Result<Vec<String>, String> = args.iter().map(|a| self.expr(a, scope)).collect();
+        let xs = xs?;
+        match &t {
+            Type::Bool => return Ok((name == "True").to_string()),
+            Type::TagUnion { tags, .. } if sorted_names(tags.iter().map(|(n, _)| *n)) == ["Err", "Ok"] => {
+                let payload = match xs.as_slice() {
+                    [] => "()".to_string(),
+                    [one] => one.clone(),
+                    many => format!("({})", many.join(", ")),
+                };
+                return Ok(format!("{}({})", name, payload));
+            }
+            _ => {}
+        }
+        let (enum_name, payload_types) = self.variant(&t, name)?;
+        if xs.is_empty() {
+            return Ok(format!("{}::{}", enum_name, name));
+        }
+        let boxed: Vec<String> = xs
+            .into_iter()
+            .zip(payload_types.iter())
+            .map(|(x, pt)| if self.boxed(pt) { format!("Rc::new({})", x) } else { x })
+            .collect();
+        Ok(format!("{}::{}({})", enum_name, name, boxed.join(", ")))
+    }
+
+    /// The Rust enum a tag belongs to, and that tag's payload types as declared.
+    fn variant(&self, t: &Type, tag: &str) -> Result<(String, Vec<Type>), String> {
+        match t {
+            Type::TagUnion { tags, .. } => {
+                let s = self.ty(t)?;
+                let p = tags.iter().find(|(n, _)| *n == tag).map(|(_, p)| p.clone()).unwrap_or_default();
+                Ok((s.split('<').next().unwrap_or(&s).to_string(), p))
+            }
+            Type::Nominal { name, backing } => {
+                let n = self.nominals.get(bare(name)).ok_or_else(|| format!("the nominal {}", name))?;
+                let Type::TagUnion { tags, .. } = &n.backing else {
+                    return Err(format!("a tag {} of the nominal {}", tag, name));
+                };
+                let mut bound = HashMap::new();
+                bind(&n.backing, backing, &mut bound);
+                let p = tags.iter().find(|(x, _)| *x == tag).map(|(_, p)| p.iter().map(|x| subst(x, &bound)).collect()).unwrap_or_default();
+                Ok((n.rust.clone(), p))
+            }
+            other => Err(format!("a tag {} of {}", tag, other)),
+        }
+    }
+
+    fn lambda(&self, params: &[&'static str], body: &Expr, e: &Expr, scope: &Scope) -> Result<String, String> {
+        let t = self.ty_of(e)?;
+        let (ps, result) = peel(&t, params.len()).ok_or("a lambda whose type is not a function")?;
+        let mut inner = scope.clone();
+        let mut typed = Vec::new();
+        for (p, pt) in params.iter().zip(&ps) {
+            typed.push(format!("{}: {}", sanitize(p), self.ty(pt)?));
+            inner.locals.push(p.to_string());
+        }
+        let b = self.expr(body, &inner)?;
+        // Captures are cloned in, so the closure owns them and the caller keeps its own.
+        let mut used = BTreeSet::new();
+        names_in(body, &mut used);
+        let captures: Vec<String> = scope.locals.iter().filter(|l| used.contains(l.as_str()) && !params.contains(&l.as_str())).map(|l| sanitize(l)).collect();
+        let lets: String = captures.iter().map(|c| format!("let {c} = {c}.clone(); ")).collect();
+        Ok(format!("{{ {}(Rc::new(move |{}| -> {} {{ {} }}) as {}) }}", lets, typed.join(", "), self.ty(&result)?, b, self.ty(&t)?))
+    }
+
+    // ---- matching ----
+
+    fn matching(&self, scrutinee: &Expr, arms: &[MatchArm], scope: &Scope) -> Result<String, String> {
+        let st = self.ty_of(scrutinee)?;
+        let mut out = format!("{{ let s = {}; 'm: {{\n", self.expr(scrutinee, scope)?);
+        for arm in arms {
+            for p in &arm.patterns {
+                let mut inner = scope.clone();
+                let mut binds = Vec::new();
+                let tail = {
+                    let mut probe = inner.clone();
+                    self.pat_names(p, &mut probe.locals);
+                    let body = self.expr(&arm.body, &probe)?;
+                    match &arm.guard {
+                        Some(g) => format!("if {} {{ break 'm ({}); }}", self.expr(g, &probe)?, body),
+                        None => format!("break 'm ({});", body),
+                    }
+                };
+                let code = self.pat(p, "(&s)", &st, &mut binds, &mut inner, tail)?;
+                out.push_str(&format!("    {}\n", indent(&code, 4)));
+            }
+        }
+        out.push_str("    panic!(\"no match arm applied\")\n} }");
+        Ok(out)
+    }
+
+    fn pat_names(&self, p: &Pattern, out: &mut Vec<String>) {
+        match p {
+            Pattern::Binding(n) => out.push(n.to_string()),
+            Pattern::As { name, inner } => {
+                out.push(name.to_string());
+                self.pat_names(inner, out)
+            }
+            Pattern::Tag { args, .. } | Pattern::Tuple(args) => args.iter().for_each(|a| self.pat_names(a, out)),
+            Pattern::Record { fields, rest } => {
+                fields.iter().for_each(|(_, a)| self.pat_names(a, out));
+                if let Some(r) = rest {
+                    out.push(r.to_string())
+                }
+            }
+            Pattern::List { before, rest, after } => {
+                before.iter().chain(after).for_each(|a| self.pat_names(a, out));
+                if let Some(Some(r)) = rest {
+                    out.push(r.to_string())
+                }
+            }
+            Pattern::Nominal { inner, .. } => self.pat_names(inner, out),
+            _ => {}
+        }
+    }
+
+    /// `v` is an expression of type `&T`, `t` is `T`. Wraps `inner` in what must
+    /// hold for `p` to match, with its bindings made.
+    fn pat(&self, p: &Pattern, v: &str, t: &Type, binds: &mut Vec<String>, scope: &mut Scope, inner: String) -> Result<String, String> {
+        let k = binds.len();
+        Ok(match p {
+            Pattern::Wildcard => inner,
+            Pattern::Binding(n) => format!("let {} = ({}).clone(); {}", sanitize(n), v, inner),
+            Pattern::As { name, inner: sub } => {
+                let rest = self.pat(sub, v, t, binds, scope, inner)?;
+                format!("let {} = ({}).clone(); {}", sanitize(name), v, rest)
+            }
+            Pattern::Int(n) => format!("if *{} == {} {{ {} }}", v, self.int_for(*n, t), inner),
+            Pattern::Str(s) => {
+                let lit = match t {
+                    Type::Nominal { name, .. } => {
+                        let from = self.qualified(bare(name), "from_quote").ok_or("a string pattern with no from_quote")?;
+                        format!("{}(String::from({:?})).unwrap()", sanitize(&from), s)
+                    }
+                    _ => format!("String::from({:?})", s),
+                };
+                format!("if *{} == {} {{ {} }}", v, lit, inner)
+            }
+            Pattern::Nominal { inner: sub, .. } => {
+                let backing = match t {
+                    Type::Nominal { name, backing } => {
+                        let n = self.nominals.get(bare(name)).ok_or("an unknown nominal pattern")?;
+                        self.instantiate(n, backing)
+                    }
+                    other => other.clone(),
+                };
+                self.pat(sub, v, &backing, binds, scope, inner)?
+            }
+            Pattern::Tuple(items) => {
+                let Type::Tuple(ts) = t else { return Err(format!("a tuple pattern on {}", t)) };
+                let mut code = inner;
+                for (i, (item, it)) in items.iter().zip(ts).enumerate().rev() {
+                    code = self.pat(item, &format!("(&({}).{})", v, i), it, binds, scope, code)?;
+                }
+                code
+            }
+            Pattern::Tag { name, args } => {
+                if matches!(t, Type::Bool) {
+                    return Ok(format!("if *{} == {} {{ {} }}", v, *name == "True", inner));
+                }
+                let names: Vec<String> = (0..args.len()).map(|i| format!("p{}_{}", k, i)).collect();
+                for n in &names {
+                    binds.push(n.clone());
+                }
+                let is_result = matches!(t, Type::TagUnion { tags, .. } if sorted_names(tags.iter().map(|(n, _)| *n)) == ["Err", "Ok"]);
+                let (head, pts) = if is_result {
+                    let Type::TagUnion { tags, .. } = t else { unreachable!() };
+                    (name.to_string(), tags.iter().find(|(n, _)| n == name).map(|(_, p)| p.clone()).unwrap_or_default())
+                } else {
+                    let (e, pts) = self.variant(t, name)?;
+                    (format!("{}::{}", e, name), pts)
+                };
+                let mut code = inner;
+                if is_result && args.len() > 1 {
+                    return Err("a Result tag with several payloads".into());
+                }
+                for (i, (a, pt)) in args.iter().zip(&pts).enumerate().rev() {
+                    let access = if self.boxed(pt) { format!("(&**{})", names[i]) } else { names[i].clone() };
+                    code = self.pat(a, &access, pt, binds, scope, code)?;
+                }
+                let bind = if args.is_empty() { String::new() } else { format!("({})", names.join(", ")) };
+                let head = if is_result && args.is_empty() { format!("{}(_)", head) } else { format!("{}{}", head, bind) };
+                format!("if let {} = {} {{ {} }}", head, v, code)
+            }
+            Pattern::Record { fields, rest } => {
+                if rest.is_some() {
+                    return Err("a record pattern with a rest".into());
+                }
+                let mut code = inner;
+                for (f, sub) in fields.iter().rev() {
+                    let ft = self.field_type(t, f)?;
+                    let access = if self.boxed(&ft) { format!("(&*({}).{})", v, sanitize(f)) } else { format!("(&({}).{})", v, sanitize(f)) };
+                    code = self.pat(sub, &access, &ft, binds, scope, code)?;
+                }
+                code
+            }
+            Pattern::List { before, rest, after } => {
+                let Type::List(et) = t else { return Err(format!("a list pattern on {}", t)) };
+                let n = before.len() + after.len();
+                let cond = match rest {
+                    None => format!("({}).0.len() == {}", v, n),
+                    Some(_) => format!("({}).0.len() >= {}", v, n),
+                };
+                let mut code = inner;
+                if let Some(Some(r)) = rest {
+                    if !after.is_empty() {
+                        return Err("a list pattern with elements after its rest".into());
+                    }
+                    code = format!("let {} = ({}).rest({}); {}", sanitize(r), v, before.len(), code);
+                }
+                for (i, b) in before.iter().enumerate().rev() {
+                    code = self.pat(b, &format!("({}).at({})", v, i), et, binds, scope, code)?;
+                }
+                for (i, a) in after.iter().enumerate().rev() {
+                    code = self.pat(a, &format!("({v}).at(({v}).0.len() - {})", after.len() - i), et, binds, scope, code)?;
+                }
+                format!("if {} {{ {} }}", cond, code)
+            }
+            other => return Err(format!("a pattern {}", other)),
+        })
+    }
+
+    fn int_for(&self, n: i128, t: &Type) -> String {
+        let suffix = match t {
+            Type::U8 => "u8",
+            Type::U16 => "u16",
+            Type::U32 => "u32",
+            Type::U64 => "u64",
+            Type::I32 => "i32",
+            _ => "i64",
+        };
+        if n < 0 { format!("({}{})", n, suffix) } else { format!("{}{}", n, suffix) }
+    }
+}
+
+fn sorted_names<'x>(names: impl Iterator<Item = &'x str>) -> Vec<String> {
+    let mut v: Vec<String> = names.map(|s| s.to_string()).collect();
+    v.sort();
+    v
+}
+
+fn record_name(names: &[String]) -> String {
+    format!("Rec_{}", names.join("_"))
+}
+
+fn union_name(names: &[String]) -> String {
+    format!("Tags_{}", names.join("_"))
+}
+
+/// A nominal Roc erases at run time and Rust can too: one over a list or a scalar.
+fn erased(backing: &Type) -> bool {
+    !matches!(backing, Type::Record { .. } | Type::TagUnion { .. })
+}
+
+fn holds_fn(t: &Type) -> bool {
+    match t {
+        Type::Function(..) => true,
+        Type::List(e) => holds_fn(e),
+        Type::Tuple(xs) => xs.iter().any(holds_fn),
+        Type::Record { fields, .. } => fields.iter().any(|(_, x)| holds_fn(x)),
+        Type::TagUnion { tags, .. } => tags.iter().flat_map(|(_, p)| p).any(holds_fn),
+        _ => false,
+    }
+}
+
+fn subst(t: &Type, bound: &HashMap<u32, Type>) -> Type {
+    match t {
+        Type::TypeVar(v) => bound.get(v).cloned().unwrap_or_else(|| t.clone()),
+        Type::List(e) => Type::List(Box::new(subst(e, bound))),
+        Type::Function(a, b) => Type::Function(Box::new(subst(a, bound)), Box::new(subst(b, bound))),
+        Type::Tuple(xs) => Type::Tuple(xs.iter().map(|x| subst(x, bound)).collect()),
+        Type::Record { fields, open } => Type::Record { fields: fields.iter().map(|(n, x)| (*n, subst(x, bound))).collect(), open: *open },
+        Type::TagUnion { tags, open } => Type::TagUnion { tags: tags.iter().map(|(n, p)| (*n, p.iter().map(|x| subst(x, bound)).collect())).collect(), open: *open },
+        Type::Nominal { name, backing } => Type::Nominal { name, backing: Box::new(subst(backing, bound)) },
+        other => other.clone(),
+    }
+}
+
+/// The first `n` parameters of a curried function type, and what is left.
+fn peel(t: &Type, n: usize) -> Option<(Vec<Type>, Type)> {
+    let mut params = Vec::new();
+    let mut cur = t;
+    while params.len() < n {
+        let Type::Function(a, b) = cur else { return None };
+        params.push((**a).clone());
+        cur = b;
+    }
+    Some((params, cur.clone()))
+}
+
+fn peel_all(t: &Type) -> Option<(Vec<Type>, Type)> {
+    let mut params = Vec::new();
+    let mut cur = t;
+    while let Type::Function(a, b) = cur {
+        params.push((**a).clone());
+        cur = b;
+    }
+    (!params.is_empty()).then(|| (params, cur.clone()))
+}
+
+/// Every bare name an expression reads, for a closure's captures.
+fn names_in(e: &Expr, out: &mut BTreeSet<String>) {
+    match e {
+        Expr::Ident(n, _) => {
+            out.insert(n.to_string());
+        }
+        Expr::BinOp { left, right, .. } => {
+            names_in(left, out);
+            names_in(right, out)
+        }
+        Expr::Call { func, args, .. } => {
+            names_in(func, out);
+            args.iter().for_each(|a| names_in(a, out))
+        }
+        Expr::Lambda { body, .. } => names_in(body, out),
+        Expr::Let { value, body, .. } | Expr::VarDecl { value, body, .. } | Expr::Assign { value, body, .. } => {
+            names_in(value, out);
+            names_in(body, out)
+        }
+        Expr::If { condition, then_branch, otherwise, .. } => {
+            names_in(condition, out);
+            names_in(then_branch, out);
+            names_in(otherwise, out)
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            names_in(scrutinee, out);
+            for a in arms {
+                names_in(&a.body, out);
+                if let Some(g) = &a.guard {
+                    names_in(g, out)
+                }
+            }
+        }
+        Expr::List(xs, _) | Expr::Tuple(xs, _) => xs.iter().for_each(|x| names_in(x, out)),
+        Expr::Record(fs, _) => fs.iter().for_each(|(_, x)| names_in(x, out)),
+        Expr::RecordUpdate { base, fields, .. } => {
+            names_in(base, out);
+            fields.iter().for_each(|(_, x)| names_in(x, out))
+        }
+        Expr::FieldAccess { record, .. } => names_in(record, out),
+        Expr::TupleIndex { tuple, .. } => names_in(tuple, out),
+        Expr::Tag { args, .. } => args.iter().for_each(|x| names_in(x, out)),
+        Expr::Crash(x, _) | Expr::Return(x, _) | Expr::Dbg(x, _) | Expr::Expect(x, _) => names_in(x, out),
+        Expr::Dispatch { receiver, args, .. } => {
+            names_in(receiver, out);
+            args.iter().for_each(|x| names_in(x, out))
+        }
+        Expr::While { condition, body, .. } => {
+            names_in(condition, out);
+            names_in(body, out)
+        }
+        _ => {}
+    }
+}
+
+fn indent(s: &str, n: usize) -> String {
+    s.replace('\n', &format!("\n{}", " ".repeat(n)))
+}
+
+fn short(e: &Expr) -> String {
+    let s = e.to_string();
+    if s.len() > 80 { format!("{}...", &s[..s.char_indices().nth(77).map_or(s.len(), |(i, _)| i)]) } else { s }
+}

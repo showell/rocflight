@@ -45,6 +45,8 @@ pub struct Input<'a> {
     pub types: HashMap<NodeId, Type>,
     /// A Cobblestone checkout's `codex/foreword/core`, for the carried chapters.
     pub foreword: std::path::PathBuf,
+    /// Each parameterised nominal's type parameters, in declared order.
+    pub nominal_params: Vec<(String, Vec<u32>)>,
 }
 
 /// The module that is Codex's own text, and the Foreword chapters every unit carries.

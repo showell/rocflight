@@ -24,6 +24,7 @@ pub mod builtin;
 pub mod artifact;
 pub mod run;
 pub mod codex;
+pub mod rust;
 
 /// Is phase timing on? `ROCFLIGHT_TIME=1` turns it on.
 ///

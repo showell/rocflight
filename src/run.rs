@@ -41,6 +41,9 @@ pub struct Options {
     /// and a Cobblestone checkout's `codex/foreword/core` for the chapters every
     /// Codex program carries. `roc2codex` sets this. See `crate::codex`.
     pub emit_codex: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Write the checked program as one Rust file instead of running it; see
+    /// `crate::rust`. `roc2rust` sets this.
+    pub emit_rust: Option<std::path::PathBuf>,
 }
 
 thread_local! {
@@ -71,7 +74,7 @@ pub struct Ran {
 /// the same pipeline serves `rocflight file.roc`, `rocflight test`, and `roc_main`
 /// inside a platform's host.
 pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn Error>> {
-    let Options { show_desugared, show_ast, ast_only, show_platforms, test_mode, args, host_entry, check_expects, inspect_result: _, emit_prefix, emit_codex } = options;
+    let Options { show_desugared, show_ast, ast_only, show_platforms, test_mode, args, host_entry, check_expects, inspect_result: _, emit_prefix, emit_codex, emit_rust } = options;
     // `roc test` times the whole invocation, compile included, not just the expects.
     let started = Instant::now();
 
@@ -240,7 +243,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     crate::tick("modules + platform", &mut phase);
     // Step 3: Type check
     let mut type_checker = TypeChecker::new();
-    if emit_codex.is_some() {
+    if emit_codex.is_some() || emit_rust.is_some() {
         type_checker.record_types();
     }
     // Declarations first, so a name used before it is declared — or declared in a
@@ -295,7 +298,12 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     }
     type_checker.predeclare(&ast);
     let inferred = type_checker.synth(&ast)?;
-    if let Some((out, foreword)) = &emit_codex {
+    if emit_codex.is_some() || emit_rust.is_some() {
+        let (out, foreword) = match (&emit_codex, &emit_rust) {
+            (Some((out, foreword)), _) => (out.clone(), foreword.clone()),
+            (None, Some(out)) => (out.clone(), std::path::PathBuf::new()),
+            (None, None) => unreachable!("guarded"),
+        };
         let app_name = std::path::Path::new(filename)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -314,9 +322,11 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
                 .map(|((module_ast, name, _), types)| crate::codex::Module { name: name.clone(), ast: module_ast, types: types.clone() })
                 .collect(),
             types: type_checker.node_types(),
-            foreword: foreword.clone(),
+            foreword,
+            nominal_params: parser.nominal_params().iter().cloned().chain(module_params.iter().cloned()).collect(),
         };
-        std::fs::write(out, crate::codex::emit(&input)?)?;
+        let text = if emit_rust.is_some() { crate::rust::emit(&input)? } else { crate::codex::emit(&input)? };
+        std::fs::write(out, text)?;
         return Ok(None);
     }
     // A literal that does not fit the type it was given: refused, as roc refuses it.
