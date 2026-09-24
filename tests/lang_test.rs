@@ -1938,3 +1938,31 @@ fn a_qualified_type_is_the_imports_even_where_the_module_shares_its_name() {
     );
     assert_eq!(out, "Ok(5)");
 }
+
+#[test]
+fn a_nominal_built_through_its_module_has_its_declared_fields() {
+    // `Shapes.Dim.{ w: 3 }` in another file: the literal is `Dim`'s, so `3` is the
+    // `I64` its field says, not a fraction.
+    let out = run_files(
+        "rocflight_qualified_nominal_literal",
+        &[
+            ("Shapes.roc", "Shapes :: [].{\n\tDim := { w : I64 }\n}\n"),
+            ("main.roc", "app [main!] {}\n\nimport Shapes\n\nmain! = |_args| {\n\td = Shapes.Dim.{ w: 3 }\n\tOk(Str.inspect(d.w))\n}\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(\"3\")");
+}
+
+#[test]
+fn a_nominal_built_through_its_module_is_not_the_files_own_of_that_name() {
+    // This file's `Dim` has a defaulted `h`; `Shapes.Dim` has no `h` at all. The
+    // literal is the import's, so the local default is not filled in.
+    let out = run_files(
+        "rocflight_qualified_nominal_literal_shadowed",
+        &[
+            ("Shapes.roc", "Shapes :: [].{\n\tDim := { w : I64 }\n}\n"),
+            ("main.roc", "app [main!] {}\n\nimport Shapes\n\nDim := { w : I64, h : I64 ?? 0 }\n\nmain! = |_args| {\n\td = Shapes.Dim.{ w: 3 }\n\tl = Dim.{ w: 4 }\n\tOk(Str.inspect((d.w, l.h)))\n}\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(\"(3, 0)\")");
+}

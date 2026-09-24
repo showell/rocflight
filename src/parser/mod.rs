@@ -3320,8 +3320,15 @@ impl Parser {
                                     {
                                         self.pos += 1;
                                         let built = self.parse_nominal_braced()?;
-                                        let built = self.fill_defaults(name, built);
-                                        if let Some(declared) = self.nominal(name) {
+                                        // Through another module, the nominal is that
+                                        // module's, as for a qualified type, and so are
+                                        // its defaults: this file's own `Dim` must not
+                                        // fill in fields of the import's.
+                                        let foreign = self.nominal(module).is_none()
+                                            && self.imported_type(name).is_some();
+                                        let built = if foreign { built } else { self.fill_defaults(name, built) };
+                                        let declared = if foreign { self.imported_type(name) } else { self.nominal(name) };
+                                        if let Some(declared) = declared {
                                             self.nominal_literals.push((built.id(), declared));
                                         }
                                         return Ok(built);
