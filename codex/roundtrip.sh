@@ -28,8 +28,8 @@ one() {
     else
         # Does codexrun run the ORIGINAL? If it fails that too, the gap is the
         # oracle's, not the round trip's.
-        src="$(grep -m1 '^#   from' "$PORTED/$n.roc" | sed 's|.*/blob/master/||')"
-        if [ -n "$src" ] && ! timeout 60 "$BIN/codexrun" "$COBBLESTONE/$src" 2>/dev/null | cmp -s - "$PORTED/expected/$n.txt"; then
+        src="$(grep -m1 '^#   from' "$PORTED/$n.roc" | sed 's|.*/blob/master/||; s|@|/|g')"
+        if [ -n "$src" ] && [ -f "$COBBLESTONE/$src" ] && ! timeout 60 "$BIN/codexrun" "$COBBLESTONE/$src" 2>/dev/null | cmp -s - "$PORTED/expected/$n.txt"; then
             echo "ORACLE-FAIL $n | codexrun fails the original $src too"
         else
             echo "FAIL $n | $(diff "$OUT/$n.out" "$PORTED/expected/$n.txt" | grep -m1 '^[<>]' | cut -c1-140)"

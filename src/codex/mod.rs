@@ -437,6 +437,9 @@ impl Cx<'_> {
             return Ok(s);
         }
         Ok(match e {
+            // Codex reads `-9223372036854775808` as the negation of a literal one past
+            // the largest Integer; its own programs write the minimum in hex.
+            Expr::Int(n, _) if *n == i64::MIN as i128 => "#8000000000000000".into(),
             Expr::Int(n, _) => n.to_string(),
             Expr::Str(s, _) if self.is_text(e) => text_literal(s),
             Expr::Str(s, _) => return Err(format!("a Str literal {:?} that is not a Text", s)),
