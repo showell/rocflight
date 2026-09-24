@@ -53,12 +53,15 @@ const CARRIED: [&str; 3] = ["ListUtils", "Tuple", "Console"];
 /// The whole program as one resolved Codex unit.
 pub fn emit(input: &Input) -> Result<String, String> {
     let mut records = Vec::new();
+    let mut unions = Vec::new();
     for (name, ty) in input.modules.iter().flat_map(|m| m.types.iter()).chain(input.app_types.iter()) {
-        if let Type::Record { fields, .. } = ty {
-            records.push((*name, field_names(fields)));
+        match strip(ty) {
+            Type::Record { fields, .. } => records.push((*name, field_names(fields))),
+            Type::TagUnion { tags, .. } if !tags.is_empty() => unions.push((*name, tags.clone(), params_of(tags))),
+            _ => {}
         }
     }
-    let cx = Cx { types: &input.types, records };
+    let cx = Cx { types: &input.types, records, unions };
 
     let mut out = String::new();
     for chapter in CARRIED {
@@ -101,6 +104,66 @@ struct Cx<'a> {
     /// Each declared record type, by its sorted field names: a record literal is
     /// anonymous in Roc and named in Codex.
     records: Vec<(&'static str, Vec<&'static str>)>,
+    /// Each declared union: its tags as declared, and its type parameters in order.
+    /// A union in a signature arrives structural, since an alias is transparent,
+    /// and is named in Codex: `[Just(a), None]` is `Maybe a`.
+    unions: Vec<(&'static str, Vec<(&'static str, Vec<Type>)>, Vec<u32>)>,
+}
+
+/// A declaration's type parameters: the variables of its payloads, in the order
+/// they first appear, which is the order `Tup2(a, b) : [MkTup2(a, b)]` declares them.
+fn params_of(tags: &[(&'static str, Vec<Type>)]) -> Vec<u32> {
+    fn walk(t: &Type, out: &mut Vec<u32>) {
+        match t {
+            Type::TypeVar(v) => {
+                if !out.contains(v) {
+                    out.push(*v)
+                }
+            }
+            Type::List(e) => walk(e, out),
+            Type::Function(a, b) => {
+                walk(a, out);
+                walk(b, out)
+            }
+            Type::Tuple(xs) => xs.iter().for_each(|x| walk(x, out)),
+            Type::Record { fields, .. } => fields.iter().for_each(|(_, x)| walk(x, out)),
+            Type::TagUnion { tags, .. } => tags.iter().flat_map(|(_, p)| p).for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    tags.iter().flat_map(|(_, p)| p).for_each(|t| walk(t, &mut out));
+    out
+}
+
+/// Bind a declaration's variables by walking it beside a use of it.
+fn bind(decl: &Type, used: &Type, out: &mut HashMap<u32, Type>) {
+    match (decl, used) {
+        (Type::TypeVar(v), t) => {
+            out.entry(*v).or_insert_with(|| t.clone());
+        }
+        (Type::List(a), Type::List(b)) => bind(a, b, out),
+        (Type::Function(a1, b1), Type::Function(a2, b2)) => {
+            bind(a1, a2, out);
+            bind(b1, b2, out)
+        }
+        (Type::Tuple(xs), Type::Tuple(ys)) => xs.iter().zip(ys).for_each(|(x, y)| bind(x, y, out)),
+        (Type::Record { fields: f1, .. }, Type::Record { fields: f2, .. }) => {
+            for (n, x) in f1 {
+                if let Some((_, y)) = f2.iter().find(|(m, _)| m == n) {
+                    bind(x, y, out)
+                }
+            }
+        }
+        (Type::TagUnion { tags: t1, .. }, Type::TagUnion { tags: t2, .. }) => {
+            for (n, p1) in t1 {
+                if let Some((_, p2)) = t2.iter().find(|(m, _)| m == n) {
+                    p1.iter().zip(p2).for_each(|(x, y)| bind(x, y, out))
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The expression's precedence as an operand: an atom needs no parentheses.
@@ -177,7 +240,8 @@ impl Cx<'_> {
             }
             Type::TagUnion { tags, .. } if tags.is_empty() => None,
             Type::TagUnion { tags, .. } => {
-                let mut out = format!("  {} =\n", name);
+                let heads: Vec<String> = params_of(tags).iter().map(|v| format!(" (t{})", v)).collect();
+                let mut out = format!("  {}{} =\n", name, heads.concat());
                 for (tag, payload) in tags {
                     out.push_str(&format!("    | {}", tag));
                     for p in payload {
@@ -187,8 +251,9 @@ impl Cx<'_> {
                 }
                 Some(out)
             }
-            Type::Nominal { backing, .. } => return self.type_decl(name, backing),
-            other => return Err(format!("type declaration `{}` of {}", name, other)),
+            Type::Nominal { backing, .. } if !matches!(**backing, Type::TypeVar(_)) => return self.type_decl(name, backing),
+            // An alias of anything else is transparent: its uses already say the type.
+            _ => None,
         })
     }
 
@@ -206,6 +271,30 @@ impl Cx<'_> {
                 None => return Err(format!("an anonymous record type {}", t)),
             },
             Type::TypeVar(v) => format!("t{}", v),
+            Type::TagUnion { tags, .. } => {
+                let names: Vec<&str> = {
+                    let mut n: Vec<&str> = tags.iter().map(|(t, _)| *t).collect();
+                    n.sort_unstable();
+                    n
+                };
+                let found = self.unions.iter().find(|(_, decl, _)| {
+                    let mut d: Vec<&str> = decl.iter().map(|(t, _)| *t).collect();
+                    d.sort_unstable();
+                    d == names
+                });
+                let Some((name, decl, params)) = found else {
+                    return Err(format!("an anonymous union {}", t));
+                };
+                let mut bound = HashMap::new();
+                bind(&Type::TagUnion { tags: decl.clone(), open: false }, t, &mut bound);
+                let mut out = bare(name).to_string();
+                for p in params {
+                    let arg = bound.get(p).cloned().unwrap_or(Type::TypeVar(*p));
+                    out.push(' ');
+                    out.push_str(&paren(self.ty(&arg)?));
+                }
+                out
+            }
             Type::Tuple(items) => {
                 let xs: Result<Vec<String>, String> = items.iter().map(|i| self.ty(i)).collect();
                 format!("({})", xs?.join(", "))
@@ -434,6 +523,32 @@ impl Cx<'_> {
 
     /// rocemit's idioms, read back as the Codex they were written from.
     fn idiom(&self, e: &Expr) -> Result<Option<String>, String> {
+        // `List.get(xs, I64.to_u64_wrap(i)) ?? crash(..)`, which the parser has
+        // made a match, is `list-at xs i`; `List.set` is `list-set-at`.
+        if let Expr::Match { scrutinee, arms, .. } = e {
+            if arms.len() == 2 && matches!(arms[1].body, Expr::Crash(..)) {
+                if let [Pattern::Tag { name: "Ok", args }] = arms[0].patterns.as_slice() {
+                    if let ([Pattern::Binding(v)], Expr::Ident(b, _)) = (args.as_slice(), &arms[0].body) {
+                        if v == b {
+                            for (roc, codex) in [("List.get", "list-at"), ("List.set", "list-set-at")] {
+                                if let Some(xs) = call_of(scrutinee, roc) {
+                                    let mut out = codex.to_string();
+                                    for (k, x) in xs.iter().enumerate() {
+                                        let x = match (k, call_of(x, "I64.to_u64_wrap")) {
+                                            (1, Some([i])) => i,
+                                            _ => x,
+                                        };
+                                        out.push(' ');
+                                        out.push_str(&paren(self.expr(x)?));
+                                    }
+                                    return Ok(Some(out));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // `Text.concat(a, b)` is `&`.
         if let Some([a, b]) = call_of(e, "Text.concat") {
             return Ok(Some(format!("{} & {}", self.expr(a)?, paren(self.expr(b)?))));
