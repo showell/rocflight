@@ -490,6 +490,7 @@ impl<'a> Cx<'a> {
                 let Some((ps, result)) = peel(&sig, params.len()) else {
                     return Err(format!("`{}`'s type has fewer parameters than its lambda", name));
                 };
+                if std::env::var("R2R_DEBUG").is_ok() { eprintln!("DEBUG {} sig={} node={:?}", name, sig, self.ty_of(value).map(|t| t.to_string())); }
                 let mut vars = Vec::new();
                 vars_of(&sig, &mut vars);
                 // `main!`'s arguments are the platform's strings, whatever the
@@ -598,12 +599,7 @@ impl<'a> Cx<'a> {
             },
             Expr::BinOp { left, op, right, .. } => self.binop(left, *op, right, scope)?,
             Expr::Call { func, args, .. } => self.call(func, args, e, scope)?,
-            Expr::If { condition, then_branch, otherwise, .. } => format!(
-                "(if {} {{\n    {}\n}} else {{\n    {}\n}})",
-                self.expr(condition, scope)?,
-                indent(&self.result(then_branch, e, scope)?, 4),
-                indent(&self.result(otherwise, e, scope)?, 4)
-            ),
+            Expr::If { condition, then_branch, otherwise, .. } => self.branching(condition, then_branch, otherwise, &self.ty_of(e).ok(), scope)?,
             Expr::Let { .. } | Expr::VarDecl { .. } | Expr::Assign { .. } => self.block(e, scope)?,
             Expr::While { condition, body, .. } => {
                 let (label, inner) = self.loop_scope(scope);
@@ -664,7 +660,7 @@ impl<'a> Cx<'a> {
                 out.push_str(" __t }");
                 out
             }
-            Expr::Match { scrutinee, arms, .. } => self.matching(scrutinee, arms, e, scope)?,
+            Expr::Match { scrutinee, arms, .. } => self.matching(scrutinee, arms, &self.ty_of(e).ok(), scope)?,
             Expr::List(items, _) => {
                 let xs: Result<Vec<String>, String> = items.iter().map(|i| self.expr(i, scope)).collect();
                 format!("List::of(vec![{}])", xs?.join(", "))
@@ -754,10 +750,7 @@ impl<'a> Cx<'a> {
             Some(Type::I16) => "i16",
             Some(Type::I32) => "i32",
             Some(Type::I128) => "i128",
-            Some(Type::F64) => return format!("{}f64", n),
-            // A whole-number literal the checker left as a fraction: unsuffixed,
-            // for rustc to type from where it goes (an I64 field it lost track of).
-            Some(Type::Dec) => return if n < 0 { format!("({})", n) } else { n.to_string() },
+            Some(Type::F64) | Some(Type::Dec) => return if n < 0 { format!("({}f64)", n) } else { format!("{}f64", n) },
             Some(Type::F32) => return format!("{}f32", n),
             _ => "i64",
         };
@@ -1009,19 +1002,33 @@ impl<'a> Cx<'a> {
         Ok(format!("{} {{ {} }}", rust, parts.join(", ")))
     }
 
+    fn branching(&self, condition: &Expr, then_branch: &Expr, otherwise: &Expr, whole: &Option<Type>, scope: &Scope) -> Result<String, String> {
+        Ok(format!(
+            "(if {} {{\n    {}\n}} else {{\n    {}\n}})",
+            self.expr(condition, scope)?,
+            indent(&self.result(then_branch, whole, scope)?, 4),
+            indent(&self.result(otherwise, whole, scope)?, 4)
+        ))
+    }
+
     /// An arm's or a branch's value. A lone tag there (`Solo =>` beside
-    /// `Anytime => Partner(p)`) knows only itself, an open `[Solo, ..]`; it is a
-    /// value of the whole `match` or `if`, whose type holds every arm's tags.
-    fn result(&self, body: &Expr, whole: &Expr, scope: &Scope) -> Result<String, String> {
-        if let Expr::Tag { name, args, .. } = body {
-            if let (Type::TagUnion { open: true, .. }, Ok(w @ Type::TagUnion { .. })) = (self.ty_of(body)?, self.ty_of(whole)) {
-                let Type::TagUnion { tags, .. } = &w else { unreachable!("matched") };
-                if tags.iter().any(|(n, _)| n == name) {
-                    return self.tag_typed(name, args, &w, scope);
+    /// `Anytime => Partner(p)`) knows only itself, an open `[Solo, ..]`, and a
+    /// nested `if` or `match` knows only its own tags; each is a value of the
+    /// whole `match` or `if`, whose type holds every arm's tags.
+    fn result(&self, body: &Expr, whole: &Option<Type>, scope: &Scope) -> Result<String, String> {
+        match body {
+            Expr::Tag { name, args, .. } => {
+                if let (Type::TagUnion { open: true, .. }, Some(w @ Type::TagUnion { tags, .. })) = (self.ty_of(body)?, whole) {
+                    if tags.iter().any(|(n, _)| n == name) {
+                        return self.tag_typed(name, args, w, scope);
+                    }
                 }
+                self.expr(body, scope)
             }
+            Expr::If { condition, then_branch, otherwise, .. } => self.branching(condition, then_branch, otherwise, whole, scope),
+            Expr::Match { scrutinee, arms, .. } => self.matching(scrutinee, arms, whole, scope),
+            _ => self.expr(body, scope),
         }
-        self.expr(body, scope)
     }
 
     fn tag(&self, name: &str, args: &[Expr], e: &Expr, scope: &Scope) -> Result<String, String> {
@@ -1104,7 +1111,7 @@ impl<'a> Cx<'a> {
 
     // ---- matching ----
 
-    fn matching(&self, scrutinee: &Expr, arms: &[MatchArm], e: &Expr, scope: &Scope) -> Result<String, String> {
+    fn matching(&self, scrutinee: &Expr, arms: &[MatchArm], whole: &Option<Type>, scope: &Scope) -> Result<String, String> {
         let st = self.ty_of(scrutinee)?;
         let mut out = format!("{{ let __s = {}; 'm: {{\n", self.expr(scrutinee, scope)?);
         for arm in arms {
@@ -1114,7 +1121,7 @@ impl<'a> Cx<'a> {
                 let tail = {
                     let mut probe = inner.clone();
                     self.pat_names(p, &mut probe.locals);
-                    let body = self.result(&arm.body, e, &probe)?;
+                    let body = self.result(&arm.body, whole, &probe)?;
                     match &arm.guard {
                         Some(g) => format!("if {} {{ break 'm ({}); }}", self.expr(g, &probe)?, body),
                         None => format!("break 'm ({});", body),

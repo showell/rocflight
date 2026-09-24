@@ -861,7 +861,11 @@ impl TypeChecker {
             // than joined and then unified: `if c { a: 5 } else {}` against
             // `{ a ?: U8 }` checks `{ a: 5 }` and `{}` each against the optional-field
             // record, where joining them (a record with `{}`) would fail.
-            Expr::If { condition, then_branch, otherwise, .. } => {
+            // Against a type still unknown there is nothing to check against, and
+            // the fallback's `synth` joins the branches: checked one by one, the first
+            // branch's `[Above, ..]` would bind the variable and no later tag could
+            // grow it.
+            Expr::If { condition, then_branch, otherwise, .. } if !matches!(resolved, Type::TypeVar(_)) => {
                 let cond = self.synth(condition)?;
                 self.unify(&cond, &Type::Bool)?;
                 self.check(then_branch, &resolved)?;
@@ -870,8 +874,9 @@ impl TypeChecker {
             // Each arm body checked against the expected type — so a `|_| {}` lambda
             // (whose `_` param wraps the body in a match) checks its `{}` against the
             // annotated result rather than synthesising it to a bare unit. Still
-            // exhaustiveness-checked, via the shared helper.
-            Expr::Match { scrutinee, arms, id } => {
+            // exhaustiveness-checked, via the shared helper. Against a type still
+            // unknown, the fallback's `synth` joins the arms, as for `if`.
+            Expr::Match { scrutinee, arms, id } if !matches!(resolved, Type::TypeVar(_)) => {
                 let scrutinee_type = self.synth(scrutinee)?;
                 // Recorded as `synth` records it: a literal pattern against a nominal
                 // with a conversion needs the scrutinee's type (`match_types`).
