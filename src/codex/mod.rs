@@ -50,6 +50,8 @@ pub struct Input<'a> {
 /// The module that is Codex's own text, and the Foreword chapters every unit carries.
 const TEXT_MODULE: &str = "CceText";
 const CHAR_MODULE: &str = "CceChar";
+/// rocemit's own helpers: each stands for a Codex builtin or operator.
+const PRELUDE_MODULE: &str = "Prelude";
 const CARRIED: [&str; 3] = ["ListUtils", "Tuple", "Console"];
 
 /// Roc's wrapping arithmetic in Codex. A plain `Integer` passes for an
@@ -108,10 +110,10 @@ pub fn emit(input: &Input) -> Result<String, String> {
         out.push_str("\n\n");
     }
     out.push_str(WRAP_CHAPTER);
-    let mut names: Vec<&str> = input.modules.iter().map(|m| m.name.as_str()).filter(|n| *n != TEXT_MODULE && *n != CHAR_MODULE).collect();
+    let mut names: Vec<&str> = input.modules.iter().map(|m| m.name.as_str()).filter(|n| ![TEXT_MODULE, CHAR_MODULE, PRELUDE_MODULE].contains(n)).collect();
     names.push("Wrap");
     for module in &input.modules {
-        if module.name == TEXT_MODULE || module.name == CHAR_MODULE {
+        if [TEXT_MODULE, CHAR_MODULE, PRELUDE_MODULE].contains(&module.name.as_str()) {
             continue;
         }
         out.push_str(&cx.chapter(&module.name, module.ast, &module.types, &names)?);
@@ -721,6 +723,46 @@ impl Cx<'_> {
         }
         if let Some([x]) = call_of(e, "I64.bitwise_not") {
             return Ok(Some(format!("bit-not {}", paren(self.expr(x)?))));
+        }
+        // Reals, and rocemit's Prelude: `~` is approximate equality, `~0` exact.
+        if let Some([a, b]) = call_of(e, "Prelude.approx_eq") {
+            return Ok(Some(format!("{} ~ {}", paren(self.expr(a)?), paren(self.expr(b)?))));
+        }
+        if let Expr::BinOp { left, op: BinOp::Eq, right, .. } = e {
+            if let (Some([a]), Some([b])) = (call_of(left, "F64.to_bits"), call_of(right, "F64.to_bits")) {
+                return Ok(Some(format!("{} ~0 {}", paren(self.expr(a)?), paren(self.expr(b)?))));
+            }
+        }
+        if let Some([t]) = call_of(e, "CceText.of_str") {
+            if let Some([x]) = call_of(t, "Prelude.real_to_str") {
+                return Ok(Some(format!("show {}", paren(self.expr(x)?))));
+            }
+        }
+        if let Some([x]) = call_of(e, "U64.to_i64_wrap") {
+            if let Some([r]) = call_of(x, "F64.to_bits") {
+                return Ok(Some(format!("real-to-bits {}", paren(self.expr(r)?))));
+            }
+        }
+        if let Some([x]) = call_of(e, "F64.from_bits") {
+            if let Some([b]) = call_of(x, "I64.to_u64_wrap") {
+                return Ok(Some(format!("bits-to-real {}", paren(self.expr(b)?))));
+            }
+        }
+        for (roc, codex) in [
+            ("Prelude.int_abs", "abs"),
+            ("I64.to_f64", "real-from-int"),
+            ("F64.to_i64_wrap", "real-to-int"),
+            ("F64.abs", "real-abs"),
+            ("F64.sqrt", "real-sqrt"),
+        ] {
+            if let Some([x]) = call_of(e, roc) {
+                return Ok(Some(format!("{} {}", codex, paren(self.expr(x)?))));
+            }
+        }
+        for (roc, codex) in [("F64.max", "real-max"), ("F64.min", "real-min")] {
+            if let Some([a, b]) = call_of(e, roc) {
+                return Ok(Some(format!("{} {} {}", codex, paren(self.expr(a)?), paren(self.expr(b)?))));
+            }
         }
         // rocemit writes arithmetic on a Codex `Integer wrapping` as Roc's
         // wrapping operations; the Codex has lost that type, so the wrapping
