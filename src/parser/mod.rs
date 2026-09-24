@@ -45,6 +45,12 @@ pub struct Parser {
     /// `(module path, exposed names)`. The path is relative to the importing file and
     /// names a `.roc` beside it — `Dir/Hello` is `Dir/Hello.roc`.
     local_modules: Vec<(String, Vec<String>)>,
+    /// The method blocks open around the current position, innermost last.
+    open_blocks: Vec<String>,
+    /// Each nominal declared inside another's method block, with that owner:
+    /// `Shape :: [].{ Box := [B(I64)].{ ... } }` gives `("Box", "Shape")`. See
+    /// `enclosing_owners`.
+    enclosing_owners: Vec<(String, String)>,
     /// How deep `parse_expr` is nested. Only the outermost call wraps the program in
     /// its nominal method bindings.
     expr_depth: u32,
@@ -168,6 +174,8 @@ impl Parser {
             imports: Vec::new(),
             ingests: Vec::new(),
             local_modules: Vec::new(),
+            open_blocks: Vec::new(),
+            enclosing_owners: Vec::new(),
             deferred_expects: Vec::new(),
             field_defaults: Vec::new(),
             optional_fields: Vec::new(),
@@ -1351,6 +1359,18 @@ impl Parser {
         if !self.input[self.pos..].starts_with(".{") {
             return;
         }
+        // A block inside another's: its methods see the outer block's members too.
+        if let Some(outer) = self.open_blocks.last() {
+            if outer != type_name {
+                self.enclosing_owners.push((type_name.to_string(), outer.clone()));
+            }
+        }
+        self.open_blocks.push(type_name.to_string());
+        self.parse_method_block_members(type_name);
+        self.open_blocks.pop();
+    }
+
+    fn parse_method_block_members(&mut self, type_name: &str) {
         self.pos += 2;
 
         // Whatever annotations are pending when this block closes, and were pushed
@@ -1880,6 +1900,13 @@ impl Parser {
     /// Local modules imported, as `(module path, names it exposes)`.
     pub fn local_modules(&self) -> &[(String, Vec<String>)] {
         &self.local_modules
+    }
+
+    /// Each nominal declared inside another's method block, and that owner. A method
+    /// of the inner one sees the outer one's members by their bare names, as its own
+    /// siblings: `Box.is_eq` may call `Shape`'s `same_box` as `same_box`.
+    pub fn enclosing_owners(&self) -> &[(String, String)] {
+        &self.enclosing_owners
     }
 
     /// Files ingested by `import "path" as name`, as `(binding name, path)`.

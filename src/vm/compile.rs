@@ -210,6 +210,9 @@ pub struct Unit<'a> {
     /// rather than a compile error on a name that is, after all, declared. That is how
     /// a qualified builtin like `Str.repeat` already behaves.
     pub intrinsics: std::collections::HashSet<&'static str>,
+    /// A nested nominal's enclosing owner, from `Parser::enclosing_owners`: the
+    /// owner a sibling lookup tries next.
+    pub enclosing_owners: std::collections::HashMap<&'static str, &'static str>,
     /// `roc test` semantics: run the top-level `expect`s and tally them. A normal run
     /// SKIPS them — roc only treats a top-level `expect` as a test — while an `expect`
     /// inside a function body runs either way.
@@ -247,6 +250,7 @@ pub fn compile(ast: &Expr, entry: Option<&str>) -> Result<Program, String> {
         parse_targets: std::collections::HashMap::new(),
         collect_targets: std::collections::HashMap::new(),
         intrinsics: std::collections::HashSet::new(),
+        enclosing_owners: std::collections::HashMap::new(),
         // The bare helper is what the unit tests and `vm::eval` use: run everything.
         test_mode: true,
     })
@@ -477,6 +481,7 @@ pub fn compile_reporting(
         capture_free_methods: Vec::new(),
         global_owner: None,
         intrinsics: &unit.intrinsics,
+        enclosing_owners: &unit.enclosing_owners,
     };
 
     for (name, value) in bindings.iter().take(phase_a) {
@@ -784,6 +789,8 @@ struct Compiler<'u> {
     global_owner: Option<&'static str>,
     /// Bare low-level names the builtin module declares; see `Unit::intrinsics`.
     intrinsics: &'u std::collections::HashSet<&'static str>,
+    /// See `Unit::enclosing_owners`.
+    enclosing_owners: &'u std::collections::HashMap<&'static str, &'static str>,
 }
 
 /// Does this instruction move control, or leave the block?
@@ -1114,6 +1121,21 @@ impl<'u> Compiler<'u> {
             }
         }
         found
+    }
+
+    /// The block the code being compiled belongs to, then each block around it: the
+    /// owners a bare sibling name is tried under, innermost first.
+    fn enclosing_owners_of(&self) -> Vec<&'static str> {
+        let mut owners = Vec::new();
+        let mut owner = self.enclosing_type();
+        while let Some(o) = owner {
+            if owners.contains(&o) {
+                break;
+            }
+            owners.push(o);
+            owner = self.enclosing_owners.get(o).copied();
+        }
+        owners
     }
 
     fn enclosing_type(&self) -> Option<&'static str> {
@@ -2918,7 +2940,7 @@ impl<'u> Compiler<'u> {
             None => {
                 // The same sibling rule, for a method used as a VALUE rather than
                 // called: `map(xs, helper)` inside the block `helper` belongs to.
-                if let Some(owner) = self.enclosing_type() {
+                for owner in self.enclosing_owners_of() {
                     let qualified = qualify(owner, name);
                     if self.resolve(qualified).is_some() {
                         return self.use_name(qualified);
@@ -2976,7 +2998,7 @@ impl<'u> Compiler<'u> {
                 }
                 // A SIBLING method, called by its bare name from inside the same
                 // method block: `from_list = |l| from_dict(…)` inside `Graph`.
-                if let Some(owner) = self.enclosing_type() {
+                for owner in self.enclosing_owners_of() {
                     if let Some((chunk, arity)) = self.tops.func(qualify(owner, bare)) {
                         let (arg_base, argc) = self.arguments(args)?;
                         check_arity(bare, arity, argc)?;
