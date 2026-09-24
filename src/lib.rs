@@ -23,6 +23,7 @@ pub mod platform;
 pub mod builtin;
 pub mod artifact;
 pub mod run;
+pub mod codex;
 
 /// Is phase timing on? `ROCFLIGHT_TIME=1` turns it on.
 ///
