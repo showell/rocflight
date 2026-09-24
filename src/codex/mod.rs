@@ -109,6 +109,12 @@ pub fn emit(input: &Input) -> Result<String, String> {
         out.push_str(text.trim_end());
         out.push_str("\n\n");
     }
+    // A program that pokes raw memory is emitted over rocemit's `Mem`, threaded
+    // through every function that reaches it: a whole-program rewrite, not an
+    // idiom, and not undone here.
+    if input.modules.iter().any(|m| m.name == "Mem") {
+        return Err("the program threads rocemit's machine memory (Mem)".into());
+    }
     out.push_str(WRAP_CHAPTER);
     let mut names: Vec<&str> = input.modules.iter().map(|m| m.name.as_str()).filter(|n| ![TEXT_MODULE, CHAR_MODULE, PRELUDE_MODULE].contains(n)).collect();
     names.push("Wrap");
@@ -559,6 +565,14 @@ impl Cx<'_> {
                 let rname = self.record_name(tf).ok_or("a record literal of no declared record type")?;
                 let fs: Result<Vec<String>, String> = fields.iter().map(|(f, v)| Ok(format!("{} = {}", kebab(f), self.expr(v)?))).collect();
                 format!("{} {{ {} }}", type_name(rname), fs?.join(", "))
+            }
+            // `{ ..r, f: v }` is Codex's `__record-set r "f" v`, a field at a time.
+            Expr::RecordUpdate { base, fields, .. } => {
+                let mut out = self.expr(base)?;
+                for (f, v) in fields {
+                    out = format!("__record-set {} \"{}\" {}", paren(out), kebab(f), paren(self.expr(v)?));
+                }
+                out
             }
             Expr::FieldAccess { record, field, .. } => format!("{}.{}", paren(self.expr(record)?), kebab(field)),
             Expr::Tag { name, args, .. } => {
