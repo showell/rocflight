@@ -491,6 +491,28 @@ impl Cx<'_> {
         match e {
             // A block of statements.
             Expr::Let { .. } => self.statements(e, ind),
+            // A choice among statements: a `when` whose arms are acts.
+            Expr::Match { scrutinee, arms, .. } if is_statement(e) => {
+                let (scrutinee, on_char) = match call_of(scrutinee, "CceChar.code") {
+                    Some([c]) => (c, true),
+                    _ => (&**scrutinee, false),
+                };
+                let mut out = format!("{}when {}\n", pad, self.expr(scrutinee)?);
+                for arm in arms {
+                    if arm.guard.is_some() {
+                        return Err("a match arm with a guard".into());
+                    }
+                    for p in &arm.patterns {
+                        let pat = match p {
+                            Pattern::Int(n) if on_char => self.char_literal(*n).ok_or_else(|| format!("a Char pattern {} with no printable literal", n))?,
+                            Pattern::Wildcard => "otherwise".into(),
+                            other => self.pattern(other, scrutinee)?,
+                        };
+                        out.push_str(&format!("{}  is {} -> act\n{}{}  end\n", pad, pat, self.statements(&arm.body, ind + 4)?, pad));
+                    }
+                }
+                Ok(out)
+            }
             other => Err(format!("a statement {}", short(other))),
         }
     }
@@ -897,9 +919,13 @@ fn effect_call(e: &Expr) -> bool {
     matches!(&**func, Expr::Ident(n, _) | Expr::Qualified { name: n, .. } if n.ends_with('!') && *n != "line!")
 }
 
-/// Is `e` something an act says rather than answers: printing, or an effect?
+/// Is `e` something an act says rather than answers: printing, an effect, or a
+/// choice among them?
 fn is_statement(e: &Expr) -> bool {
-    effect_call(e) || call_of(e, "line!").is_some() || matches!(e, Expr::Let { .. })
+    effect_call(e)
+        || call_of(e, "line!").is_some()
+        || matches!(e, Expr::Let { .. })
+        || matches!(e, Expr::Match { arms, .. } if arms.iter().any(|a| is_statement(&a.body)))
 }
 
 /// The first `n` parameters of a curried function type, and what is left.

@@ -60,8 +60,8 @@ program's chapters as `Roc--Name`.
 
 ## Where it stands (2026-09-24)
 
-484 of 526 round-trip, none wrong. 3 are ORACLE-FAIL. 10 are refused on purpose:
+488 of 526 round-trip, none wrong. 3 are ORACLE-FAIL. 10 are refused on purpose:
 a program that pokes raw memory is emitted over rocemit's `Mem`, threaded
 through every function, which is a whole-program rewrite rather than an idiom.
-The rest are single cases: `when` guards, a `when` as an act statement, a few
-methods on values, `List.insert`.
+The rest are single cases: `when` guards, a few methods on values, float
+conversions, `List.insert`.
