@@ -575,14 +575,14 @@ impl<'a> Cx<'a> {
             Expr::Record(fields, _) => self.record(fields, e, scope)?,
             Expr::RecordUpdate { base, fields, .. } => {
                 let t = self.ty_of(e)?;
-                let mut out = format!("{{ let mut r = {};", self.expr(base, scope)?);
+                let mut out = format!("{{ let mut __r = {};", self.expr(base, scope)?);
                 for (f, v) in fields {
                     let (_, boxed) = self.field_type(&t, f)?;
                     let v = self.expr(v, scope)?;
                     let v = if boxed { format!("Rc::new({})", v) } else { v };
-                    out.push_str(&format!(" r.{} = {};", sanitize(f), v));
+                    out.push_str(&format!(" __r.{} = {};", sanitize(f), v));
                 }
-                out.push_str(" r }");
+                out.push_str(" __r }");
                 out
             }
             Expr::FieldAccess { record, field, .. } => {
@@ -702,13 +702,13 @@ impl<'a> Cx<'a> {
                     return Ok(format!("echo({})", xs.join(", ")));
                 }
                 match self.resolve(n, scope) {
-                    Some(top) if self.tops[&top] => sanitize(&top),
+                    Some(top) if self.tops[&top] => format!("{}{}", sanitize(&top), self.turbofish(&top, func, scope)?),
                     Some(top) => format!("({})", self.top_value(&top, func, scope)?),
                     None => return Err(format!("a call to `{}`", n)),
                 }
             }
             Expr::Qualified { module, name, .. } => match self.qualified(module, name) {
-                Some(top) if self.tops[&top] => sanitize(&top),
+                Some(top) if self.tops[&top] => format!("{}{}", sanitize(&top), self.turbofish(&top, func, scope)?),
                 Some(top) => format!("({})", self.top_value(&top, func, scope)?),
                 None if BUILTIN_MODULES.contains(module) => {
                     if matches!(*module, "List" | "Str") {
@@ -728,6 +728,52 @@ impl<'a> Cx<'a> {
     /// A field's type at this use, and whether the definition holds it behind an
     /// `Rc`: a nominal field of a nominal record is; a structural record's field is
     /// a type parameter, never.
+    /// A generic function's type arguments at a call, from the use's type: Roc
+    /// lets a variable stay unconstrained (`List.len(make_empty(0))`) and Rust
+    /// does not, so one nothing binds is `()`.
+    fn turbofish(&self, top: &str, func: &Expr, scope: &Scope) -> Result<String, String> {
+        let Some(sig) = self.sig_of(top) else { return Ok(String::new()) };
+        let mut vars = Vec::new();
+        vars_of(&sig, &mut vars);
+        if vars.is_empty() {
+            return Ok(String::new());
+        }
+        // A qualified callee has no type of its own recorded; rustc infers there.
+        let Some(used) = self.types.get(&func.id()).cloned() else { return Ok(String::new()) };
+        let mut bound = HashMap::new();
+        bind(&sig, &used, &mut bound);
+        let mut args = Vec::new();
+        for v in &vars {
+            let t = bound.get(v).cloned().unwrap_or(Type::Unit);
+            let mut free = Vec::new();
+            vars_of(&t, &mut free);
+            // In a function with no type parameters a leftover variable is
+            // unconstrained, so `()`; inside a generic one it may be one of that
+            // function's own, under the checker's id, so rustc infers it.
+            if free.iter().any(|f| !scope.generics.contains(f)) && !scope.generics.is_empty() {
+                args.push(erase_free(&self.ty(&t)?, &scope.generics));
+            } else {
+                let t = if free.iter().any(|f| !scope.generics.contains(f)) { subst_free(&t, &scope.generics) } else { t };
+                args.push(self.ty(&t)?);
+            }
+        }
+        Ok(format!("::<{}>", args.join(", ")))
+    }
+
+    /// A top-level definition's declared type: its annotation, or its value's type.
+    fn sig_of(&self, top: &str) -> Option<Type> {
+        for ast in self.input.modules.iter().map(|m| m.ast).chain(std::iter::once(self.input.app)) {
+            let mut cursor = ast;
+            while let Expr::Let { name, annotation, value, body, .. } = cursor {
+                if *name == top {
+                    return annotation.clone().or_else(|| self.types.get(&value.id()).cloned());
+                }
+                cursor = body;
+            }
+        }
+        None
+    }
+
     fn field_type(&self, t: &Type, field: &str) -> Result<(Type, bool), String> {
         match t {
             Type::Record { fields, .. } => fields.iter().find(|(f, _)| *f == field).map(|(_, t)| (t.clone(), false)).ok_or_else(|| format!("no field {}", field)),
@@ -867,7 +913,7 @@ impl<'a> Cx<'a> {
 
     fn matching(&self, scrutinee: &Expr, arms: &[MatchArm], scope: &Scope) -> Result<String, String> {
         let st = self.ty_of(scrutinee)?;
-        let mut out = format!("{{ let s = {}; 'm: {{\n", self.expr(scrutinee, scope)?);
+        let mut out = format!("{{ let __s = {}; 'm: {{\n", self.expr(scrutinee, scope)?);
         for arm in arms {
             for p in &arm.patterns {
                 let mut inner = scope.clone();
@@ -881,7 +927,7 @@ impl<'a> Cx<'a> {
                         None => format!("break 'm ({});", body),
                     }
                 };
-                let code = self.pat(p, "(&s)", &st, &mut binds, &mut inner, tail)?;
+                let code = self.pat(p, "(&__s)", &st, &mut binds, &mut inner, tail)?;
                 out.push_str(&format!("    {}\n", indent(&code, 4)));
             }
         }
@@ -958,7 +1004,7 @@ impl<'a> Cx<'a> {
                 if matches!(t, Type::Bool) {
                     return Ok(format!("if *{} == {} {{ {} }}", v, *name == "True", inner));
                 }
-                let names: Vec<String> = (0..args.len()).map(|i| format!("p{}_{}", k, i)).collect();
+                let names: Vec<String> = (0..args.len()).map(|i| format!("__p{}_{}", k, i)).collect();
                 for n in &names {
                     binds.push(n.clone());
                 }
@@ -1096,6 +1142,14 @@ fn holds_fn(t: &Type) -> bool {
         Type::TagUnion { tags, .. } => tags.iter().flat_map(|(_, p)| p).any(holds_fn),
         _ => false,
     }
+}
+
+/// A type with every variable not among `keep` made `()`: nothing constrains it.
+fn subst_free(t: &Type, keep: &[u32]) -> Type {
+    let mut vars = Vec::new();
+    vars_of(t, &mut vars);
+    let bound: HashMap<u32, Type> = vars.into_iter().filter(|v| !keep.contains(v)).map(|v| (v, Type::Unit)).collect();
+    subst(t, &bound)
 }
 
 fn subst(t: &Type, bound: &HashMap<u32, Type>) -> Type {
