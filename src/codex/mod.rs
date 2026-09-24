@@ -339,10 +339,7 @@ impl Cx<'_> {
             Type::Nominal { name, .. } if bare(name) == TEXT_MODULE => "Text".into(),
             Type::Nominal { name, .. } if bare(name) == CHAR_MODULE => "Char".into(),
             Type::Nominal { name, .. } => type_name(name),
-            Type::Record { fields, .. } => match self.record_name(fields) {
-                Some(n) => type_name(n),
-                None => return Err(format!("an anonymous record type {}", t)),
-            },
+            Type::Record { fields, .. } => type_name(self.record_names(fields)?),
             Type::TypeVar(v) => format!("t{}", v),
             Type::TagUnion { tags, .. } => {
                 let names: Vec<&str> = {
@@ -386,10 +383,21 @@ impl Cx<'_> {
     }
 
     fn record_name(&self, fields: &[(&'static str, Type)]) -> Option<&'static str> {
+        self.record_names(fields).ok()
+    }
+
+    /// The one declared record type with these fields; or, where there is none or
+    /// more than one, why not. Two aliases of one shape (`Byte : { val : I64 }`,
+    /// `Wide : { val : I64 }`) are one Roc type, and which Codex type a literal
+    /// was is not in the Roc.
+    fn record_names(&self, fields: &[(&'static str, Type)]) -> Result<&'static str, String> {
         let want = field_names(fields);
-        let mut found = self.records.iter().filter(|(_, fs)| *fs == want).map(|(n, _)| *n);
-        let first = found.next()?;
-        found.next().is_none().then(|| bare(first)).map(|s| crate::memory::string_pool::intern(s))
+        let found: Vec<&str> = self.records.iter().filter(|(_, fs)| *fs == want).map(|(n, _)| bare(n)).collect();
+        match found.as_slice() {
+            [one] => Ok(crate::memory::string_pool::intern(one)),
+            [] => Err(format!("a record {{ {} }} of no declared record type", want.join(", "))),
+            many => Err(format!("a record {{ {} }} that could be any of {}", want.join(", "), many.join(", "))),
+        }
     }
 
     /// A top-level definition: its signature, then its equation.
@@ -548,7 +556,9 @@ impl Cx<'_> {
             // the largest Integer; its own programs write the minimum in hex.
             Expr::Int(n, _) if *n == i64::MIN as i128 => "#8000000000000000".into(),
             Expr::Int(n, _) => n.to_string(),
-            Expr::Float(f, _, _) if matches!(self.ty_of(e), Some(Type::F64)) => format!("{:?}", f),
+            // Codex has one real type: a fractional literal the checker left as a
+            // `Dec` (an unannotated record's field) is a Codex real as well.
+            Expr::Float(f, _, _) => real_literal(*f).ok_or_else(|| format!("a real {} Codex cannot spell", f))?,
             // Codex has one string type, `Text`. A literal the checker left as `Str`
             // (a let-generalised local's) is still one; what a `Str` could do that a
             // `Text` cannot is a `Str` builtin, and those are refused.
@@ -591,11 +601,10 @@ impl Cx<'_> {
                 format!("[{}]", xs?.join(", "))
             }
             Expr::Record(fields, _) => {
-                let ty = self.ty_of(e).cloned();
-                let Some(Type::Record { fields: tf, .. }) = ty.as_ref().map(strip) else {
-                    return Err("a record literal of no record type".into());
-                };
-                let rname = self.record_name(tf).ok_or("a record literal of no declared record type")?;
+                // Named by its own fields, which a literal lists in full: its type
+                // can be an unresolved variable (a payload of a generic tag).
+                let shape: Vec<(&'static str, Type)> = fields.iter().map(|(f, _)| (*f, Type::Unit)).collect();
+                let rname = self.record_names(&shape)?;
                 let fs: Result<Vec<String>, String> = fields.iter().map(|(f, v)| Ok(format!("{} = {}", kebab(f), self.expr(v)?))).collect();
                 format!("{} {{ {} }}", type_name(rname), fs?.join(", "))
             }
@@ -722,6 +731,11 @@ impl Cx<'_> {
         })
     }
 
+    fn concat_left(&self, a: &Expr) -> Result<String, String> {
+        let s = self.expr(a)?;
+        Ok(if call_of(a, "CceText.concat").is_some() || call_of(a, "List.concat").is_some() { s } else { paren(s) })
+    }
+
     /// rocemit's idioms, read back as the Codex they were written from.
     fn idiom(&self, e: &Expr) -> Result<Option<String>, String> {
         // A Codex Char: `CceChar.of_code(15)` is `'a'`; the conversions and the
@@ -771,8 +785,10 @@ impl Cx<'_> {
             }
         }
         // `Text.concat(a, b)` is `&`.
+        // `&` is left-associative, so a left operand that is itself an `&` needs no
+        // parentheses; anything else might reach past it (`if .. else "a" & "b"`).
         if let Some([a, b]) = call_of(e, "CceText.concat") {
-            return Ok(Some(format!("{} & {}", self.expr(a)?, paren(self.expr(b)?))));
+            return Ok(Some(format!("{} & {}", self.concat_left(a)?, paren(self.expr(b)?))));
         }
         if let Some([n]) = call_of(e, "CceText.show_int") {
             return Ok(Some(format!("show {}", paren(self.expr(n)?))));
@@ -811,7 +827,7 @@ impl Cx<'_> {
             }
         }
         if let Some([a, b]) = call_of(e, "List.concat") {
-            return Ok(Some(format!("{} & {}", self.expr(a)?, paren(self.expr(b)?))));
+            return Ok(Some(format!("{} & {}", self.concat_left(a)?, paren(self.expr(b)?))));
         }
         if let Some([xs, x]) = call_of(e, "List.append") {
             return Ok(Some(format!("list-snoc {} {}", paren(self.expr(xs)?), paren(self.expr(x)?))));
@@ -861,9 +877,7 @@ impl Cx<'_> {
         // A real rocemit wrote as its bits: the shortest decimal that reads back as
         // those bits, where Codex can spell it.
         if let Some([Expr::Int(bits, _)]) = call_of(e, "F64.from_bits") {
-            let f = f64::from_bits(*bits as u64);
-            let text = format!("{:?}", f);
-            if f.is_finite() && !text.contains('e') {
+            if let Some(text) = real_literal(f64::from_bits(*bits as u64)) {
                 return Ok(Some(text));
             }
         }
@@ -997,6 +1011,19 @@ fn text_literal(s: &str) -> String {
 /// (and as a negative literal must be), else below it.
 fn body_text(s: &str) -> String {
     if s.contains('\n') { format!("\n    {}", indent(s, 4)) } else { format!(" {}", s) }
+}
+
+/// A real as a Codex literal that reads back as the same double: the shortest
+/// decimal, and a whole number as its digits and `.0` rather than an exponent.
+fn real_literal(f: f64) -> Option<String> {
+    if !f.is_finite() {
+        return None;
+    }
+    let text = format!("{:?}", f);
+    if !text.contains('e') {
+        return Some(text);
+    }
+    (f.fract() == 0.0 && f.abs() < 1e18).then(|| format!("{}.0", f as i128))
 }
 
 fn indent(s: &str, n: usize) -> String {
