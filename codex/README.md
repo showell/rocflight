@@ -92,8 +92,9 @@ unannotated local is let-generalised, and its string or number literal stays
 a `Str` or a fraction where its uses want a `CceText` or an `I64`.
 
 506 of 521 compile and print their verdict. 7 of the rest are the programs
-over rocemit's `Mem`; 5 are rocflight dropping a type's arguments where it is
-written before its declaration (B-Teague/rocflight#11); 3 are single cases.
+over rocemit's `Mem`; 3 are rocflight dropping a type's arguments where it is
+written before its declaration (B-Teague/rocflight#11); 5 are single cases not
+yet looked at.
 
 ## Where it stands (2026-09-24)
 
