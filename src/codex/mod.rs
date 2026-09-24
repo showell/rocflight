@@ -6,10 +6,11 @@
 //! the output the original program was captured with. Two things make that Roc
 //! readable as Codex:
 //!
-//! - **A Codex `Text` is a Roc `Text :: List(U8)`**, a type of its own, so the
-//!   checker's types say where a Codex `Text` was. The `Text` module is Codex's own
-//!   text, not a chapter: `Text.concat` is `&`, `Text.show_int` is `show`, and a
-//!   string literal typed `Text` is a Codex text literal.
+//! - **A Codex `Text` is a Roc `CceText :: List(U8)`, and a Codex `Char` a
+//!   `CceChar :: I64`**, types of their own, so the checker's types say where each
+//!   was. Their modules are Codex's own text, not chapters: `CceText.concat` is `&`,
+//!   `CceText.show_int` is `show`, `CceChar.of_code(15)` is `'a'`, and a string
+//!   literal is a Codex text literal.
 //! - **rocemit writes a Codex builtin as a Roc idiom**, and those are read back as
 //!   the builtin: `U64.to_i64_wrap(List.len(xs))` is `list-length xs`. The idioms
 //!   are rocemit's builtin table (`roc_emit.rs`, `fn builtin`) run backwards.
@@ -47,7 +48,8 @@ pub struct Input<'a> {
 }
 
 /// The module that is Codex's own text, and the Foreword chapters every unit carries.
-const TEXT_MODULE: &str = "Text";
+const TEXT_MODULE: &str = "CceText";
+const CHAR_MODULE: &str = "CceChar";
 const CARRIED: [&str; 3] = ["ListUtils", "Tuple", "Console"];
 
 /// Roc's wrapping arithmetic in Codex. A plain `Integer` passes for an
@@ -87,7 +89,15 @@ pub fn emit(input: &Input) -> Result<String, String> {
             _ => {}
         }
     }
-    let cx = Cx { types: &input.types, records, unions };
+    // What each code 0..127 names, from the program's own `CceText.points`: a
+    // `CceChar.of_code(15)` is the literal `'a'`.
+    let points = input
+        .modules
+        .iter()
+        .find(|m| m.name == TEXT_MODULE)
+        .and_then(|m| list_def(m.ast, "CceText.points"))
+        .unwrap_or_default();
+    let cx = Cx { types: &input.types, records, unions, points };
 
     let mut out = String::new();
     for chapter in CARRIED {
@@ -98,10 +108,10 @@ pub fn emit(input: &Input) -> Result<String, String> {
         out.push_str("\n\n");
     }
     out.push_str(WRAP_CHAPTER);
-    let mut names: Vec<&str> = input.modules.iter().map(|m| m.name.as_str()).filter(|n| *n != TEXT_MODULE).collect();
+    let mut names: Vec<&str> = input.modules.iter().map(|m| m.name.as_str()).filter(|n| *n != TEXT_MODULE && *n != CHAR_MODULE).collect();
     names.push("Wrap");
     for module in &input.modules {
-        if module.name == TEXT_MODULE {
+        if module.name == TEXT_MODULE || module.name == CHAR_MODULE {
             continue;
         }
         out.push_str(&cx.chapter(&module.name, module.ast, &module.types, &names)?);
@@ -146,6 +156,21 @@ struct Cx<'a> {
     /// A union in a signature arrives structural, since an alias is transparent,
     /// and is named in Codex: `[Just(a), None]` is `Maybe a`.
     unions: Vec<(&'static str, Vec<(&'static str, Vec<Type>)>, Vec<u32>)>,
+    /// The code point each CCE code 0..127 names.
+    points: Vec<i128>,
+}
+
+/// The integers of a top-level list definition, `name = [..]`.
+fn list_def(ast: &Expr, name: &str) -> Option<Vec<i128>> {
+    let mut cursor = ast;
+    while let Expr::Let { name: n, value, body, .. } = cursor {
+        if *n == name {
+            let Expr::List(items, _) = &**value else { return None };
+            return items.iter().map(|i| if let Expr::Int(v, _) = i { Some(*v) } else { None }).collect();
+        }
+        cursor = body;
+    }
+    None
 }
 
 /// A declaration's type parameters: the variables of its payloads, in the order
@@ -235,10 +260,6 @@ impl Cx<'_> {
         self.types.get(&e.id())
     }
 
-    fn is_text(&self, e: &Expr) -> bool {
-        matches!(self.ty_of(e), Some(Type::Nominal { name, .. }) if bare(name) == TEXT_MODULE)
-    }
-
     fn chapter(&self, name: &str, ast: &Expr, types: &[(&'static str, Type)], all: &[&str]) -> Result<String, String> {
         let mut out = format!("Chapter: Roc--{}\n  cites Foreword chapter Console\n", name);
         for other in all {
@@ -302,11 +323,13 @@ impl Cx<'_> {
     fn ty(&self, t: &Type) -> Result<String, String> {
         Ok(match t {
             Type::I64 => "Integer".into(),
-            Type::F64 => "Number".into(),
+            Type::Str => "Text".into(),
+            Type::F64 => "Real".into(),
             Type::Bool => "Boolean".into(),
             Type::Unit => "Nothing".into(),
             Type::List(e) => format!("List {}", paren(self.ty(e)?)),
             Type::Nominal { name, .. } if bare(name) == TEXT_MODULE => "Text".into(),
+            Type::Nominal { name, .. } if bare(name) == CHAR_MODULE => "Char".into(),
             Type::Nominal { name, .. } => type_name(name),
             Type::Record { fields, .. } => match self.record_name(fields) {
                 Some(n) => type_name(n),
@@ -421,8 +444,12 @@ impl Cx<'_> {
         let pad = " ".repeat(ind);
         // `line!(Text.printed(t))` is Codex's print-line-uni.
         if let Some([arg]) = call_of(e, "line!") {
-            if let Some([t]) = call_of(arg, "Text.printed") {
+            if let Some([t]) = call_of(arg, "CceText.printed") {
                 return Ok(format!("{}print-line-uni {}\n", pad, paren(self.expr(t)?)));
+            }
+            // An opening's Integer value, which the driver prints.
+            if let Some([n]) = call_of(arg, "I64.to_str") {
+                return Ok(format!("{}print-line-uni (show {})\n", pad, paren(self.expr(n)?)));
             }
         }
         match e {
@@ -441,8 +468,11 @@ impl Cx<'_> {
             // the largest Integer; its own programs write the minimum in hex.
             Expr::Int(n, _) if *n == i64::MIN as i128 => "#8000000000000000".into(),
             Expr::Int(n, _) => n.to_string(),
-            Expr::Str(s, _) if self.is_text(e) => text_literal(s),
-            Expr::Str(s, _) => return Err(format!("a Str literal {:?} that is not a Text", s)),
+            Expr::Float(f, _, _) if matches!(self.ty_of(e), Some(Type::F64)) => format!("{:?}", f),
+            // Codex has one string type, `Text`. A literal the checker left as `Str`
+            // (a let-generalised local's) is still one; what a `Str` could do that a
+            // `Text` cannot is a `Str` builtin, and those are refused.
+            Expr::Str(s, _) => text_literal(s),
             Expr::Bool(b, _) => if *b { "True".into() } else { "False".into() },
             Expr::Ident(n, _) => kebab(n),
             Expr::Qualified { name, .. } => kebab(name),
@@ -539,9 +569,12 @@ impl Cx<'_> {
         Ok(match p {
             Pattern::Wildcard => "otherwise".into(),
             Pattern::Binding(n) => kebab(n),
+            Pattern::Int(n) if matches!(self.ty_of(scrutinee), Some(Type::Nominal { name, .. }) if bare(name) == CHAR_MODULE) => {
+                self.char_literal(*n).ok_or_else(|| format!("a Char pattern {} with no printable literal", n))?
+            }
             Pattern::Int(n) if *n < 0 => format!("({})", n),
             Pattern::Int(n) => n.to_string(),
-            Pattern::Str(s) if self.is_text(scrutinee) => text_literal(s),
+            Pattern::Str(s) => text_literal(s),
             Pattern::Tag { name, args } => {
                 let mut out = name.to_string();
                 for a in args {
@@ -557,8 +590,40 @@ impl Cx<'_> {
         })
     }
 
+    /// A CCE code as a Codex char literal, where the code names a plain printable
+    /// character.
+    fn char_literal(&self, code: i128) -> Option<String> {
+        let point = *self.points.get(usize::try_from(code).ok()?)?;
+        let c = char::from_u32(u32::try_from(point).ok()?)?;
+        (c.is_ascii_graphic() || c == ' ').then(|| match c {
+            '\'' => "'\\''".to_string(),
+            '\\' => "'\\\\'".to_string(),
+            c => format!("'{}'", c),
+        })
+    }
+
     /// rocemit's idioms, read back as the Codex they were written from.
     fn idiom(&self, e: &Expr) -> Result<Option<String>, String> {
+        // A Codex Char: `CceChar.of_code(15)` is `'a'`; the conversions and the
+        // classifiers are Codex's builtins.
+        if let Some([c]) = call_of(e, "CceChar.of_code") {
+            if let Expr::Int(n, _) = c {
+                if let Some(lit) = self.char_literal(*n) {
+                    return Ok(Some(lit));
+                }
+            }
+            return Ok(Some(format!("code-to-char {}", paren(self.expr(c)?))));
+        }
+        for (roc, codex) in [
+            ("CceChar.code", "char-code"),
+            ("CceChar.is_letter", "is-letter"),
+            ("CceChar.is_digit", "is-digit"),
+            ("CceChar.is_whitespace", "is-whitespace"),
+        ] {
+            if let Some([c]) = call_of(e, roc) {
+                return Ok(Some(format!("{} {}", codex, paren(self.expr(c)?))));
+            }
+        }
         // `List.get(xs, I64.to_u64_wrap(i)) ?? crash(..)`, which the parser has
         // made a match, is `list-at xs i`; `List.set` is `list-set-at`.
         if let Expr::Match { scrutinee, arms, .. } = e {
@@ -586,14 +651,38 @@ impl Cx<'_> {
             }
         }
         // `Text.concat(a, b)` is `&`.
-        if let Some([a, b]) = call_of(e, "Text.concat") {
+        if let Some([a, b]) = call_of(e, "CceText.concat") {
             return Ok(Some(format!("{} & {}", self.expr(a)?, paren(self.expr(b)?))));
         }
-        if let Some([n]) = call_of(e, "Text.show_int") {
+        if let Some([n]) = call_of(e, "CceText.show_int") {
             return Ok(Some(format!("show {}", paren(self.expr(n)?))));
         }
-        if let Some([t]) = call_of(e, "Text.len") {
-            return Ok(Some(format!("text-length {}", paren(self.expr(t)?))));
+        // The rest of `Text`: each is the Codex builtin rocemit wrote it for.
+        for (roc, codex) in [
+            ("CceText.len", "text-length"),
+            ("CceText.char_at", "char-at"),
+            ("CceText.char_code_at", "char-code-at"),
+            ("CceText.substring", "substring"),
+            ("CceText.split", "text-split"),
+            ("CceText.char_to_text", "char-to-text"),
+            ("CceText.char_encode", "char-encode"),
+            ("CceText.compare", "text-compare"),
+            ("CceText.to_integer", "text-to-integer"),
+            ("CceText.contains", "text-contains"),
+            ("CceText.starts_with", "text-starts-with"),
+            ("CceText.ends_with", "text-ends-with"),
+            ("CceText.replace", "text-replace"),
+            ("CceText.concat_list", "text-concat-list"),
+            ("CceText.of_bytes", "raw-bytes-to-text"),
+        ] {
+            if let Some(args) = call_of(e, roc) {
+                let mut out = codex.to_string();
+                for a in args {
+                    out.push(' ');
+                    out.push_str(&paren(self.expr(a)?));
+                }
+                return Ok(Some(out));
+            }
         }
         // `U64.to_i64_wrap(List.len(xs))` is `list-length xs`.
         if let Some([inner]) = call_of(e, "U64.to_i64_wrap") {
