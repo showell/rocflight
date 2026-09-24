@@ -515,6 +515,10 @@ pub enum NominalShape {
     /// A SIMD backing — `Vector := U64x2`. Holds the element-kind byte so a
     /// `Value::Simd` of the right width is recognised as this nominal.
     Simd(u8),
+    /// A LIST backing — `Text :: List(U8)`. It rules out every value that is not a
+    /// list, and is never an exact fit, since a plain list is indistinguishable from
+    /// it at run time: a list keeps answering to `List`'s own methods.
+    List,
     /// A backing this cannot rule anything out from — a type variable, or another
     /// nominal whose own shape is unknown. Never filters.
     Unknown,
@@ -641,6 +645,7 @@ impl NominalShape {
             (NominalShape::Tuple(_), _) => false,
             (NominalShape::Simd(kind), Value::Simd { kind: k, .. }) => k == kind,
             (NominalShape::Simd(_), _) => false,
+            (NominalShape::List, value) => matches!(value, Value::List(_)),
             (NominalShape::Unknown, _) => true,
         }
     }
@@ -664,6 +669,7 @@ pub fn shape_of(ty: &crate::types::Type) -> NominalShape {
             NominalShape::Fields(fields.iter().map(|(name, ty)| ((*name).to_string(), FieldKind::of(ty))).collect())
         }
         Type::Tuple(items) => NominalShape::Tuple(items.len()),
+        Type::List(_) => NominalShape::List,
         Type::Nominal { name, backing } => match crate::eval::simd_kind(name) {
             Some(kind) => NominalShape::Simd(kind),
             None => shape_of(backing),
