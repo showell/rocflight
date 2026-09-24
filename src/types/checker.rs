@@ -261,8 +261,23 @@ impl TypeChecker {
                 matches!(t, Type::Nominal { name: n, backing }
                     if *n == name && matches!(**backing, Type::TypeVar(u32::MAX)))
             };
+            // A module is an empty namespace, `Maybe :: [].{ ... }`, and types are
+            // registered by their last segment, so the module and a type it declares
+            // under its own name (`Maybe(a) : [Just(a), None]`, written `Maybe.Maybe`
+            // elsewhere) are both `Maybe`. The namespace has no values to type, so
+            // the declared type wins whichever arrives first.
+            let namespace = |t: &Type| {
+                let t = match t {
+                    Type::Nominal { backing, .. } => &**backing,
+                    other => other,
+                };
+                matches!(t, Type::TagUnion { tags, open: false } if tags.is_empty())
+            };
             match self.declared_types.get(name) {
                 Some(existing) if placeholder(existing) && !placeholder(&ty) => {
+                    self.declared_types.insert(name.to_string(), ty);
+                }
+                Some(existing) if namespace(existing) && !namespace(&ty) && !placeholder(&ty) => {
                     self.declared_types.insert(name.to_string(), ty);
                 }
                 Some(_) => {}
