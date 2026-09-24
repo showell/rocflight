@@ -1923,3 +1923,18 @@ fn a_module_type_named_like_its_module_is_the_type_elsewhere() {
     );
     assert_eq!(out, "Ok(\"given\")");
 }
+
+#[test]
+fn a_qualified_type_is_the_imports_even_where_the_module_shares_its_name() {
+    // In `Thing.roc`, itself the namespace `Thing :: [].{ .. }`, the annotation
+    // `Kinds.Thing` is the record `Kinds` declares, not the file's own namespace.
+    let out = run_files(
+        "rocflight_qualified_type_import",
+        &[
+            ("Kinds.roc", "Kinds :: [].{\n\tThing : { a : I64 }\n}\n"),
+            ("Thing.roc", "import Kinds\n\nThing :: [].{\n\tmake : I64 -> Kinds.Thing\n\tmake = |n| { a: n }\n}\n"),
+            ("main.roc", "app [main!] {}\n\nimport Thing\n\nmain! = |_args| Ok(Thing.make(5).a)\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(5)");
+}

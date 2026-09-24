@@ -583,6 +583,11 @@ impl Parser {
             .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == '.'))
             .map_or(rest.len(), |(i, _)| i);
         let qualified: &str = &rest[..end];
+        // `Kinds.Thing` written in a module that is itself `Thing :: [].{ .. }`: the
+        // qualifier names no type of this file, so the name is the IMPORT's, and the
+        // file's own namespace of the same last segment must not answer for it.
+        let foreign = qualified.contains('.')
+            && self.nominal(qualified.split('.').next().expect("split yields one part")).is_none();
         let name = if qualified.contains('.')
             && qualified.starts_with(char::is_uppercase)
             && !qualified.ends_with('.')
@@ -671,7 +676,12 @@ impl Parser {
 
         // A declared nominal wins over the fallback: `Point` is the nominal, not an
         // anonymous variable.
-        if let Some(nominal) = self.nominal(name).or_else(|| self.imported_type(name)) {
+        let declared = if foreign {
+            self.imported_type(name).or_else(|| self.nominal(name))
+        } else {
+            self.nominal(name).or_else(|| self.imported_type(name))
+        };
+        if let Some(nominal) = declared {
             // A nominal named but not yet declared here — the recursive `ConsList(a)`
             // inside `ConsList`'s own body, or an imported name — stands in with a
             // variable for its backing. Each OCCURRENCE gets its own: the shared
@@ -683,7 +693,12 @@ impl Parser {
                 return Ok(nominal);
             }
             // `Wrapper(Str)` — put the arguments in place of the declared parameters.
-            if let Some((_, params)) = self.nominal_params.iter().chain(self.imported_params.iter()).find(|(n, _)| n == name) {
+            let found = if foreign {
+                self.imported_params.iter().chain(self.nominal_params.iter()).find(|(n, _)| n == name)
+            } else {
+                self.nominal_params.iter().chain(self.imported_params.iter()).find(|(n, _)| n == name)
+            };
+            if let Some((_, params)) = found {
                 let pairs: Vec<(u32, Type)> =
                     params.iter().copied().zip(args.iter().cloned()).collect();
                 self.check_extension(name, &nominal, &pairs);
