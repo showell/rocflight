@@ -695,3 +695,17 @@ fn a_defaulted_field_is_present_while_an_optional_one_may_not_be() {
         "absent"
     );
 }
+
+// --- an open record meets a closed one ------------------------------------
+
+#[test]
+fn an_open_record_that_meets_a_closed_one_is_that_record() {
+    // `y.k` makes `acc`'s element an open `{ k, .. }`; appending `x`, a whole
+    // `{ i, k }`, says what it is, so the fold answers a list of those.
+    let src = "xs = [{ k: \"a\", i: \"b\" }]\n\
+               List.fold(xs, [], |acc, x| match List.last(acc) {\n\
+               \tOk(y) if y.k == x.k => acc\n\
+               \t_ => List.append(acc, x)\n\
+               })";
+    assert_eq!(defaulted_type_of(src), "List({ i: Str, k: Str })");
+}

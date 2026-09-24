@@ -4255,6 +4255,16 @@ impl TypeChecker {
                         });
                     }
                 }
+                // An open record that meets a closed one IS that record: the
+                // parameter of `|acc, x| .. k.key == x.key ..`, folded over a list
+                // of `{ key, i }`, has an `i` too. Rebound by value, as field access
+                // grows one: the types arrive here already applied, so the variable
+                // that held it is not known.
+                if *a_open && !*b_open {
+                    self.subst.rebind_applied(&t1, t2.clone());
+                } else if *b_open && !*a_open {
+                    self.subst.rebind_applied(&t2, t1.clone());
+                }
                 Ok(())
             }
             // Function unification

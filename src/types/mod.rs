@@ -201,6 +201,21 @@ impl Substitution {
         }
     }
 
+    /// Rebind every variable whose type, APPLIED, is `old`: `rebind` for a type
+    /// that has been applied already, whose variables' own bindings are in it.
+    /// Only a record is rebound; a variable bound to another variable follows it.
+    pub fn rebind_applied(&mut self, old: &Type, new: Type) {
+        let hits: Vec<u32> = self
+            .bindings
+            .iter()
+            .filter(|(_, bound)| matches!(bound, Type::Record { .. }) && self.apply(bound) == *old)
+            .map(|(v, _)| *v)
+            .collect();
+        for v in hits {
+            self.bindings.insert(v, new.clone());
+        }
+    }
+
     pub fn new() -> Self {
         Substitution {
             bindings: HashMap::new(),
