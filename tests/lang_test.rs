@@ -1736,6 +1736,26 @@ fn a_string_pattern_matches_a_nominal_through_from_quote() {
     assert_eq!(ran.inspected.expect("inspected"), "Ok(\"matched\")");
 }
 
+#[test]
+fn a_nested_nominals_methods_see_the_enclosing_blocks_members() {
+    // `Box.is_eq` calls `same_box`, which `Shape`'s block declares: roc resolves a bare
+    // name through every block around the method, not only the method's own.
+    let file = std::env::temp_dir().join("rocflight_enclosing_owner.roc");
+    std::fs::write(
+        &file,
+        "app [main!] {}\n\nShape :: [].{\n\tBox := [B(I64)].{\n\t\tis_eq : Shape.Box, Shape.Box -> Bool\n\t\tis_eq = |a, b| same_box(a, b)\n\t}\n\n\
+         \tsame_box : Shape.Box, Shape.Box -> Bool\n\tsame_box = |a, b| match (a, b) {\n\t\t(B(x), B(y)) => x == y\n\t}\n}\n\n\
+         main! = |_args| Ok(B(3) == B(3))\n",
+    )
+    .unwrap();
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let ran = rocflight::run::run_file(file.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(ran.inspected.expect("inspected"), "Ok(True)");
+}
+
 // --- type-level features --------------------------------------------------
 
 #[test]

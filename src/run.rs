@@ -187,7 +187,9 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     let mut module_params: Vec<(String, Vec<u32>)> = Vec::new();
     let mut module_defaults: Vec<(String, Vec<(String, crate::ast::Expr)>)> = Vec::new();
     let mut module_where_methods: Vec<String> = Vec::new();
+    let mut enclosing_owners: Vec<(String, String)> = parser.enclosing_owners().to_vec();
     for (file, module_ast, module_parser) in loaded_modules.order {
+        enclosing_owners.extend(module_parser.enclosing_owners().iter().cloned());
         // The last segment is the type the module's method block hangs its names on:
         // `Dir/Hello` exposes them as `Hello.hello`.
         let type_name = file.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
@@ -245,6 +247,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     type_checker.declare_nominal_literals(parser.nominal_literals());
     type_checker.declare_defaults(parser.field_default_exprs());
     type_checker.declare_defaults(&module_defaults);
+    type_checker.declare_enclosing_owners(enclosing_owners.iter().cloned());
     type_checker.declare_suffixed_literals(&parser.suffixed_literals());
     type_checker.declare_suffixed_nominals(parser.nominal_suffixes());
     type_checker.declare_overflowed_literals(parser.overflowed_literals());
@@ -443,6 +446,13 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
             .collect(),
         opaque_nominals: parser.opaque_nominals().to_vec(),
         intrinsics: builtins.iter().flat_map(|b| b.intrinsics.iter().copied()).collect(),
+        enclosing_owners: enclosing_owners
+            .iter()
+            .map(|(inner, outer)| {
+                let leak = |s: &String| -> &'static str { Box::leak(s.clone().into_boxed_str()) };
+                (leak(inner), leak(outer))
+            })
+            .collect(),
         test_mode,
     };
     crate::tick("build the unit", &mut phase);

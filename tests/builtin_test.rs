@@ -301,6 +301,7 @@ fn run_with(src: &str, builtins: &[&str]) -> Result<String, String> {
         opaque_nominals: app.opaque_nominals().to_vec(),
         intrinsics: loaded.iter().flat_map(|l| l.intrinsics.iter().copied()).collect(),
         test_mode: true,
+        enclosing_owners: std::collections::HashMap::new(),
     };
     let program = std::rc::Rc::new(rocflight::vm::compile_unit(&unit)?);
     rocflight::vm::run(&program).map(|v| v.to_string()).map_err(|e| e.message)
