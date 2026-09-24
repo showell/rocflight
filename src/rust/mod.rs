@@ -307,7 +307,7 @@ impl<'a> Cx<'a> {
             }
             Type::TagUnion { tags, .. } => {
                 let names: Vec<String> = sorted_names(tags.iter().map(|(n, _)| *n));
-                if names == ["Err", "Ok"] {
+                if names == ["Err", "Ok"] || names == ["Ok"] || names == ["Err"] {
                     let get = |n: &str| tags.iter().find(|(t, _)| *t == n).map(|(_, p)| p.clone()).unwrap_or_default();
                     let ok = get("Ok");
                     let err = get("Err");
@@ -601,8 +601,8 @@ impl<'a> Cx<'a> {
             Expr::If { condition, then_branch, otherwise, .. } => format!(
                 "(if {} {{\n    {}\n}} else {{\n    {}\n}})",
                 self.expr(condition, scope)?,
-                indent(&self.expr(then_branch, scope)?, 4),
-                indent(&self.expr(otherwise, scope)?, 4)
+                indent(&self.result(then_branch, e, scope)?, 4),
+                indent(&self.result(otherwise, e, scope)?, 4)
             ),
             Expr::Let { .. } | Expr::VarDecl { .. } | Expr::Assign { .. } => self.block(e, scope)?,
             Expr::While { condition, body, .. } => {
@@ -610,6 +610,19 @@ impl<'a> Cx<'a> {
                 format!("{{ {}: while {} {{ {}; }} }}", label, self.expr(condition, scope)?, self.expr(body, &inner)?)
             }
             Expr::For { name, iterable, body, .. } => {
+                if let Expr::Range { start, end, inclusive, .. } = &**iterable {
+                    let (label, mut inner) = self.loop_scope(scope);
+                    inner.locals.push(name.to_string());
+                    return Ok(format!(
+                        "{{ {}: for {} in ({}){}({}) {{ {}; }} }}",
+                        label,
+                        sanitize(name),
+                        self.expr(start, scope)?,
+                        if *inclusive { "..=" } else { ".." },
+                        self.expr(end, scope)?,
+                        self.expr(body, &inner)?
+                    ));
+                }
                 if !matches!(self.ty_of(iterable)?, Type::List(_)) {
                     return Err(format!("a for over {}", short(iterable)));
                 }
@@ -651,7 +664,7 @@ impl<'a> Cx<'a> {
                 out.push_str(" __t }");
                 out
             }
-            Expr::Match { scrutinee, arms, .. } => self.matching(scrutinee, arms, scope)?,
+            Expr::Match { scrutinee, arms, .. } => self.matching(scrutinee, arms, e, scope)?,
             Expr::List(items, _) => {
                 let xs: Result<Vec<String>, String> = items.iter().map(|i| self.expr(i, scope)).collect();
                 format!("List::of(vec![{}])", xs?.join(", "))
@@ -996,13 +1009,37 @@ impl<'a> Cx<'a> {
         Ok(format!("{} {{ {} }}", rust, parts.join(", ")))
     }
 
+    /// An arm's or a branch's value. A lone tag there (`Solo =>` beside
+    /// `Anytime => Partner(p)`) knows only itself, an open `[Solo, ..]`; it is a
+    /// value of the whole `match` or `if`, whose type holds every arm's tags.
+    fn result(&self, body: &Expr, whole: &Expr, scope: &Scope) -> Result<String, String> {
+        if let Expr::Tag { name, args, .. } = body {
+            if let (Type::TagUnion { open: true, .. }, Ok(w @ Type::TagUnion { .. })) = (self.ty_of(body)?, self.ty_of(whole)) {
+                let Type::TagUnion { tags, .. } = &w else { unreachable!("matched") };
+                if tags.iter().any(|(n, _)| n == name) {
+                    return self.tag_typed(name, args, &w, scope);
+                }
+            }
+        }
+        self.expr(body, scope)
+    }
+
     fn tag(&self, name: &str, args: &[Expr], e: &Expr, scope: &Scope) -> Result<String, String> {
         let t = self.ty_of(e)?;
+        self.tag_typed(name, args, &t, scope)
+    }
+
+    fn tag_typed(&self, name: &str, args: &[Expr], t: &Type, scope: &Scope) -> Result<String, String> {
+        let t = t.clone();
         let xs: Result<Vec<String>, String> = args.iter().map(|a| self.expr(a, scope)).collect();
         let xs = xs?;
         match &t {
             Type::Bool => return Ok((name == "True").to_string()),
-            Type::TagUnion { tags, .. } if sorted_names(tags.iter().map(|(n, _)| *n)) == ["Err", "Ok"] => {
+            // `[Ok, Err]` is `Result`; so is a lone `Ok(..)` or `Err(..)`, whose
+            // union knows only its own tag.
+            Type::TagUnion { tags, .. }
+                if sorted_names(tags.iter().map(|(n, _)| *n)) == ["Err", "Ok"] || (matches!(name, "Ok" | "Err") && tags.len() == 1) =>
+            {
                 let payload = match xs.as_slice() {
                     [] => "()".to_string(),
                     [one] => one.clone(),
@@ -1067,7 +1104,7 @@ impl<'a> Cx<'a> {
 
     // ---- matching ----
 
-    fn matching(&self, scrutinee: &Expr, arms: &[MatchArm], scope: &Scope) -> Result<String, String> {
+    fn matching(&self, scrutinee: &Expr, arms: &[MatchArm], e: &Expr, scope: &Scope) -> Result<String, String> {
         let st = self.ty_of(scrutinee)?;
         let mut out = format!("{{ let __s = {}; 'm: {{\n", self.expr(scrutinee, scope)?);
         for arm in arms {
@@ -1077,7 +1114,7 @@ impl<'a> Cx<'a> {
                 let tail = {
                     let mut probe = inner.clone();
                     self.pat_names(p, &mut probe.locals);
-                    let body = self.expr(&arm.body, &probe)?;
+                    let body = self.result(&arm.body, e, &probe)?;
                     match &arm.guard {
                         Some(g) => format!("if {} {{ break 'm ({}); }}", self.expr(g, &probe)?, body),
                         None => format!("break 'm ({});", body),

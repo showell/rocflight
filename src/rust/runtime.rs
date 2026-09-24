@@ -232,8 +232,8 @@ macro_rules! paste_int {
             pub fn bitwise_not(a: $t) -> $t { !a }
             pub fn min(a: $t, b: $t) -> $t { a.min(b) }
             pub fn max(a: $t, b: $t) -> $t { a.max(b) }
-            pub fn shl_wrap(a: $t, n: u8) -> $t { a.wrapping_shl(n as u32) }
-            pub fn shr_wrap(a: $t, n: u8) -> $t { a.wrapping_shr(n as u32) }
+            pub fn shl_wrap(a: $t, n: impl Into<i128>) -> $t { a.wrapping_shl(n.into() as u32) }
+            pub fn shr_wrap(a: $t, n: impl Into<i128>) -> $t { a.wrapping_shr(n.into() as u32) }
             pub fn to_str(a: $t) -> String { a.to_string() }
             pub fn to_i64_wrap(a: $t) -> i64 { a as i64 }
             pub fn to_u64_wrap(a: $t) -> u64 { a as u64 }
@@ -251,11 +251,11 @@ pub mod I64 {
     pub fn abs(a: i64) -> i64 { a.abs() }
     pub fn pow(a: i64, b: i64) -> i64 { a.pow(b as u32) }
     /// Logical shift right: zeros fill from the left.
-    pub fn shr_zf_wrap(a: i64, n: u8) -> i64 { ((a as u64).wrapping_shr(n as u32)) as i64 }
+    pub fn shr_zf_wrap(a: i64, n: impl Into<i128>) -> i64 { ((a as u64).wrapping_shr(n.into() as u32)) as i64 }
 }
 pub mod U64 {
     pub use super::ops_u64::*;
-    pub fn shr_zf_wrap(a: u64, n: u8) -> u64 { a.wrapping_shr(n as u32) }
+    pub fn shr_zf_wrap(a: u64, n: impl Into<i128>) -> u64 { a.wrapping_shr(n.into() as u32) }
 }
 pub mod U8 {
     pub use super::ops_u8::*;
@@ -268,6 +268,10 @@ pub mod U32 {
 }
 pub mod U16 {
     pub use super::ops_u16::*;
+}
+
+pub mod Bool {
+    pub fn not(a: bool) -> bool { !a }
 }
 
 pub mod F64 {
