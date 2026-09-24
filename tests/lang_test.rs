@@ -1695,6 +1695,27 @@ fn a_user_defined_is_eq_decides_equality_both_ways() {
 }
 
 #[test]
+fn a_list_backed_nominals_is_eq_does_not_claim_a_record() {
+    // A record compared with `==` looks for an `is_eq` by the value's shape. `T` is
+    // over a list, so its `is_eq` is no candidate for the record; before, a list
+    // backing had no shape, ruled nothing out, and `T.is_eq` compared the records
+    // with `==` again, in Rust, until the stack ran out.
+    let file = std::env::temp_dir().join("rocflight_list_shape.roc");
+    std::fs::write(
+        &file,
+        "app [main!] {}\n\nT :: List(U8).{\n\tis_eq : T, T -> Bool\n\tis_eq = |T.(a), T.(b)| a == b\n\n\tof : List(U8) -> T\n\tof = |u| T.(u)\n}\n\n\
+         main! = |_args| Ok({ n: T.of([1]) } == { n: T.of([1]) })\n",
+    )
+    .unwrap();
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let ran = rocflight::run::run_file(file.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(ran.inspected.expect("inspected"), "Ok(True)");
+}
+
+#[test]
 fn a_user_defined_operator_does_not_capture_the_primitives() {
     // A type defining `plus` must not hijack `1 + 2`.
     let src = "Money :: { cents: I64 }.{\n    plus : Money, Money -> Money\n    plus = |a, b| { cents: a.cents + b.cents }\n}\n1 + 2";
