@@ -1923,3 +1923,20 @@ fn a_module_type_named_like_its_module_is_the_type_elsewhere() {
     );
     assert_eq!(out, "Ok(\"given\")");
 }
+
+#[test]
+fn a_type_from_another_module_keeps_its_arguments() {
+    // `Tuple.Tup2(I64, I64)` is `Tup2` with `I64` put in, as it would be were `Tup2`
+    // declared here: the literals `first` is given are I64s, not fractions.
+    let out = run_files(
+        "rocflight_imported_type_args",
+        &[
+            ("Tuple.roc", "Tuple :: [].{\n\tTup2(a, b) : [MkTup2(a, b)]\n}\n"),
+            (
+                "main.roc",
+                "app [main!] {}\n\nimport Tuple\n\nfirst : Tuple.Tup2(I64, I64) -> I64\nfirst = |p| match p {\n\tMkTup2(x, _) => x\n}\n\nmain! = |_args| Ok(I64.to_str(first(MkTup2(1, 2))))\n",
+            ),
+        ],
+    );
+    assert_eq!(out, "Ok(\"1\")");
+}

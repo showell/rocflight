@@ -124,6 +124,11 @@ pub struct Parser {
     /// `Wrapper(a) := { item: a }` records the id that `a` was given, so `Wrapper(Str)`
     /// can substitute `Str` for it.
     nominal_params: Vec<(String, Vec<u32>)>,
+    /// Types the file's imports declare, with their parameters: `Tup2(I64, I64)`
+    /// written in another module is that module's `Tup2` with the arguments put
+    /// in, as a local declaration's would be. See `declare_imported`.
+    imported_types: Vec<(&'static str, Type)>,
+    imported_params: Vec<(String, Vec<u32>)>,
     /// Names introduced by `var`, which are reassignable.
     ///
     /// Flat rather than scoped: a `var x` in one function also makes a later `x = e`
@@ -183,6 +188,8 @@ impl Parser {
             nominal_suffixes: Vec::new(),
             where_methods: Vec::new(),
             nominal_params: Vec::new(),
+            imported_types: Vec::new(),
+            imported_params: Vec::new(),
             mutable_names: Vec::new(),
             expr_depth: 0,
             block_depth: 0,
@@ -664,7 +671,7 @@ impl Parser {
 
         // A declared nominal wins over the fallback: `Point` is the nominal, not an
         // anonymous variable.
-        if let Some(nominal) = self.nominal(name) {
+        if let Some(nominal) = self.nominal(name).or_else(|| self.imported_type(name)) {
             // A nominal named but not yet declared here — the recursive `ConsList(a)`
             // inside `ConsList`'s own body, or an imported name — stands in with a
             // variable for its backing. Each OCCURRENCE gets its own: the shared
@@ -676,7 +683,7 @@ impl Parser {
                 return Ok(nominal);
             }
             // `Wrapper(Str)` — put the arguments in place of the declared parameters.
-            if let Some((_, params)) = self.nominal_params.iter().find(|(n, _)| n == name) {
+            if let Some((_, params)) = self.nominal_params.iter().chain(self.imported_params.iter()).find(|(n, _)| n == name) {
                 let pairs: Vec<(u32, Type)> =
                     params.iter().copied().zip(args.iter().cloned()).collect();
                 self.check_extension(name, &nominal, &pairs);
@@ -1572,6 +1579,25 @@ impl Parser {
     /// See `type_problems`.
     pub fn type_problems(&self) -> &[String] {
         &self.type_problems
+    }
+
+    /// Make the types a file's imports declare known to its annotations, so an
+    /// imported `Tup2(I64, I64)` keeps its arguments. A module's own empty
+    /// namespace (`Maybe :: []`) is not one of them: a type it declares under its
+    /// own name (`Maybe(a)`) is what `Maybe.Maybe` means.
+    pub fn declare_imported(&mut self, types: &[(&'static str, Type)], params: &[(String, Vec<u32>)]) {
+        for (name, ty) in types {
+            let empty = matches!(ty, Type::TagUnion { tags, open: false } if tags.is_empty())
+                || matches!(ty, Type::Nominal { backing, .. } if matches!(**backing, Type::TypeVar(_)) || matches!(&**backing, Type::TagUnion { tags, open: false } if tags.is_empty()));
+            if !empty {
+                self.imported_types.push((name, ty.clone()));
+            }
+        }
+        self.imported_params.extend(params.iter().cloned());
+    }
+
+    fn imported_type(&self, name: &str) -> Option<Type> {
+        self.imported_types.iter().rev().find(|(n, _)| *n == name).map(|(_, t)| t.clone())
     }
 
     fn nominal(&self, name: &str) -> Option<Type> {

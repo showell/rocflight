@@ -182,6 +182,18 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     for (file, _) in &wanted {
         loaded_modules.load(file)?;
     }
+    // The app, parsed again knowing what its imports declare (see `ModuleLoader`).
+    let imports: Vec<std::path::PathBuf> = wanted.iter().map(|(f, _)| f.clone()).collect();
+    let (imported, imported_params) = loaded_modules.declared_by(&imports);
+    let (ast, app_entry_point) = if imported.is_empty() {
+        (ast, app_entry_point)
+    } else {
+        parser = Parser::named(filename, &desugared);
+        parser.declare_imported(&imported, &imported_params);
+        let expr = parser.parse_expr()?;
+        let entry = parser.app_entry_point();
+        (expr, entry)
+    };
     let mut module_asts = Vec::new();
     let mut module_nominals: Vec<(&'static str, Type)> = Vec::new();
     let mut module_params: Vec<(String, Vec<u32>)> = Vec::new();
@@ -535,7 +547,7 @@ impl ModuleLoader<'_> {
         let module_source = Desugarer::new(text).desugar()?;
         let module_source: &'static str = Box::leak(module_source.into_boxed_str());
         let mut module_parser = Parser::named(&file.display().to_string(), module_source);
-        let module_ast = module_parser.parse_expr()?;
+        let mut module_ast = module_parser.parse_expr()?;
         // A module's own imports: a bare one is beside it, a qualified one is in the
         // package its alias names.
         let dir = file.parent().unwrap_or_else(|| std::path::Path::new("."));
@@ -549,10 +561,31 @@ impl ModuleLoader<'_> {
                 deps.push(pkg.join(format!("{}.roc", module.replace('.', "/"))));
             }
         }
-        for dep in deps {
-            self.load(&dep)?;
+        for dep in &deps {
+            self.load(dep)?;
+        }
+        // Parsed again knowing what its imports declare, so an imported type
+        // written with arguments keeps them.
+        let (types, params) = self.declared_by(&deps);
+        if !types.is_empty() {
+            module_parser = Parser::named(&file.display().to_string(), module_source);
+            module_parser.declare_imported(&types, &params);
+            module_ast = module_parser.parse_expr()?;
         }
         self.order.push((file.to_path_buf(), module_ast, module_parser));
         Ok(())
+    }
+
+    /// The types these loaded modules declare, and their parameters.
+    fn declared_by(&self, files: &[std::path::PathBuf]) -> (Vec<(&'static str, Type)>, Vec<(String, Vec<u32>)>) {
+        let mut types = Vec::new();
+        let mut params = Vec::new();
+        for (file, _, parser) in &self.order {
+            if files.contains(file) {
+                types.extend(parser.nominals().iter().cloned());
+                params.extend(parser.nominal_params().iter().cloned());
+            }
+        }
+        (types, params)
     }
 }
