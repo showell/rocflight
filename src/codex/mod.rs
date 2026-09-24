@@ -396,6 +396,21 @@ impl Cx<'_> {
             return Err(format!("`{}` has no annotation", name));
         };
         match value {
+            // An effectful function is an `act` whose last line is its value.
+            Expr::Lambda { params, body, .. } if name.ends_with('!') => {
+                let (ps, result) = peel(sig, params.len()).ok_or_else(|| format!("`{}`'s annotation has fewer parameters than its lambda", name))?;
+                let ps: Result<Vec<String>, String> = ps.iter().map(|p| self.ty(p)).collect();
+                let heads: Vec<String> = params.iter().map(|p| format!(" ({})", kebab(p))).collect();
+                Ok(format!(
+                    "  {} : {} -> [Console] {}\n  {}{} = act\n{}  end\n",
+                    cname,
+                    ps?.join(", "),
+                    self.ty(result)?,
+                    cname,
+                    heads.concat(),
+                    self.statements(body, 4)?
+                ))
+            }
             Expr::Lambda { params, body, .. } => {
                 let (ps, result) = peel(sig, params.len()).ok_or_else(|| format!("`{}`'s annotation has fewer parameters than its lambda", name))?;
                 let ps: Result<Vec<String>, String> = ps.iter().map(|p| self.ty(p)).collect();
@@ -426,6 +441,11 @@ impl Cx<'_> {
                     out.push_str(&self.statement(value, ind)?);
                     cursor = body;
                 }
+                // `w = noisy!(1)`: an effect's answer is bound for the rest of the act.
+                Expr::Let { name, value, body, .. } if effect_call(value) => {
+                    out.push_str(&format!("{}{} <- {}\n", pad, kebab(name), self.effect(value)?));
+                    cursor = body;
+                }
                 Expr::Let { name, value, body, .. } => {
                     out.push_str(&format!("{}let {} = {}\n{}in act\n", pad, kebab(name), indent(&self.expr(value)?, ind + 2), pad));
                     out.push_str(&self.statements(body, ind + 2)?);
@@ -434,6 +454,11 @@ impl Cx<'_> {
                 }
                 // The program's answer: nothing to say in Codex.
                 Expr::Tag { name, .. } if *name == "Ok" => return Ok(out),
+                // An effectful function's value: the act's last line.
+                other if !is_statement(other) => {
+                    out.push_str(&format!("{}{}\n", pad, indent(&self.expr(other)?, ind + 2)));
+                    return Ok(out);
+                }
                 other => {
                     out.push_str(&self.statement(other, ind)?);
                     return Ok(out);
@@ -454,11 +479,28 @@ impl Cx<'_> {
                 return Ok(format!("{}print-line-uni (show {})\n", pad, paren(self.expr(n)?)));
             }
         }
+        if effect_call(e) {
+            return Ok(format!("{}{}\n", pad, self.effect(e)?));
+        }
         match e {
             // A block of statements.
             Expr::Let { .. } => self.statements(e, ind),
             other => Err(format!("a statement {}", short(other))),
         }
+    }
+
+    /// A call of an effectful function: `noisy!(1)` is `noisy 1`.
+    fn effect(&self, e: &Expr) -> Result<String, String> {
+        let Expr::Call { func, args, .. } = e else { return Err("an effect that is not a call".into()) };
+        let mut out = match &**func {
+            Expr::Ident(n, _) | Expr::Qualified { name: n, .. } => kebab(n),
+            other => return Err(format!("an effect through {}", short(other))),
+        };
+        for a in args {
+            out.push(' ');
+            out.push_str(&paren(self.expr(a)?));
+        }
+        Ok(out)
     }
 
     fn expr(&self, e: &Expr) -> Result<String, String> {
@@ -815,6 +857,17 @@ fn call_of<'e>(e: &'e Expr, name: &str) -> Option<&'e [Expr]> {
         _ => false,
     };
     matches.then_some(args.as_slice())
+}
+
+/// A call of a function whose name ends in `!`, other than the print helper.
+fn effect_call(e: &Expr) -> bool {
+    let Expr::Call { func, .. } = e else { return false };
+    matches!(&**func, Expr::Ident(n, _) | Expr::Qualified { name: n, .. } if n.ends_with('!') && *n != "line!")
+}
+
+/// Is `e` something an act says rather than answers: printing, or an effect?
+fn is_statement(e: &Expr) -> bool {
+    effect_call(e) || call_of(e, "line!").is_some() || matches!(e, Expr::Let { .. })
 }
 
 /// The first `n` parameters of a curried function type, and what is left.
