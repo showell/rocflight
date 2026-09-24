@@ -2625,6 +2625,9 @@ impl<'u> Compiler<'u> {
                 Ok(())
             }
 
+            // A nominal is erased at run time: its payload is the value itself.
+            Pattern::Nominal { inner, .. } => self.pattern(inner, v, fails, ty),
+
             // The whole value under `name`, and then the inner pattern against it.
             Pattern::As { name, inner } => {
                 self.pattern(&Pattern::Binding(name), v, fails, None)?;

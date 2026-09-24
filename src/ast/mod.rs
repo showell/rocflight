@@ -612,6 +612,13 @@ pub enum Pattern {
     },
     /// Tuple pattern: `(0, 0)`, `(x, 0)`. Fixed arity, matched element-wise.
     Tuple(Vec<Pattern>),
+    /// `Name.(payload)` — unwraps a nominal over a non-record backing. The nominal
+    /// is erased at run time, so it matches as `inner` does; the checker types
+    /// `inner` against the BACKING, so `|Text.(units)|` binds a `List(U8)`.
+    Nominal {
+        name: &'static str,
+        inner: Box<Pattern>,
+    },
     /// Record pattern: `{ x, y }`, `Point.{ x }`, `{ email: _, ..rest }`.
     ///
     /// Each entry is a field name and the pattern matched against it; in a PATTERN a
@@ -655,6 +662,7 @@ impl fmt::Display for Pattern {
                 write!(f, "\"")
             }
             Pattern::As { name, inner } => write!(f, "{} as {}", inner, name),
+            Pattern::Nominal { name, inner } => write!(f, "{}.({})", name, inner),
             Pattern::Tag { name, args } => {
                 if args.is_empty() {
                     write!(f, "{}", name)
