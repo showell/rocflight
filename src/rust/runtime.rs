@@ -115,6 +115,79 @@ pub fn List__ends_with<T: Clone + PartialEq>(l: List<T>, p: List<T>) -> bool {
     l.0.ends_with(&p.0)
 }
 
+pub fn List__is_empty<T: Clone>(l: List<T>) -> bool {
+    l.0.is_empty()
+}
+pub fn List__first<T: Clone>(l: List<T>) -> Result<T, ()> {
+    l.0.first().cloned().ok_or(())
+}
+pub fn List__prepend<T: Clone>(l: List<T>, x: T) -> List<T> {
+    let mut v = Vec::with_capacity(l.0.len() + 1);
+    v.push(x);
+    v.extend(l.0.iter().cloned());
+    List::of(v)
+}
+pub fn List__take_first<T: Clone>(l: List<T>, n: u64) -> List<T> {
+    List::of(l.0[..(n as usize).min(l.0.len())].to_vec())
+}
+pub fn List__drop_at<T: Clone>(l: List<T>, i: u64) -> List<T> {
+    let i = i as usize;
+    if i >= l.0.len() {
+        return l;
+    }
+    let mut v = l.vec();
+    v.remove(i);
+    List::of(v)
+}
+pub fn List__contains<T: Clone + PartialEq>(l: List<T>, x: T) -> bool {
+    l.0.contains(&x)
+}
+pub fn List__any<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> bool {
+    l.0.iter().cloned().any(|x| f(x))
+}
+pub fn List__all<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> bool {
+    l.0.iter().cloned().all(|x| f(x))
+}
+pub fn List__count_if<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> u64 {
+    l.0.iter().cloned().filter(|x| f(x.clone())).count() as u64
+}
+pub fn List__keep_if<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> List<T> {
+    List::of(l.0.iter().cloned().filter(|x| f(x.clone())).collect())
+}
+pub fn List__drop_if<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> List<T> {
+    List::of(l.0.iter().cloned().filter(|x| !f(x.clone())).collect())
+}
+pub fn List__find_first<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> Result<T, ()> {
+    l.0.iter().cloned().find(|x| f(x.clone())).ok_or(())
+}
+pub fn List__find_last<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> Result<T, ()> {
+    l.0.iter().rev().cloned().find(|x| f(x.clone())).ok_or(())
+}
+pub fn List__find_first_index<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> Result<u64, ()> {
+    l.0.iter().cloned().position(|x| f(x)).map(|i| i as u64).ok_or(())
+}
+pub fn List__map_with_index<T: Clone, U: Clone>(l: List<T>, f: Rc<dyn Fn(T, u64) -> U>) -> List<U> {
+    List::of(l.0.iter().cloned().enumerate().map(|(i, x)| f(x, i as u64)).collect())
+}
+pub fn List__join<T: Clone>(l: List<List<T>>) -> List<T> {
+    List::of(l.0.iter().flat_map(|x| x.0.iter().cloned()).collect())
+}
+pub fn List__join_map<T: Clone, U: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> List<U>>) -> List<U> {
+    List::of(l.0.iter().cloned().flat_map(|x| f(x).0.iter().cloned().collect::<Vec<U>>()).collect())
+}
+/// `List.sort_with`: a stable sort, as Roc's is, by a comparison answering the
+/// program's own `[Before, Same, After]`.
+pub fn List__sort_with<T: Clone, O: RocOrder>(l: List<T>, f: Rc<dyn Fn(T, T) -> O>) -> List<T> {
+    let mut v = l.vec();
+    v.sort_by(|a, b| f(a.clone(), b.clone()).order());
+    List::of(v)
+}
+/// What a comparison answers, as Rust's `Ordering`; roc2rust writes the one
+/// implementation, for the union `[After, Before, Same]`.
+pub trait RocOrder {
+    fn order(&self) -> std::cmp::Ordering;
+}
+
 /// `{ start, len }`, the argument of `List.sublist`.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Rec_len_start {
@@ -132,6 +205,10 @@ pub fn Str__to_utf8(s: String) -> List<u8> {
 }
 pub fn Str__from_utf8_lossy(l: List<u8>) -> String {
     String::from_utf8_lossy(&l.0).into_owned()
+}
+
+pub fn Str__join_with(l: List<String>, sep: String) -> String {
+    l.0.join(&sep)
 }
 
 // ---- integers ----
@@ -210,4 +287,8 @@ pub fn echo(s: String) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(s.as_bytes());
+}
+/// fasttrack's cli platform: `Echo.line!`.
+pub fn echo_line(s: String) {
+    echo(s + "\n")
 }

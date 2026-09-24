@@ -1,0 +1,4 @@
+0,1,4,9,16
+first over 4: 5
+none over 4
+7

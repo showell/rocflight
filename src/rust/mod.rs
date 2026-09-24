@@ -26,7 +26,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ast::{BinOp, Expr, MatchArm, NodeId, Pattern};
+use crate::ast::{BinOp, Expr, MatchArm, NodeId, Pattern, StrPart};
 use crate::codex::Input;
 use crate::types::Type;
 
@@ -99,12 +99,16 @@ struct Cx<'a> {
     unions: RefCell<BTreeMap<Vec<String>, Vec<usize>>>,
     /// The top-level definitions referred to so far; see `emit`.
     wanted: RefCell<BTreeSet<String>>,
+    /// Loops written so far, for their labels: a `break` inside a `match`'s
+    /// labeled block must name its loop.
+    loops: RefCell<usize>,
 }
 
 fn sanitize(name: &str) -> String {
     let base = name.trim_end_matches('!');
     let bang = name.ends_with('!');
-    let s = base.replace('.', "__");
+    // `$deck`, a `var`: `v_deck`.
+    let s = base.replace('.', "__").replace('$', "v_");
     let s = match s.as_str() {
         "as" | "break" | "const" | "continue" | "crate" | "else" | "enum" | "extern" | "false" | "fn" | "for" | "if" | "impl" | "in"
         | "let" | "loop" | "match" | "mod" | "move" | "mut" | "pub" | "ref" | "return" | "self" | "Self" | "static" | "struct"
@@ -192,6 +196,8 @@ struct Scope {
     /// body names only these; any other variable (the checker's own, for an
     /// instantiation) is `_`, and rustc infers it.
     generics: Vec<u32>,
+    /// The label of the loop a `break` leaves.
+    in_loop: Option<String>,
 }
 
 impl Scope {
@@ -210,6 +216,7 @@ impl<'a> Cx<'a> {
             records: RefCell::new(BTreeSet::new()),
             unions: RefCell::new(BTreeMap::new()),
             wanted: RefCell::new(BTreeSet::new()),
+            loops: RefCell::new(0),
         }
     }
 
@@ -462,6 +469,9 @@ impl<'a> Cx<'a> {
                 }
             }
             out.push_str("}\n\n");
+            if names == &["After", "Before", "Same"] {
+                out.push_str("impl RocOrder for Tags_After_Before_Same {\n    fn order(&self) -> std::cmp::Ordering {\n        match self {\n            Tags_After_Before_Same::Before => std::cmp::Ordering::Less,\n            Tags_After_Before_Same::Same => std::cmp::Ordering::Equal,\n            Tags_After_Before_Same::After => std::cmp::Ordering::Greater,\n        }\n    }\n}\n\n");
+            }
         }
         Ok(out)
     }
@@ -471,7 +481,7 @@ impl<'a> Cx<'a> {
     fn def(&self, module: Option<&str>, name: &str, annotation: Option<&Type>, value: &Expr) -> Result<String, String> {
         let rust = sanitize(name);
         let owner = name.rsplit_once('.').map(|(o, _)| o.to_string()).unwrap_or_else(|| module.unwrap_or("").to_string());
-        let mut scope = Scope { locals: Vec::new(), owner, module: module.map(|m| m.to_string()), generics: Vec::new() };
+        let mut scope = Scope { locals: Vec::new(), owner, module: module.map(|m| m.to_string()), generics: Vec::new(), in_loop: None };
         let Some(sig) = annotation.cloned().or_else(|| self.types.get(&value.id()).cloned()) else {
             return Err(format!("`{}` has no type", name));
         };
@@ -596,7 +606,50 @@ impl<'a> Cx<'a> {
             ),
             Expr::Let { .. } | Expr::VarDecl { .. } | Expr::Assign { .. } => self.block(e, scope)?,
             Expr::While { condition, body, .. } => {
-                format!("{{ while {} {{ {}; }} }}", self.expr(condition, scope)?, self.expr(body, scope)?)
+                let (label, inner) = self.loop_scope(scope);
+                format!("{{ {}: while {} {{ {}; }} }}", label, self.expr(condition, scope)?, self.expr(body, &inner)?)
+            }
+            Expr::For { name, iterable, body, .. } => {
+                if !matches!(self.ty_of(iterable)?, Type::List(_)) {
+                    return Err(format!("a for over {}", short(iterable)));
+                }
+                let (label, mut inner) = self.loop_scope(scope);
+                inner.locals.push(name.to_string());
+                format!(
+                    "{{ let __it = {}; {}: for {} in __it.0.iter().cloned() {{ {}; }} }}",
+                    self.expr(iterable, scope)?,
+                    label,
+                    sanitize(name),
+                    self.expr(body, &inner)?
+                )
+            }
+            Expr::Break(_) => match &scope.in_loop {
+                Some(label) => format!("break {}", label),
+                None => return Err("a break outside a loop".into()),
+            },
+            // Inside a lambda, `return` leaves the lambda, as a Rust closure's does.
+            Expr::Return(value, _) => format!("return {}", self.expr(value, scope)?),
+            Expr::Expect(cond, _) => format!(
+                "{{ if !({}) {{ eprintln!(\"expect failed: {}\"); }} }}",
+                self.expr(cond, scope)?,
+                short(cond).replace('\\', "\\\\").replace('"', "\\\"").replace('{', "{{").replace('}', "}}")
+            ),
+            Expr::Dbg(value, _) => format!("{{ let __d = {}; eprintln!(\"{{:?}}\", __d); __d }}", self.expr(value, scope)?),
+            Expr::StrInterp(parts, _) => {
+                let mut out = String::from("{ let mut __t = String::new();");
+                for part in parts {
+                    match part {
+                        StrPart::Literal(l) => out.push_str(&format!(" __t.push_str({:?});", l)),
+                        StrPart::Expr(x) => {
+                            if !matches!(self.ty_of(x)?, Type::Str) {
+                                return Err(format!("an interpolation of {}", short(x)));
+                            }
+                            out.push_str(&format!(" __t.push_str(&{});", self.expr(x, scope)?))
+                        }
+                    }
+                }
+                out.push_str(" __t }");
+                out
             }
             Expr::Match { scrutinee, arms, .. } => self.matching(scrutinee, arms, scope)?,
             Expr::List(items, _) => {
@@ -636,8 +689,40 @@ impl<'a> Cx<'a> {
             Expr::Crash(msg, _) => format!("panic!(\"{{}}\", {})", self.expr(msg, scope)?),
             Expr::Dispatch { receiver, method: "negate", args, .. } if args.is_empty() => format!("(-({}))", self.expr(receiver, scope)?),
             Expr::Dispatch { receiver, method: "not", args, .. } if args.is_empty() => format!("(!({}))", self.expr(receiver, scope)?),
+            Expr::Dispatch { receiver, method, args, .. } => {
+                // `xs.concat(ys)` is `List.concat(xs, ys)`: the receiver's type names
+                // the module, and the receiver is the first argument.
+                let rt = self.ty_of(receiver)?;
+                let module: &'static str = match &rt {
+                    Type::List(_) => "List",
+                    Type::Str => "Str",
+                    Type::I64 => "I64",
+                    Type::U64 => "U64",
+                    Type::U8 => "U8",
+                    Type::I32 => "I32",
+                    Type::U32 => "U32",
+                    Type::U16 => "U16",
+                    Type::F64 => "F64",
+                    Type::Nominal { name, .. } => crate::memory::string_pool::intern(bare(name)),
+                    other => return Err(format!("a method {} of {}", method, other)),
+                };
+                let func = Expr::Qualified { module, name: method, id: crate::ast::fresh_node_unlocated() };
+                let mut all = vec![(**receiver).clone()];
+                all.extend(args.iter().cloned());
+                self.call(&func, &all, e, scope)?
+            }
             other => return Err(format!("an expression {}", short(other))),
         })
+    }
+
+    /// A new loop's label, and the scope its body is written in.
+    fn loop_scope(&self, scope: &Scope) -> (String, Scope) {
+        let mut n = self.loops.borrow_mut();
+        *n += 1;
+        let label = format!("'l{}", n);
+        let mut inner = scope.clone();
+        inner.in_loop = Some(label.clone());
+        (label, inner)
     }
 
     fn read_local(&self, n: &str, e: &Expr) -> Result<String, String> {
@@ -749,8 +834,17 @@ impl<'a> Cx<'a> {
             Expr::Qualified { module, name, .. } => match self.qualified(module, name) {
                 Some(top) if self.tops[&top] => format!("{}{}", sanitize(&top), self.turbofish(&top, func, scope)?),
                 Some(top) => format!("({})", self.top_value(&top, func, scope)?),
+                // The platform's one effect: a line out, its newline written for it.
+                None if *module == "Echo" && *name == "line!" => return Ok(format!("echo_line({})", xs.join(", "))),
+                None if *module == "Try" && *name == "is_ok" && xs.len() == 1 => return Ok(format!("({}).is_ok()", xs[0])),
+                None if *module == "Try" && *name == "map_ok" && xs.len() == 2 => return Ok(format!("({}).map(|__x| (*{})(__x))", xs[0], xs[1])),
                 None if BUILTIN_MODULES.contains(module) => {
                     if matches!(*module, "List" | "Str") {
+                        // A builtin's `Err` is `()` in runtime.rs; the program's is the
+                        // tag it names, in the program's own union.
+                        if let Some(tag) = builtin_err_tag(module, name) {
+                            return Ok(format!("{}__{}({}){}", module, name, xs.join(", "), self.err_as(e, tag)?));
+                        }
                         format!("{}__{}", module, name)
                     } else {
                         format!("{}::{}", module, name)
@@ -762,6 +856,22 @@ impl<'a> Cx<'a> {
         };
         let _ = e;
         Ok(format!("{}({})", callee, xs.join(", ")))
+    }
+
+    /// `.map_err(..)` turning a builtin's `Err(())` into this call's `Err(tag)`.
+    fn err_as(&self, e: &Expr, tag: &str) -> Result<String, String> {
+        let t = self.ty_of(e)?;
+        let Type::TagUnion { tags, .. } = &t else { return Err(format!("a builtin answering {}", t)) };
+        let err = tags.iter().find(|(n, _)| *n == "Err").map(|(_, p)| p.clone()).unwrap_or_default();
+        match err.as_slice() {
+            [] => Ok(String::new()),
+            [et] if matches!(et, Type::Unit) || matches!(et, Type::TypeVar(_)) => Ok(String::new()),
+            [et] => {
+                let (enum_name, _) = self.variant(et, tag)?;
+                Ok(format!(".map_err(|_| {}::{})", enum_name, tag))
+            }
+            _ => Err(format!("a builtin's Err of {}", t)),
+        }
     }
 
     /// A field's type at this use, and whether the definition holds it behind an
@@ -821,7 +931,7 @@ impl<'a> Cx<'a> {
 
     fn field_type(&self, t: &Type, field: &str) -> Result<(Type, bool), String> {
         match t {
-            Type::Record { fields, .. } => fields.iter().find(|(f, _)| *f == field).map(|(_, t)| (t.clone(), false)).ok_or_else(|| format!("no field {}", field)),
+            Type::Record { fields, .. } => fields.iter().find(|(f, _)| *f == field).map(|(_, t)| (t.clone(), false)).ok_or_else(|| format!("no field {} in {}", field, t)),
             Type::Nominal { name, backing } => {
                 let n = self.nominals.get(bare(name)).ok_or_else(|| format!("the nominal {}", name))?;
                 let decl = match &n.backing {
@@ -940,6 +1050,7 @@ impl<'a> Cx<'a> {
         let t = self.ty_of(e)?;
         let (ps, result) = peel(&t, params.len()).ok_or("a lambda whose type is not a function")?;
         let mut inner = scope.clone();
+        inner.in_loop = None;
         let mut typed = Vec::new();
         for (p, pt) in params.iter().zip(&ps) {
             typed.push(format!("{}: {}", sanitize(p), erase_free(&self.ty(pt)?, &scope.generics)));
@@ -1124,6 +1235,16 @@ impl<'a> Cx<'a> {
         };
         if n < 0 { format!("({}{})", n, suffix) } else { format!("{}{}", n, suffix) }
     }
+}
+
+/// The tag a builtin's `Err` carries.
+fn builtin_err_tag(module: &str, name: &str) -> Option<&'static str> {
+    Some(match (module, name) {
+        ("List", "get") => "OutOfBounds",
+        ("List", "first" | "last") => "ListWasEmpty",
+        ("List", "find_first" | "find_last" | "find_first_index") => "NotFound",
+        _ => return None,
+    })
 }
 
 fn generic_list(vars: &[u32]) -> String {

@@ -5,6 +5,8 @@
 #
 #   codex/rust.sh            every test; the tally, and refusals by reason
 #   codex/rust.sh NAME...    those (codex_arithmetic, ...)
+#   codex/rust.sh --tests    roc2rust's own tests, codex/rust-tests/: a small
+#                            program for each form it writes, with what roc prints
 #
 # One line per test in $OUT/ledger.txt: PASS, FAIL (wrong output, or it
 # panicked), NO-COMPILE (rustc rejected it; its first error), REFUSED
@@ -14,9 +16,14 @@ set -u
 BIN="${BIN:-$HOME/build/rust-target/release}"
 PORTED="${PORTED:-$HOME/showell_repos/roc-apps/tests/ported}"
 OUT="${OUT:-$HOME/build/rocflight/rust}"
+GLOB='codex_*.roc'
+if [ "${1:-}" = --tests ]; then
+    shift
+    PORTED="$(cd "$(dirname "$0")" && pwd)/rust-tests"; OUT="$HOME/build/rocflight/rust-tests"; GLOB='*.roc'
+fi
 mkdir -p "$OUT"
 export PATH=$HOME/.cargo/bin:$PATH
-if [ $# -gt 0 ]; then names=("$@"); else mapfile -t names < <(cd "$PORTED" && ls codex_*.roc | sed 's/\.roc$//'); fi
+if [ $# -gt 0 ]; then names=("$@"); else mapfile -t names < <(cd "$PORTED" && ls $GLOB | sed 's/\.roc$//'); fi
 : > "$OUT/ledger.txt"
 trim() { awk 'BEGIN{n=0} /^$/{n++; next} {while (n-- > 0) print ""; n=0; print}'; }
 one() {
