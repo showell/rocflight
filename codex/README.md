@@ -58,9 +58,46 @@ program cites (`ListUtils`, `Tuple`) and `Console`, copied from a Cobblestone
 checkout (`$COBBLESTONE`, default `~/showell_repos/cobblestone-u62`), then this
 program's chapters as `Roc--Name`.
 
+## Roc to Rust
+
+`src/rust/` writes the same checked program as one Rust file, which `rustc`
+compiles; `codex/rust.sh` compiles each ported test (a debug build, whose
+overflow checks panic where Roc's arithmetic crashes), runs it and diffs its
+output against the same verdict.
+
+    roc2rust app.roc out.rs
+    codex/rust.sh                    # all of them; rust.sh NAME... for some
+
+Unlike roc2codex it translates every module, rocemit's `CceText`, `CceChar`
+and `Prelude` included; `runtime.rs` is Roc's own builtins by hand, and heads
+every program. It writes only what `main!` reaches.
+
+- **Structural records and unions** (`{ p : I64 }`, `[Just(a), None]`) are one
+  generic Rust type per set of field or tag names (`Rec_p<T0>`,
+  `Tags_Just_None<T0>`); `[Ok(a), Err(e)]` is `Result`. An open union (a lone
+  tag's type) is the declared union holding its tags.
+- **A nominal** is a named type, with `Rc` where a nominal field holds another
+  (only a nominal can be recursive); one over a list or a scalar (`CceText`) is
+  its backing, as Roc erases it.
+- **A list** is an `Rc<Vec<T>>` that copies on write, so a uniquely held list is
+  written in place, as in Roc. Values are cloned where read.
+- **A closure** is `Rc<dyn Fn(..)>`, its captures cloned in. A `match` is a
+  labeled block of nested `if let`s. `main!` runs on a 1 GB stack: Rust does no
+  tail calls.
+- **Types rustc can infer are left to it**: a variable in a body that is not
+  the enclosing definition's own is `_`; one nothing constrains is `()`.
+
+It relies on rocemit writing plain-typed locals with an annotation: an
+unannotated local is let-generalised, and its string or number literal stays
+a `Str` or a fraction where its uses want a `CceText` or an `I64`.
+
+506 of 521 compile and print their verdict. 7 of the rest are the programs
+over rocemit's `Mem`; 5 are rocflight dropping a type's arguments where it is
+written before its declaration (B-Teague/rocflight#11); 3 are single cases.
+
 ## Where it stands (2026-09-24)
 
-515 of 525 round-trip, none wrong. The other 10 are refused on purpose: a
+514 of 521 round-trip, none wrong. The other 7 are refused on purpose: a
 program that pokes raw memory is emitted over rocemit's `Mem`, threaded through
 every function, which is a whole-program rewrite rather than an idiom.
 

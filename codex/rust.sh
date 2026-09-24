@@ -24,7 +24,7 @@ one() {
     if ! (cd "$PORTED" && timeout 60 "$BIN/roc2rust" "$n.roc" "$OUT/$n.rs") 2> "$OUT/$n.refused"; then
         echo "REFUSED $n | $(sed 's/^REFUSED: //' "$OUT/$n.refused" | head -1 | cut -c1-140)"; return
     fi
-    if ! rustc --edition 2021 -A warnings -o "$OUT/$n.bin" "$OUT/$n.rs" 2> "$OUT/$n.rustc"; then
+    if ! rustc --edition 2021 --crate-name roc -A warnings -o "$OUT/$n.bin" "$OUT/$n.rs" 2> "$OUT/$n.rustc"; then
         echo "NO-COMPILE $n | $(grep -m1 '^error' "$OUT/$n.rustc" | cut -c1-140)"; return
     fi
     timeout 60 "$OUT/$n.bin" 2> "$OUT/$n.err" | trim > "$OUT/$n.out"; rc=${PIPESTATUS[0]}
