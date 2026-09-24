@@ -50,6 +50,32 @@ pub struct Input<'a> {
 const TEXT_MODULE: &str = "Text";
 const CARRIED: [&str; 3] = ["ListUtils", "Tuple", "Console"];
 
+/// Roc's wrapping arithmetic in Codex. A plain `Integer` passes for an
+/// `Integer wrapping`, and arithmetic on one wraps where a plain one traps
+/// (codex/test/ops/int-wrapping-spelling).
+const WRAP_CHAPTER: &str = "Chapter: Roc--Wrap
+
+Section: Wrapping arithmetic
+
+  roc-plus-wrap : Integer wrapping, Integer -> Integer
+  roc-plus-wrap (a) (b) = a + b
+
+  roc-minus-wrap : Integer wrapping, Integer -> Integer
+  roc-minus-wrap (a) (b) = a - b
+
+  roc-times-wrap : Integer wrapping, Integer -> Integer
+  roc-times-wrap (a) (b) = a * b
+
+Page 1
+
+";
+
+/// Roc's own modules. A call into one is either an idiom this reads back, or a
+/// refusal: its bare name means nothing in Codex.
+const ROC_BUILTIN_MODULES: [&str; 17] = [
+    "I8", "I16", "I32", "I64", "I128", "U8", "U16", "U32", "U64", "U128", "F32", "F64", "Dec", "List", "Str", "Bool", "Prelude",
+];
+
 /// The whole program as one resolved Codex unit.
 pub fn emit(input: &Input) -> Result<String, String> {
     let mut records = Vec::new();
@@ -71,7 +97,9 @@ pub fn emit(input: &Input) -> Result<String, String> {
         out.push_str(text.trim_end());
         out.push_str("\n\n");
     }
-    let names: Vec<&str> = input.modules.iter().map(|m| m.name.as_str()).filter(|n| *n != TEXT_MODULE).collect();
+    out.push_str(WRAP_CHAPTER);
+    let mut names: Vec<&str> = input.modules.iter().map(|m| m.name.as_str()).filter(|n| *n != TEXT_MODULE).collect();
+    names.push("Wrap");
     for module in &input.modules {
         if module.name == TEXT_MODULE {
             continue;
@@ -89,8 +117,18 @@ fn field_names(fields: &[(&'static str, Type)]) -> Vec<&'static str> {
 }
 
 /// A Roc name as Codex spells it: rocemit wrote `is-even` as `is_even`.
+/// Roc marks an unused binding with a leading `_`; Codex has no such mark.
 fn kebab(name: &str) -> String {
-    name.trim_end_matches('!').replace('_', "-")
+    let name = name.trim_end_matches('!');
+    let trimmed = name.trim_start_matches('_');
+    let name = if trimmed.is_empty() { "unused" } else { trimmed };
+    name.replace('_', "-")
+}
+
+/// A type name as Codex spells it: rocemit suffixed one that collides with a Roc
+/// builtin (`Box_` for Codex's `Box`).
+fn type_name(name: &str) -> String {
+    bare(name).trim_end_matches('_').to_string()
 }
 
 /// The last segment of a qualified name: Codex names a cited chapter's definitions
@@ -169,6 +207,10 @@ fn bind(decl: &Type, used: &Type, out: &mut HashMap<u32, Type>) {
 /// The expression's precedence as an operand: an atom needs no parentheses.
 fn atom(s: &str) -> bool {
     let s = s.trim();
+    // `-5` is an operand only in parentheses: `f (-5)`, but `x = -5`.
+    if s.starts_with('-') {
+        return false;
+    }
     let bracketed = |open: char, close: char| {
         s.starts_with(open) && s.ends_with(close) && {
             let mut depth = 0i32;
@@ -227,7 +269,7 @@ impl Cx<'_> {
     /// A type declaration: a record, or a union as a sum type. A module's own
     /// namespace (`Maybe :: []`) is no type.
     fn type_decl(&self, name: &str, ty: &Type) -> Result<Option<String>, String> {
-        let name = bare(name);
+        let name = &type_name(name);
         Ok(match ty {
             Type::Record { fields, .. } => {
                 let mut out = format!("  {} = record {{\n", name);
@@ -265,9 +307,9 @@ impl Cx<'_> {
             Type::Unit => "Nothing".into(),
             Type::List(e) => format!("List {}", paren(self.ty(e)?)),
             Type::Nominal { name, .. } if bare(name) == TEXT_MODULE => "Text".into(),
-            Type::Nominal { name, .. } => bare(name).to_string(),
+            Type::Nominal { name, .. } => type_name(name),
             Type::Record { fields, .. } => match self.record_name(fields) {
-                Some(n) => n.to_string(),
+                Some(n) => type_name(n),
                 None => return Err(format!("an anonymous record type {}", t)),
             },
             Type::TypeVar(v) => format!("t{}", v),
@@ -287,7 +329,7 @@ impl Cx<'_> {
                 };
                 let mut bound = HashMap::new();
                 bind(&Type::TagUnion { tags: decl.clone(), open: false }, t, &mut bound);
-                let mut out = bare(name).to_string();
+                let mut out = type_name(name);
                 for p in params {
                     let arg = bound.get(p).cloned().unwrap_or(Type::TypeVar(*p));
                     out.push(' ');
@@ -333,17 +375,9 @@ impl Cx<'_> {
                 let (ps, result) = peel(sig, params.len()).ok_or_else(|| format!("`{}`'s annotation has fewer parameters than its lambda", name))?;
                 let ps: Result<Vec<String>, String> = ps.iter().map(|p| self.ty(p)).collect();
                 let heads: Vec<String> = params.iter().map(|p| format!("({})", kebab(p))).collect();
-                Ok(format!(
-                    "  {} : {} -> {}\n  {} {} =\n    {}\n",
-                    cname,
-                    ps?.join(", "),
-                    self.ty(result)?,
-                    cname,
-                    heads.join(" "),
-                    indent(&self.expr(body)?, 4)
-                ))
+                Ok(format!("  {} : {} -> {}\n  {} {} ={}\n", cname, ps?.join(", "), self.ty(result)?, cname, heads.join(" "), body_text(&self.expr(body)?)))
             }
-            _ => Ok(format!("  {} : {}\n  {} =\n    {}\n", cname, self.ty(sig)?, cname, indent(&self.expr(value)?, 4))),
+            _ => Ok(format!("  {} : {}\n  {} ={}\n", cname, self.ty(sig)?, cname, body_text(&self.expr(value)?))),
         }
     }
 
@@ -403,7 +437,6 @@ impl Cx<'_> {
             return Ok(s);
         }
         Ok(match e {
-            Expr::Int(n, _) if *n < 0 => format!("({})", n),
             Expr::Int(n, _) => n.to_string(),
             Expr::Str(s, _) if self.is_text(e) => text_literal(s),
             Expr::Str(s, _) => return Err(format!("a Str literal {:?} that is not a Text", s)),
@@ -414,7 +447,7 @@ impl Cx<'_> {
             Expr::Call { func, args, .. } => {
                 let f = match &**func {
                     Expr::Ident(n, _) => kebab(n),
-                    Expr::Qualified { module, name, .. } if *module != TEXT_MODULE => kebab(name),
+                    Expr::Qualified { module, name, .. } if *module != TEXT_MODULE && !ROC_BUILTIN_MODULES.contains(module) => kebab(name),
                     other => return Err(format!("a call to {}", short(other))),
                 };
                 let mut out = f;
@@ -448,7 +481,7 @@ impl Cx<'_> {
                 };
                 let rname = self.record_name(tf).ok_or("a record literal of no declared record type")?;
                 let fs: Result<Vec<String>, String> = fields.iter().map(|(f, v)| Ok(format!("{} = {}", kebab(f), self.expr(v)?))).collect();
-                format!("{} {{ {} }}", rname, fs?.join(", "))
+                format!("{} {{ {} }}", type_name(rname), fs?.join(", "))
             }
             Expr::FieldAccess { record, field, .. } => format!("{}.{}", paren(self.expr(record)?), kebab(field)),
             Expr::Tag { name, args, .. } => {
@@ -571,9 +604,43 @@ impl Cx<'_> {
         if let Some([xs, x]) = call_of(e, "List.append") {
             return Ok(Some(format!("list-snoc {} {}", paren(self.expr(xs)?), paren(self.expr(x)?))));
         }
-        for (roc, codex) in [("I64.min", "min"), ("I64.max", "max"), ("I64.rem_by", "int-rem"), ("Prelude.int_mod", "int-mod")] {
+        for (roc, codex) in [
+            ("I64.min", "min"),
+            ("I64.max", "max"),
+            ("I64.rem_by", "int-rem"),
+            ("Prelude.int_mod", "int-mod"),
+            ("I64.bitwise_and", "bit-and"),
+            ("I64.bitwise_or", "bit-or"),
+            ("I64.bitwise_xor", "bit-xor"),
+        ] {
             if let Some([a, b]) = call_of(e, roc) {
                 return Ok(Some(format!("{} {} {}", codex, paren(self.expr(a)?), paren(self.expr(b)?))));
+            }
+        }
+        if let Some([x]) = call_of(e, "I64.bitwise_not") {
+            return Ok(Some(format!("bit-not {}", paren(self.expr(x)?))));
+        }
+        // rocemit writes arithmetic on a Codex `Integer wrapping` as Roc's
+        // wrapping operations; the Codex has lost that type, so the wrapping
+        // happens in `Roc--Wrap`'s helpers, whose first operand is `Integer wrapping`.
+        for (roc, helper) in [("I64.plus_wrap", "roc-plus-wrap"), ("I64.minus_wrap", "roc-minus-wrap"), ("I64.times_wrap", "roc-times-wrap")] {
+            if let Some([a, b]) = call_of(e, roc) {
+                return Ok(Some(format!("{} {} {}", helper, paren(self.expr(a)?), paren(self.expr(b)?))));
+            }
+        }
+        for (roc, op) in [("I64.div_trunc_by", "/"), ("Prelude.int_pow", "^")] {
+            if let Some([a, b]) = call_of(e, roc) {
+                return Ok(Some(format!("{} {} {}", paren(self.expr(a)?), op, paren(self.expr(b)?))));
+            }
+        }
+        // A shift's count is narrowed to a byte for Roc: `bit-shl x n`.
+        for (roc, codex) in [("I64.shl_wrap", "bit-shl"), ("I64.shr_wrap", "bit-shr"), ("I64.shr_zf_wrap", "bit-shru")] {
+            if let Some([x, n]) = call_of(e, roc) {
+                let n = match call_of(n, "I64.to_u8_wrap") {
+                    Some([n]) => n,
+                    _ => n,
+                };
+                return Ok(Some(format!("{} {} {}", codex, paren(self.expr(x)?), paren(self.expr(n)?))));
             }
         }
         // `-x` arrives as `x.negate()`.
@@ -587,7 +654,7 @@ impl Cx<'_> {
         if let Expr::BinOp { left, op: BinOp::Sub, right, .. } = e {
             if matches!(**left, Expr::Int(0, _)) {
                 if let Expr::Int(n, _) = **right {
-                    return Ok(Some(format!("(-{})", n)));
+                    return Ok(Some(format!("-{}", n)));
                 }
             }
         }
@@ -640,6 +707,12 @@ fn text_literal(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// A definition's body: on the `=` line when it is one line, as Codex writes it
+/// (and as a negative literal must be), else below it.
+fn body_text(s: &str) -> String {
+    if s.contains('\n') { format!("\n    {}", indent(s, 4)) } else { format!(" {}", s) }
 }
 
 fn indent(s: &str, n: usize) -> String {
