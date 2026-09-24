@@ -858,8 +858,11 @@ impl TypeChecker {
             // (whose `_` param wraps the body in a match) checks its `{}` against the
             // annotated result rather than synthesising it to a bare unit. Still
             // exhaustiveness-checked, via the shared helper.
-            Expr::Match { scrutinee, arms, .. } => {
+            Expr::Match { scrutinee, arms, id } => {
                 let scrutinee_type = self.synth(scrutinee)?;
+                // Recorded as `synth` records it: a literal pattern against a nominal
+                // with a conversion needs the scrutinee's type (`match_types`).
+                self.matches.push((*id, scrutinee_type.clone()));
                 for arm in arms {
                     for pattern in &arm.patterns {
                         // `{ age: Ok(v) }` against `{ age ?: U8 }`: the sub-pattern
