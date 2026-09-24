@@ -1723,3 +1723,59 @@ fn a_parameterised_nominal_instantiates_its_backing_type() {
                n : Wrapper(I64)\nn = Wrapper.{ item: 42 }\nunwrap(n) + 1";
     assert_eq!(value(src), "43");
 }
+
+// ==========================================================================
+// Modules and packages.
+//
+// Verified against `roc` nightly-2026-09-07 and nightly-2026-09-22: the program
+// below prints `hi!` under both.
+//   * a module's own `import Sibling` is a file beside that module, and is loaded
+//     whether or not the app imports it too.
+//   * `pkg: "./pkg/main.roc"` in an app header is a package on disk: `import
+//     pkg.Words` is `pkg/Words.roc`, and Words' own `import Letters` is beside it.
+
+/// Write `files` under a fresh directory and run its `main.roc`, answering
+/// `Str.inspect` of what `main!` returned.
+fn run_files(dir: &str, files: &[(&str, &str)]) -> String {
+    let root = std::env::temp_dir().join(dir);
+    let _ = std::fs::remove_dir_all(&root);
+    for (path, text) in files {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, text).unwrap();
+    }
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let main = root.join("main.roc");
+    let ran = rocflight::run::run_file(main.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_dir_all(&root);
+    ran.inspected.expect("inspected")
+}
+
+#[test]
+fn a_module_loads_the_modules_it_imports() {
+    let out = run_files(
+        "rocflight_module_imports",
+        &[
+            ("Exclaim.roc", "Exclaim :: [].{\n\tbang : Str -> Str\n\tbang = |s| Str.concat(s, \"!\")\n}\n"),
+            ("Shout.roc", "import Exclaim\n\nShout :: [].{\n\tshout : Str -> Str\n\tshout = |s| Exclaim.bang(s)\n}\n"),
+            ("main.roc", "app [main!] {}\n\nimport Shout\n\nmain! = |_args| Ok(Shout.shout(\"hi\"))\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(\"hi!\")");
+}
+
+#[test]
+fn a_package_on_disk_is_imported_through_its_alias() {
+    let out = run_files(
+        "rocflight_local_package",
+        &[
+            ("pkg/main.roc", "package [Words] {}\n"),
+            ("pkg/Letters.roc", "Letters :: [].{\n\th : Str\n\th = \"h\"\n}\n"),
+            ("pkg/Words.roc", "import Letters\n\nWords :: [].{\n\tgreeting : Str\n\tgreeting = Str.concat(Letters.h, \"i\")\n}\n"),
+            ("main.roc", "app [main!] { pkg: \"./pkg/main.roc\" }\n\nimport pkg.Words\n\nmain! = |_args| Ok(Words.greeting)\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(\"hi\")");
+}
