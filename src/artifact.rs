@@ -1141,7 +1141,7 @@ fn put_shape(w: &mut Writer, shape: &crate::vm::NominalShape) {
             w.tag(4);
             w.seq(fields, |w, (n, kind)| { w.s(n); w.tag(field_kind_tag(*kind)); });
         }
-        S::List => w.tag(5),
+        S::Kind(kind) => { w.tag(5); w.tag(field_kind_tag(*kind)); }
     }
 }
 
@@ -1153,7 +1153,7 @@ fn get_shape(r: &mut Reader) -> crate::vm::NominalShape {
         2 => S::Simd(r.u() as u8),
         3 => S::Tags(r.seq(0, |r, _| r.s().to_string())),
         4 => S::Fields(r.seq(0, |r, _| (r.s().to_string(), field_kind_of(r.tag())))),
-        5 => S::List,
+        5 => S::Kind(field_kind_of(r.tag())),
         other => unreachable_tag("NominalShape", other),
     }
 }

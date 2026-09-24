@@ -1716,6 +1716,25 @@ fn a_list_backed_nominals_is_eq_does_not_claim_a_record() {
 }
 
 #[test]
+fn a_scalar_backed_nominals_is_eq_does_not_claim_a_record() {
+    // The same for a nominal over an integer: `Code.is_eq` is no candidate for a
+    // record, so the record is compared field by field.
+    let file = std::env::temp_dir().join("rocflight_scalar_shape.roc");
+    std::fs::write(
+        &file,
+        "app [main!] {}\n\nCode :: I64.{\n\tis_eq : Code, Code -> Bool\n\tis_eq = |Code.(a), Code.(b)| a == b\n\n\tof : I64 -> Code\n\tof = |c| Code.(c)\n}\n\n\
+         main! = |_args| Ok({ c: Code.of(15) } == { c: Code.of(15) })\n",
+    )
+    .unwrap();
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let ran = rocflight::run::run_file(file.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(ran.inspected.expect("inspected"), "Ok(True)");
+}
+
+#[test]
 fn a_user_defined_operator_does_not_capture_the_primitives() {
     // A type defining `plus` must not hijack `1 + 2`.
     let src = "Money :: { cents: I64 }.{\n    plus : Money, Money -> Money\n    plus = |a, b| { cents: a.cents + b.cents }\n}\n1 + 2";
