@@ -750,10 +750,16 @@ impl<'a> Cx<'a> {
         let t = self.ty_of(e)?;
         let name = match &t {
             Type::Nominal { name, .. } => self.nominals.get(bare(name)).map(|n| n.rust.clone()).ok_or_else(|| format!("the nominal {}", name))?,
-            Type::Record { .. } => {
-                let s = self.ty(&t)?;
-                s.split('<').next().unwrap_or(&s).to_string()
-            }
+            // Typed only by its shape (a let-bound literal can be): the one nominal
+            // record with exactly these fields, where there is one, since rocemit
+            // writes every record type without parameters as a nominal.
+            Type::Record { fields: tf, .. } => match self.nominal_record(tf) {
+                Some((rust, nt)) => return self.record_as(&rust, &nt, fields, scope),
+                None => {
+                    let s = self.ty(&t)?;
+                    s.split('<').next().unwrap_or(&s).to_string()
+                }
+            },
             other => return Err(format!("a record literal typed {}", other)),
         };
         let mut parts = Vec::new();
@@ -763,6 +769,30 @@ impl<'a> Cx<'a> {
             parts.push(format!("{}: {}", sanitize(f), if boxed { format!("Rc::new({})", v) } else { v }));
         }
         Ok(format!("{} {{ {} }}", name, parts.join(", ")))
+    }
+
+    /// The one nominal record whose fields are exactly these.
+    fn nominal_record(&self, fields: &[(&'static str, Type)]) -> Option<(String, Type)> {
+        let want = sorted_names(fields.iter().map(|(n, _)| *n));
+        let mut found = self.nominals.iter().filter(|(_, n)| {
+            matches!(&n.backing, Type::Record { fields: f, .. } if sorted_names(f.iter().map(|(x, _)| *x)) == want) && n.params.is_empty()
+        });
+        let (name, n) = found.next()?;
+        if found.next().is_some() {
+            return None;
+        }
+        let nt = Type::Nominal { name: crate::memory::string_pool::intern(name), backing: Box::new(n.backing.clone()) };
+        Some((n.rust.clone(), nt))
+    }
+
+    fn record_as(&self, rust: &str, t: &Type, fields: &[(&'static str, Expr)], scope: &Scope) -> Result<String, String> {
+        let mut parts = Vec::new();
+        for (f, v) in fields {
+            let (_, boxed) = self.field_type(t, f)?;
+            let v = self.expr(v, scope)?;
+            parts.push(format!("{}: {}", sanitize(f), if boxed { format!("Rc::new({})", v) } else { v }));
+        }
+        Ok(format!("{} {{ {} }}", rust, parts.join(", ")))
     }
 
     fn tag(&self, name: &str, args: &[Expr], e: &Expr, scope: &Scope) -> Result<String, String> {

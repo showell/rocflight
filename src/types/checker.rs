@@ -2096,13 +2096,24 @@ impl TypeChecker {
 
     /// Each recorded node's type, once inference is done: the substitution applied
     /// and an unpinned numeral defaulted, as the program will see it. A node typed
-    /// more than once (checked, then synthesised inside) keeps its last type.
+    /// more than once (checked, then synthesised inside) keeps its last type, but
+    ///
+    /// A node synthesised and also checked against a nominal (a tag or a record
+    /// literal where a `Node` or a `Particle` is wanted) keeps the nominal: it is
+    /// what the value is, where the synthesised type is only its shape.
     pub fn node_types(&self) -> std::collections::HashMap<crate::ast::NodeId, Type> {
-        self.node_types
-            .iter()
-            .flatten()
-            .map(|(id, ty)| (*id, self.defaulted(ty)))
-            .collect()
+        let mut out: std::collections::HashMap<crate::ast::NodeId, Type> = std::collections::HashMap::new();
+        for (id, ty) in self.node_types.iter().flatten() {
+            let ty = self.defaulted(ty);
+            let nominal = |t: &Type| matches!(t, Type::Nominal { backing, .. } if !matches!(**backing, Type::TypeVar(_)));
+            match out.get(id) {
+                Some(kept) if nominal(kept) && !nominal(&ty) => {}
+                _ => {
+                    out.insert(*id, ty);
+                }
+            }
+        }
+        out
     }
 
     fn synth_node(&mut self, expr: &Expr) -> Result<Type, TypeError> {
