@@ -1714,6 +1714,28 @@ fn a_nominal_unwrapped_by_a_pattern_is_its_backing_type() {
     assert_eq!(ran.inspected.expect("inspected"), "Ok(True)");
 }
 
+#[test]
+fn a_string_pattern_matches_a_nominal_through_from_quote() {
+    // `"zero"` against a `Text` is `Text.from_quote("zero")`, compared by `is_eq`.
+    // Inside an annotated function the match is checked, not synthesised, and must
+    // still hand its scrutinee's type to the compiler.
+    let file = std::env::temp_dir().join("rocflight_quote_pattern.roc");
+    std::fs::write(
+        &file,
+        "app [main!] {}\n\nText :: List(U8).{\n\tfrom_quote : Str -> Try(Text, [BadQuotedBytes(Str)])\n\tfrom_quote = |s| Ok(Text.(Str.to_utf8(s)))\n\n\
+         \tis_eq : Text, Text -> Bool\n\tis_eq = |Text.(a), Text.(b)| a == b\n}\n\n\
+         name : Text -> Str\nname = |t| match t {\n\t\"zero\" => \"matched\"\n\t_ => \"fell through\"\n}\n\n\
+         main! = |_args| Ok(name(\"zero\"))\n",
+    )
+    .unwrap();
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let ran = rocflight::run::run_file(file.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(ran.inspected.expect("inspected"), "Ok(\"matched\")");
+}
+
 // --- type-level features --------------------------------------------------
 
 #[test]
