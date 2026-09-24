@@ -188,6 +188,10 @@ struct Scope {
     locals: Vec<String>,
     owner: String,
     module: Option<String>,
+    /// The enclosing definition's type parameters. A type written inside its
+    /// body names only these; any other variable (the checker's own, for an
+    /// instantiation) is `_`, and rustc infers it.
+    generics: Vec<u32>,
 }
 
 impl Scope {
@@ -213,7 +217,9 @@ impl<'a> Cx<'a> {
         let params: HashMap<&str, &Vec<u32>> = self.input.nominal_params.iter().map(|(n, p)| (n.as_str(), p)).collect();
         for (name, ty) in self.input.modules.iter().flat_map(|m| m.types.iter()).chain(self.input.app_types.iter()) {
             if let Type::Nominal { backing, .. } = ty {
-                if matches!(**backing, Type::TypeVar(_)) {
+                // A placeholder, or a module's namespace (`Maybe :: []`), which no
+                // value has: not a type to write.
+                if matches!(**backing, Type::TypeVar(_)) || matches!(&**backing, Type::TagUnion { tags, .. } if tags.is_empty()) {
                     continue;
                 }
                 let b = bare(name).to_string();
@@ -435,7 +441,7 @@ impl<'a> Cx<'a> {
     fn def(&self, module: Option<&str>, name: &str, annotation: Option<&Type>, value: &Expr) -> Result<String, String> {
         let rust = sanitize(name);
         let owner = name.rsplit_once('.').map(|(o, _)| o.to_string()).unwrap_or_else(|| module.unwrap_or("").to_string());
-        let scope = Scope { locals: Vec::new(), owner, module: module.map(|m| m.to_string()) };
+        let mut scope = Scope { locals: Vec::new(), owner, module: module.map(|m| m.to_string()), generics: Vec::new() };
         let Some(sig) = annotation.cloned().or_else(|| self.types.get(&value.id()).cloned()) else {
             return Err(format!("`{}` has no type", name));
         };
@@ -446,12 +452,8 @@ impl<'a> Cx<'a> {
                 };
                 let mut vars = Vec::new();
                 vars_of(&sig, &mut vars);
-                let generics = if vars.is_empty() {
-                    String::new()
-                } else {
-                    format!("<{}>", vars.iter().map(|v| format!("T{}: Clone + PartialEq + std::fmt::Debug + 'static", v)).collect::<Vec<_>>().join(", "))
-                };
-                let mut scope = scope;
+                let generics = generic_list(&vars);
+                scope.generics = vars;
                 let mut args = Vec::new();
                 for (p, t) in params.iter().zip(&ps) {
                     args.push(format!("{}: {}", sanitize(p), self.ty(t)?));
@@ -463,9 +465,13 @@ impl<'a> Cx<'a> {
                 Ok(format!("pub fn {}{}({}) -> {} {{\n    {}\n}}\n", rust, generics, args.join(", "), result_ty, indent(&body, 4)))
             }
             _ => {
+                let mut vars = Vec::new();
+                vars_of(&sig, &mut vars);
+                let generics = generic_list(&vars);
+                scope.generics = vars;
                 let t = self.ty(&sig)?;
                 let body = self.expr(value, &scope)?;
-                Ok(format!("pub fn {}() -> {} {{\n    {}\n}}\n", rust, t, indent(&body, 4)))
+                Ok(format!("pub fn {}{}() -> {} {{\n    {}\n}}\n", rust, generics, t, indent(&body, 4)))
             }
         }
     }
@@ -497,7 +503,7 @@ impl<'a> Cx<'a> {
     }
 
     /// A reference to a top-level definition as a value.
-    fn top_value(&self, roc: &str, e: &Expr) -> Result<String, String> {
+    fn top_value(&self, roc: &str, e: &Expr, scope: &Scope) -> Result<String, String> {
         let rust = sanitize(roc);
         if self.tops[roc] {
             // A function used as a value: a closure over it, typed by the use.
@@ -506,8 +512,8 @@ impl<'a> Cx<'a> {
                 return Err(format!("`{}` used as a value of type {}", roc, t));
             };
             let names: Vec<String> = (0..ps.len()).map(|i| format!("a{}", i)).collect();
-            let typed: Result<Vec<String>, String> = names.iter().zip(&ps).map(|(n, t)| Ok(format!("{}: {}", n, self.ty(t)?))).collect();
-            Ok(format!("(Rc::new(move |{}| {}({})) as {})", typed?.join(", "), rust, names.join(", "), self.ty(&t)?))
+            let typed: Result<Vec<String>, String> = names.iter().zip(&ps).map(|(n, t)| Ok(format!("{}: {}", n, erase_free(&self.ty(t)?, &scope.generics)))).collect();
+            Ok(format!("(Rc::new(move |{}| {}({})) as {})", typed?.join(", "), rust, names.join(", "), erase_free(&self.ty(&t)?, &scope.generics)))
         } else {
             Ok(format!("{}()", rust))
         }
@@ -535,13 +541,13 @@ impl<'a> Cx<'a> {
                 if scope.local(n) {
                     self.read_local(n, e)?
                 } else if let Some(top) = self.resolve(n, scope) {
-                    self.top_value(&top, e)?
+                    self.top_value(&top, e, scope)?
                 } else {
                     return Err(format!("the name `{}`", n));
                 }
             }
             Expr::Qualified { module, name, .. } => match self.qualified(module, name) {
-                Some(top) => self.top_value(&top, e)?,
+                Some(top) => self.top_value(&top, e, scope)?,
                 None => return Err(format!("`{}.{}` as a value", module, name)),
             },
             Expr::BinOp { left, op, right, .. } => self.binop(left, *op, right, scope)?,
@@ -571,9 +577,9 @@ impl<'a> Cx<'a> {
                 let t = self.ty_of(e)?;
                 let mut out = format!("{{ let mut r = {};", self.expr(base, scope)?);
                 for (f, v) in fields {
-                    let ft = self.field_type(&t, f)?;
+                    let (_, boxed) = self.field_type(&t, f)?;
                     let v = self.expr(v, scope)?;
-                    let v = if self.boxed(&ft) { format!("Rc::new({})", v) } else { v };
+                    let v = if boxed { format!("Rc::new({})", v) } else { v };
                     out.push_str(&format!(" r.{} = {};", sanitize(f), v));
                 }
                 out.push_str(" r }");
@@ -581,9 +587,9 @@ impl<'a> Cx<'a> {
             }
             Expr::FieldAccess { record, field, .. } => {
                 let rt = self.ty_of(record)?;
-                let ft = self.field_type(&rt, field)?;
+                let (_, boxed) = self.field_type(&rt, field)?;
                 let r = self.expr(record, scope)?;
-                if self.boxed(&ft) {
+                if boxed {
                     format!("(*({}).{}).clone()", r, sanitize(field))
                 } else {
                     format!("({}).{}", r, sanitize(field))
@@ -697,13 +703,13 @@ impl<'a> Cx<'a> {
                 }
                 match self.resolve(n, scope) {
                     Some(top) if self.tops[&top] => sanitize(&top),
-                    Some(top) => format!("({})", self.top_value(&top, func)?),
+                    Some(top) => format!("({})", self.top_value(&top, func, scope)?),
                     None => return Err(format!("a call to `{}`", n)),
                 }
             }
             Expr::Qualified { module, name, .. } => match self.qualified(module, name) {
                 Some(top) if self.tops[&top] => sanitize(&top),
-                Some(top) => format!("({})", self.top_value(&top, func)?),
+                Some(top) => format!("({})", self.top_value(&top, func, scope)?),
                 None if BUILTIN_MODULES.contains(module) => {
                     if matches!(*module, "List" | "Str") {
                         format!("{}__{}", module, name)
@@ -719,9 +725,12 @@ impl<'a> Cx<'a> {
         Ok(format!("{}({})", callee, xs.join(", ")))
     }
 
-    fn field_type(&self, t: &Type, field: &str) -> Result<Type, String> {
+    /// A field's type at this use, and whether the definition holds it behind an
+    /// `Rc`: a nominal field of a nominal record is; a structural record's field is
+    /// a type parameter, never.
+    fn field_type(&self, t: &Type, field: &str) -> Result<(Type, bool), String> {
         match t {
-            Type::Record { fields, .. } => fields.iter().find(|(f, _)| *f == field).map(|(_, t)| t.clone()).ok_or_else(|| format!("no field {}", field)),
+            Type::Record { fields, .. } => fields.iter().find(|(f, _)| *f == field).map(|(_, t)| (t.clone(), false)).ok_or_else(|| format!("no field {}", field)),
             Type::Nominal { name, backing } => {
                 let n = self.nominals.get(bare(name)).ok_or_else(|| format!("the nominal {}", name))?;
                 let decl = match &n.backing {
@@ -731,7 +740,7 @@ impl<'a> Cx<'a> {
                 .ok_or_else(|| format!("no field {} in {}", field, name))?;
                 let mut bound = HashMap::new();
                 bind(&n.backing, backing, &mut bound);
-                Ok(subst(&decl, &bound))
+                Ok((subst(&decl, &bound), self.boxed(&decl)))
             }
             other => Err(format!("a field {} of {}", field, other)),
         }
@@ -749,9 +758,9 @@ impl<'a> Cx<'a> {
         };
         let mut parts = Vec::new();
         for (f, v) in fields {
-            let ft = self.field_type(&t, f)?;
+            let (_, boxed) = self.field_type(&t, f)?;
             let v = self.expr(v, scope)?;
-            parts.push(format!("{}: {}", sanitize(f), if self.boxed(&ft) { format!("Rc::new({})", v) } else { v }));
+            parts.push(format!("{}: {}", sanitize(f), if boxed { format!("Rc::new({})", v) } else { v }));
         }
         Ok(format!("{} {{ {} }}", name, parts.join(", ")))
     }
@@ -779,17 +788,17 @@ impl<'a> Cx<'a> {
         let boxed: Vec<String> = xs
             .into_iter()
             .zip(payload_types.iter())
-            .map(|(x, pt)| if self.boxed(pt) { format!("Rc::new({})", x) } else { x })
+            .map(|(x, (_, boxed))| if *boxed { format!("Rc::new({})", x) } else { x })
             .collect();
         Ok(format!("{}::{}({})", enum_name, name, boxed.join(", ")))
     }
 
     /// The Rust enum a tag belongs to, and that tag's payload types as declared.
-    fn variant(&self, t: &Type, tag: &str) -> Result<(String, Vec<Type>), String> {
+    fn variant(&self, t: &Type, tag: &str) -> Result<(String, Vec<(Type, bool)>), String> {
         match t {
             Type::TagUnion { tags, .. } => {
                 let s = self.ty(t)?;
-                let p = tags.iter().find(|(n, _)| *n == tag).map(|(_, p)| p.clone()).unwrap_or_default();
+                let p = tags.iter().find(|(n, _)| *n == tag).map(|(_, p)| p.iter().map(|x| (x.clone(), false)).collect()).unwrap_or_default();
                 Ok((s.split('<').next().unwrap_or(&s).to_string(), p))
             }
             Type::Nominal { name, backing } => {
@@ -799,7 +808,7 @@ impl<'a> Cx<'a> {
                 };
                 let mut bound = HashMap::new();
                 bind(&n.backing, backing, &mut bound);
-                let p = tags.iter().find(|(x, _)| *x == tag).map(|(_, p)| p.iter().map(|x| subst(x, &bound)).collect()).unwrap_or_default();
+                let p = tags.iter().find(|(x, _)| *x == tag).map(|(_, p)| p.iter().map(|x| (subst(x, &bound), self.boxed(x))).collect()).unwrap_or_default();
                 Ok((n.rust.clone(), p))
             }
             other => Err(format!("a tag {} of {}", tag, other)),
@@ -812,7 +821,7 @@ impl<'a> Cx<'a> {
         let mut inner = scope.clone();
         let mut typed = Vec::new();
         for (p, pt) in params.iter().zip(&ps) {
-            typed.push(format!("{}: {}", sanitize(p), self.ty(pt)?));
+            typed.push(format!("{}: {}", sanitize(p), erase_free(&self.ty(pt)?, &scope.generics)));
             inner.locals.push(p.to_string());
         }
         let b = self.expr(body, &inner)?;
@@ -821,7 +830,7 @@ impl<'a> Cx<'a> {
         names_in(body, &mut used);
         let captures: Vec<String> = scope.locals.iter().filter(|l| used.contains(l.as_str()) && !params.contains(&l.as_str())).map(|l| sanitize(l)).collect();
         let lets: String = captures.iter().map(|c| format!("let {c} = {c}.clone(); ")).collect();
-        Ok(format!("{{ {}(Rc::new(move |{}| -> {} {{ {} }}) as {}) }}", lets, typed.join(", "), self.ty(&result)?, b, self.ty(&t)?))
+        Ok(format!("{{ {}(Rc::new(move |{}| -> {} {{ {} }}) as {}) }}", lets, typed.join(", "), erase_free(&self.ty(&result)?, &scope.generics), b, erase_free(&self.ty(&t)?, &scope.generics)))
     }
 
     // ---- matching ----
@@ -924,9 +933,9 @@ impl<'a> Cx<'a> {
                     binds.push(n.clone());
                 }
                 let is_result = matches!(t, Type::TagUnion { tags, .. } if sorted_names(tags.iter().map(|(n, _)| *n)) == ["Err", "Ok"]);
-                let (head, pts) = if is_result {
+                let (head, pts): (String, Vec<(Type, bool)>) = if is_result {
                     let Type::TagUnion { tags, .. } = t else { unreachable!() };
-                    (name.to_string(), tags.iter().find(|(n, _)| n == name).map(|(_, p)| p.clone()).unwrap_or_default())
+                    (name.to_string(), tags.iter().find(|(n, _)| n == name).map(|(_, p)| p.iter().map(|x| (x.clone(), false)).collect()).unwrap_or_default())
                 } else {
                     let (e, pts) = self.variant(t, name)?;
                     (format!("{}::{}", e, name), pts)
@@ -935,8 +944,8 @@ impl<'a> Cx<'a> {
                 if is_result && args.len() > 1 {
                     return Err("a Result tag with several payloads".into());
                 }
-                for (i, (a, pt)) in args.iter().zip(&pts).enumerate().rev() {
-                    let access = if self.boxed(pt) { format!("(&**{})", names[i]) } else { names[i].clone() };
+                for (i, (a, (pt, boxed))) in args.iter().zip(&pts).enumerate().rev() {
+                    let access = if *boxed { format!("(&**{})", names[i]) } else { names[i].clone() };
                     code = self.pat(a, &access, pt, binds, scope, code)?;
                 }
                 let bind = if args.is_empty() { String::new() } else { format!("({})", names.join(", ")) };
@@ -949,8 +958,8 @@ impl<'a> Cx<'a> {
                 }
                 let mut code = inner;
                 for (f, sub) in fields.iter().rev() {
-                    let ft = self.field_type(t, f)?;
-                    let access = if self.boxed(&ft) { format!("(&*({}).{})", v, sanitize(f)) } else { format!("(&({}).{})", v, sanitize(f)) };
+                    let (ft, boxed) = self.field_type(t, f)?;
+                    let access = if boxed { format!("(&*({}).{})", v, sanitize(f)) } else { format!("(&({}).{})", v, sanitize(f)) };
                     code = self.pat(sub, &access, &ft, binds, scope, code)?;
                 }
                 code
@@ -992,6 +1001,41 @@ impl<'a> Cx<'a> {
         };
         if n < 0 { format!("({}{})", n, suffix) } else { format!("{}{}", n, suffix) }
     }
+}
+
+fn generic_list(vars: &[u32]) -> String {
+    if vars.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", vars.iter().map(|v| format!("T{}: Clone + PartialEq + std::fmt::Debug + 'static", v)).collect::<Vec<_>>().join(", "))
+    }
+}
+
+/// A type written inside a body: a variable that is not the definition's own
+/// is `_`, for rustc to infer.
+fn erase_free(s: &str, generics: &[u32]) -> String {
+    let b = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        let boundary = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if b[i] == b'T' && boundary {
+            let mut j = i + 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let ends = j == b.len() || !(b[j].is_ascii_alphanumeric() || b[j] == b'_');
+            if j > i + 1 && ends {
+                let v: u32 = s[i + 1..j].parse().unwrap_or(u32::MAX);
+                out.push_str(if generics.contains(&v) { &s[i..j] } else { "_" });
+                i = j;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
 }
 
 fn sorted_names<'x>(names: impl Iterator<Item = &'x str>) -> Vec<String> {
