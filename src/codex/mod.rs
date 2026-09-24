@@ -601,10 +601,16 @@ impl Cx<'_> {
                 format!("[{}]", xs?.join(", "))
             }
             Expr::Record(fields, _) => {
-                // Named by its own fields, which a literal lists in full: its type
-                // can be an unresolved variable (a payload of a generic tag).
-                let shape: Vec<(&'static str, Type)> = fields.iter().map(|(f, _)| (*f, Type::Unit)).collect();
-                let rname = self.record_names(&shape)?;
+                // A nominal record (`Byte.{ val: 0 }`) names itself. A structural
+                // one is named by its own fields, which a literal lists in full:
+                // its type can be an unresolved variable (a generic tag's payload).
+                let rname = match self.ty_of(e) {
+                    Some(Type::Nominal { name, backing }) if matches!(**backing, Type::Record { .. }) => bare(name),
+                    _ => {
+                        let shape: Vec<(&'static str, Type)> = fields.iter().map(|(f, _)| (*f, Type::Unit)).collect();
+                        self.record_names(&shape)?
+                    }
+                };
                 let fs: Result<Vec<String>, String> = fields.iter().map(|(f, v)| Ok(format!("{} = {}", kebab(f), self.expr(v)?))).collect();
                 format!("{} {{ {} }}", type_name(rname), fs?.join(", "))
             }

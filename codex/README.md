@@ -60,9 +60,10 @@ program's chapters as `Roc--Name`.
 
 ## Where it stands (2026-09-24)
 
-512 of 526 round-trip, none wrong. 10 are refused on purpose: a program that
-pokes raw memory is emitted over rocemit's `Mem`, threaded through every
-function, which is a whole-program rewrite rather than an idiom. The other 4
-are record types the Roc cannot name: two Codex record types of one shape
-(`Byte`, `Wide` are both `{ val : I64 }`, one Roc type), and one record whose
-type rocemit never declared.
+515 of 525 round-trip, none wrong. The other 10 are refused on purpose: a
+program that pokes raw memory is emitted over rocemit's `Mem`, threaded through
+every function, which is a whole-program rewrite rather than an idiom.
+
+Record types come back by name because rocemit writes each one (without type
+parameters) as a nominal, `Byte := { val : I64 }`: two Codex records of one
+shape are otherwise one Roc type.
