@@ -553,13 +553,23 @@ impl Cx<'_> {
     }
 
     fn when(&self, scrutinee: &Expr, arms: &[MatchArm]) -> Result<String, String> {
+        // rocemit matches a Codex Char on its code: `match CceChar.code(c) { 15 => }`
+        // is `when c is 'a' ->`.
+        let (scrutinee, on_char) = match call_of(scrutinee, "CceChar.code") {
+            Some([c]) => (c, true),
+            _ => (scrutinee, false),
+        };
         let mut out = format!("when {}", self.expr(scrutinee)?);
         for arm in arms {
             if arm.guard.is_some() {
                 return Err("a match arm with a guard".into());
             }
             for p in &arm.patterns {
-                out.push_str(&format!("\n  is {} -> {}", self.pattern(p, scrutinee)?, indent(&self.expr(&arm.body)?, 4)));
+                let pat = match p {
+                    Pattern::Int(n) if on_char => self.char_literal(*n).ok_or_else(|| format!("a Char pattern {} with no printable literal", n))?,
+                    other => self.pattern(other, scrutinee)?,
+                };
+                out.push_str(&format!("\n  is {} -> {}", pat, indent(&self.expr(&arm.body)?, 4)));
             }
         }
         Ok(out)
