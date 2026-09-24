@@ -17,26 +17,29 @@ COBBLESTONE="${COBBLESTONE:-$HOME/showell_repos/cobblestone-u62}"
 mkdir -p "$OUT"
 if [ $# -gt 0 ]; then names=("$@"); else mapfile -t names < <(cd "$PORTED" && ls codex_*.roc | sed 's/\.roc$//'); fi
 : > "$OUT/ledger.txt"
+trim() { awk 'BEGIN{n=0} /^$/{n++; next} {while (n-- > 0) print ""; n=0; print}'; }
 one() {
     n="$1"
     if ! (cd "$PORTED" && timeout 60 "$BIN/roc2codex" "$n.roc" "$OUT/$n.codex") 2> "$OUT/$n.refused"; then
         echo "REFUSED $n | $(sed 's/^REFUSED: //' "$OUT/$n.refused" | head -1 | cut -c1-140)"; return
     fi
-    timeout 60 "$BIN/codexrun" "$OUT/$n.codex" > "$OUT/$n.out" 2>&1; rc=$?
+    # The capture behind a verdict drops trailing blank lines, so ours are dropped
+    # too, as roc-apps' ladder does (tests/verdicts.py).
+    timeout 60 "$BIN/codexrun" "$OUT/$n.codex" 2>&1 | trim > "$OUT/$n.out"; rc=${PIPESTATUS[0]}
     if [ $rc = 124 ]; then echo "TIMEOUT $n"
     elif cmp -s "$OUT/$n.out" "$PORTED/expected/$n.txt"; then echo "PASS $n"
     else
         # Does codexrun run the ORIGINAL? If it fails that too, the gap is the
         # oracle's, not the round trip's.
         src="$(grep -m1 '^#   from' "$PORTED/$n.roc" | sed 's|.*/blob/master/||; s|@|/|g')"
-        if [ -n "$src" ] && [ -f "$COBBLESTONE/$src" ] && ! timeout 60 "$BIN/codexrun" "$COBBLESTONE/$src" 2>/dev/null | cmp -s - "$PORTED/expected/$n.txt"; then
+        if [ -n "$src" ] && [ -f "$COBBLESTONE/$src" ] && ! timeout 60 "$BIN/codexrun" "$COBBLESTONE/$src" 2>/dev/null | trim | cmp -s - "$PORTED/expected/$n.txt"; then
             echo "ORACLE-FAIL $n | codexrun fails the original $src too"
         else
             echo "FAIL $n | $(diff "$OUT/$n.out" "$PORTED/expected/$n.txt" | grep -m1 '^[<>]' | cut -c1-140)"
         fi
     fi
 }
-export -f one; export BIN PORTED OUT COBBLESTONE
+export -f one trim; export BIN PORTED OUT COBBLESTONE
 printf '%s\n' "${names[@]}" | xargs -P "${JOBS:-2}" -I{} bash -c 'one {}' | sort -k2 > "$OUT/ledger.txt"
 cut -d' ' -f1 "$OUT/ledger.txt" | sort | uniq -c | sort -rn
 echo "--- refusals by reason:"

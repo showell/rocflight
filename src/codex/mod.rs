@@ -491,6 +491,13 @@ impl Cx<'_> {
         match e {
             // A block of statements.
             Expr::Let { .. } => self.statements(e, ind),
+            // A choice between statements: an `if` whose branches are acts.
+            Expr::If { condition, then_branch, otherwise, .. } if is_statement(e) => Ok(format!(
+                "{pad}if {} then act\n{}{pad}end else act\n{}{pad}end\n",
+                self.expr(condition)?,
+                self.statements(then_branch, ind + 2)?,
+                self.statements(otherwise, ind + 2)?,
+            )),
             // A choice among statements: a `when` whose arms are acts.
             Expr::Match { scrutinee, arms, .. } if is_statement(e) => {
                 let (scrutinee, on_char) = match call_of(scrutinee, "CceChar.code") {
@@ -499,16 +506,17 @@ impl Cx<'_> {
                 };
                 let mut out = format!("{}when {}\n", pad, self.expr(scrutinee)?);
                 for arm in arms {
-                    if arm.guard.is_some() {
-                        return Err("a match arm with a guard".into());
-                    }
+                    let guard = match &arm.guard {
+                        Some(g) => format!(" when {}", self.expr(g)?),
+                        None => String::new(),
+                    };
                     for p in &arm.patterns {
                         let pat = match p {
                             Pattern::Int(n) if on_char => self.char_literal(*n).ok_or_else(|| format!("a Char pattern {} with no printable literal", n))?,
                             Pattern::Wildcard => "otherwise".into(),
                             other => self.pattern(other, scrutinee)?,
                         };
-                        out.push_str(&format!("{}  is {} -> act\n{}{}  end\n", pad, pat, self.statements(&arm.body, ind + 4)?, pad));
+                        out.push_str(&format!("{}  is {}{} -> act\n{}{}  end\n", pad, pat, guard, self.statements(&arm.body, ind + 4)?, pad));
                     }
                 }
                 Ok(out)
@@ -653,9 +661,10 @@ impl Cx<'_> {
         };
         let mut out = format!("when {}", self.expr(scrutinee)?);
         for arm in arms {
-            if arm.guard.is_some() {
-                return Err("a match arm with a guard".into());
-            }
+            let guard = match &arm.guard {
+                Some(g) => format!(" when {}", self.expr(g)?),
+                None => String::new(),
+            };
             for p in &arm.patterns {
                 let pat = match p {
                     Pattern::Int(n) if on_char => self.char_literal(*n).ok_or_else(|| format!("a Char pattern {} with no printable literal", n))?,
@@ -663,7 +672,7 @@ impl Cx<'_> {
                     Pattern::Wildcard => "otherwise".into(),
                     other => self.pattern(other, scrutinee)?,
                 };
-                out.push_str(&format!("\n  is {} -> {}", pat, indent(&self.expr(&arm.body)?, 4)));
+                out.push_str(&format!("\n  is {}{} -> {}", pat, guard, indent(&self.expr(&arm.body)?, 4)));
             }
         }
         Ok(out)
@@ -742,7 +751,7 @@ impl Cx<'_> {
                 if let [Pattern::Tag { name: "Ok", args }] = arms[0].patterns.as_slice() {
                     if let ([Pattern::Binding(v)], Expr::Ident(b, _)) = (args.as_slice(), &arms[0].body) {
                         if v == b {
-                            for (roc, codex) in [("List.get", "list-at"), ("List.set", "list-set-at")] {
+                            for (roc, codex) in [("List.get", "list-at"), ("List.set", "list-set-at"), ("List.insert", "list-insert-at")] {
                                 if let Some(xs) = call_of(scrutinee, roc) {
                                     let mut out = codex.to_string();
                                     for (k, x) in xs.iter().enumerate() {
@@ -842,6 +851,22 @@ impl Cx<'_> {
                 return Ok(Some(format!("real-to-bits {}", paren(self.expr(r)?))));
             }
         }
+        // Roc's `mod_by` takes the divisor's sign and Codex's `int-mod` is
+        // Euclidean: the same for a positive divisor, which is the only one read.
+        if let Some([a, b]) = call_of(e, "I64.mod_by") {
+            if matches!(b, Expr::Int(n, _) if *n > 0) {
+                return Ok(Some(format!("int-mod {} {}", paren(self.expr(a)?), paren(self.expr(b)?))));
+            }
+        }
+        // A real rocemit wrote as its bits: the shortest decimal that reads back as
+        // those bits, where Codex can spell it.
+        if let Some([Expr::Int(bits, _)]) = call_of(e, "F64.from_bits") {
+            let f = f64::from_bits(*bits as u64);
+            let text = format!("{:?}", f);
+            if f.is_finite() && !text.contains('e') {
+                return Ok(Some(text));
+            }
+        }
         if let Some([x]) = call_of(e, "F64.from_bits") {
             if let Some([b]) = call_of(x, "I64.to_u64_wrap") {
                 return Ok(Some(format!("bits-to-real {}", paren(self.expr(b)?))));
@@ -929,6 +954,7 @@ fn is_statement(e: &Expr) -> bool {
         || call_of(e, "line!").is_some()
         || matches!(e, Expr::Let { .. })
         || matches!(e, Expr::Match { arms, .. } if arms.iter().any(|a| is_statement(&a.body)))
+        || matches!(e, Expr::If { then_branch, otherwise, .. } if is_statement(then_branch) || is_statement(otherwise))
 }
 
 /// The first `n` parameters of a curried function type, and what is left.

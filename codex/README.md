@@ -60,8 +60,8 @@ program's chapters as `Roc--Name`.
 
 ## Where it stands (2026-09-24)
 
-498 of 526 round-trip, none wrong. 10 are refused on purpose: a program that
+506 of 526 round-trip, none wrong. 10 are refused on purpose: a program that
 pokes raw memory is emitted over rocemit's `Mem`, threaded through every
 function, which is a whole-program rewrite rather than an idiom. The rest are
-single cases: `when` guards, float conversions, `List.insert`, a few record
-shapes.
+single cases: record literals of no declared record type, and reals written
+as their bits.
