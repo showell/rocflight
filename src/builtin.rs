@@ -438,7 +438,13 @@ fn reachable(source: &str, selected: &[&str]) -> String {
 /// All ten parsing members are verified to seed cleanly, with the golden pairs and the
 /// examples green on any combination of them, so widening this is one edit whenever the
 /// long tail beyond these four is worth its parse.
-const TYPED_MEMBERS: &[&str] = &["Dict", "Set", "Str", "List"];
+const TYPED_MEMBERS: &[&str] = &["Dict", "Set", "Str", "List", "Try"];
+
+/// The member a module's signatures are declared in: its own, but for `Try`, whose
+/// method block is inside `Box`'s.
+fn member_of(module: &str) -> &str {
+    if module == "Try" { "Box" } else { module }
+}
 
 /// The `Type.method` signatures for one module, parsed on FIRST USE and kept.
 ///
@@ -446,9 +452,8 @@ const TYPED_MEMBERS: &[&str] = &["Dict", "Set", "Str", "List"];
 /// need: a program that never mentions a `Dict` never pays for `Dict`, and one that
 /// only concatenates strings pays 0.22ms for `Str` and nothing for `List`'s 0.57ms.
 ///
-/// The module name is the member name here, which holds for everything in
-/// `TYPED_MEMBERS`. It does not in general — `Json` lives in `Encoding` and `Try` in
-/// `Box` — so widening that list means indexing modules to members first.
+/// The module name is the member name, but for those `member_of` indexes: `Try`
+/// lives in `Box` (and `Json` in `Encoding`, not typed yet).
 type SignatureTable =
     std::collections::HashMap<String, &'static [(&'static str, crate::types::Type)]>;
 static CACHE: std::sync::OnceLock<std::sync::Mutex<SignatureTable>> = std::sync::OnceLock::new();
@@ -485,7 +490,7 @@ pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Ty
     // with its own `Parser`, so its `Dict` is an unparameterised placeholder and `item`
     // is dropped. `parse_signatures` prepends `Dict`'s annotations for exactly that.
     if module != "Set" {
-        if let Some(found) = artifact().and_then(|a| a.signatures_of(module)) {
+        if let Some(found) = artifact().and_then(|a| a.signatures_of(member_of(module))) {
             let table: Box<[(&'static str, crate::types::Type)]> = found
                 .into_iter()
                 .filter(|(name, _)| {
@@ -550,7 +555,7 @@ pub fn seed_signatures(loaded: &[Loaded]) {
 }
 
 fn parse_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
-    let Some(slice) = MEMBERS.iter().find(|s| s.name == module) else { return Box::new([]) };
+    let Some(slice) = MEMBERS.iter().find(|s| s.name == member_of(module)) else { return Box::new([]) };
     // `Set(item) :: Dict(item, {})` — so `Set`'s own signatures only carry their
     // element type if `Dict` is a known parameterised nominal while they are parsed.
     // Alone, `Dict(item, {})` degrades to a placeholder and `item` is dropped, which is
