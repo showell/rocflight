@@ -553,6 +553,9 @@ impl Cx<'_> {
                 let f = match &**func {
                     Expr::Ident(n, _) => kebab(n),
                     Expr::Qualified { module, name, .. } if *module != TEXT_MODULE && !ROC_BUILTIN_MODULES.contains(module) => kebab(name),
+                    // A function value: a record's field, `(bx.get)(i)`, or a call's
+                    // answer, `mk(4)(20, 22)`.
+                    other @ (Expr::FieldAccess { .. } | Expr::Call { .. }) => format!("({})", self.expr(other)?),
                     other => return Err(format!("a call to {}", short(other))),
                 };
                 let mut out = f;
