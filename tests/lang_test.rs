@@ -1468,6 +1468,14 @@ fn a_lambda_boundary_is_not_read_as_a_pipe() {
 }
 
 #[test]
+fn a_lambda_whose_body_is_a_record_reads_its_field_inside() {
+    // `|b| { val: b.val + 1 }.val` is a lambda answering the field, not the field of
+    // a lambda: a record body takes postfix like any other expression.
+    let src = "Byte : { val : I64 }\nbump : Byte -> I64\nbump = |b| { val: (b.val + 1) }.val\nbump({ val: 41 })";
+    assert_eq!(value(src), "42");
+}
+
+#[test]
 fn or_is_not_read_as_a_pipe() {
     assert_eq!(
         as_str("Str.inspect(Bool.True or Bool.False)"),
