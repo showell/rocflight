@@ -2274,6 +2274,25 @@ impl TypeChecker {
                         }
                         Ok(Type::closed_record(result))
                     }
+                    // A nominal record updated is that nominal: `{ ..p, x: 1 }` on a
+                    // `P := { x : I64, .. }` is a `P`. The fields were checked against
+                    // the backing above; one it does not have is an error, as for a
+                    // plain record. A fresh variable here made the next update's base
+                    // an open record holding only the fields that update named.
+                    resolved @ Type::Nominal { .. } if !known.is_empty() => {
+                        for (name, _) in &updated {
+                            if !known.iter().any(|(field, _)| field == name) {
+                                return Err(TypeError {
+                                    message: format!("Record has no field `{}` to update", name),
+                                    expected: Type::closed_record(known.clone()).to_string(),
+                                    actual: name.to_string(),
+                                    line: 0,
+                                    col: 0,
+                                });
+                            }
+                        }
+                        Ok(resolved)
+                    }
                     // Base type not resolved yet; eval catches a real mistake.
                     _ => Ok(self.fresh_var()),
                 }

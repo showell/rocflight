@@ -535,6 +535,24 @@ fn several_fields_may_be_updated_at_once() {
 }
 
 #[test]
+fn an_update_of_a_nominal_record_is_the_nominal() {
+    // Each update answers a `P`, so the next one sees every field: three deep, the
+    // result is still a whole `P`, not a record holding the last update's fields.
+    let src = "P := { x : I64, y : I64, z : I64 }\n\
+               bump : P, I64 -> P\nbump = |p, a| { ..{ ..{ ..p, x: a }, y: a }, z: a }\n\
+               start : P\nstart = P.{ x: 1, y: 2, z: 3 }\nq = bump(start, 10)\nq.x + q.y + q.z";
+    assert_eq!(value(src), "30");
+}
+
+#[test]
+fn updating_a_nominal_record_by_a_field_it_lacks_is_an_error() {
+    assert!(
+        !accepts("P := { a : I64 }\np : P\np = P.{ a: 1 }\n{ ..p, nope: 2 }"),
+        "adding a field to a nominal record via update should fail"
+    );
+}
+
+#[test]
 fn updating_a_field_the_record_lacks_is_an_error() {
     // An update cannot ADD a field.
     assert!(
