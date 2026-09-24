@@ -3751,7 +3751,8 @@ impl Parser {
                 }
                 // `Name.(payload)` unwraps a nominal over a NON-record backing, the
                 // pattern counterpart of the `Name.(x)` constructor. The nominal is
-                // erased at runtime, so the pattern is just its payload's.
+                // erased at runtime, so it matches as its payload does; it is kept in
+                // the tree because the payload's TYPE is the backing, not the nominal.
                 if self.input[self.pos..].starts_with(".(") {
                     self.pos += 2; // Skip '.('
                     let inner = self.parse_pattern()?;
@@ -3772,7 +3773,7 @@ impl Parser {
                             self.pos += 1;
                             self.skip_whitespace();
                         }
-                        return Ok(Pattern::Tuple(items));
+                        return Ok(Pattern::Nominal { name, inner: Box::new(Pattern::Tuple(items)) });
                     }
                     if !self.input[self.pos..].starts_with(')') {
                         return Err(ParseError {
@@ -3782,7 +3783,7 @@ impl Parser {
                     }
                     self.pos += 1;
                     self.skip_whitespace();
-                    return Ok(inner);
+                    return Ok(Pattern::Nominal { name, inner: Box::new(inner) });
                 }
                 if self.input[self.pos..].starts_with('.')
                     && self.input[self.pos + 1..].starts_with(|c: char| c.is_uppercase())

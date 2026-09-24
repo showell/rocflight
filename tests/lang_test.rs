@@ -1693,6 +1693,27 @@ fn a_user_defined_operator_does_not_capture_the_primitives() {
     assert_eq!(value(src), "3");
 }
 
+#[test]
+fn a_nominal_unwrapped_by_a_pattern_is_its_backing_type() {
+    // `|Units.(a), Units.(b)| a == b` compares the two LISTS: `a` is a `List(U8)`, so
+    // its `==` is the list's, not `Units.is_eq` again. Typed as the nominal, the
+    // comparison called itself until the recursion limit. The whole pipeline, since
+    // the checker's operand types reach the compiler only through `run_file`.
+    let file = std::env::temp_dir().join("rocflight_nominal_unwrap.roc");
+    std::fs::write(
+        &file,
+        "app [main!] {}\n\nUnits :: List(U8).{\n\tis_eq : Units, Units -> Bool\n\tis_eq = |Units.(a), Units.(b)| a == b\n}\n\n\
+         main! = |_args| Ok(Units.([1, 2]) == Units.([1, 2]))\n",
+    )
+    .unwrap();
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let ran = rocflight::run::run_file(file.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(ran.inspected.expect("inspected"), "Ok(True)");
+}
+
 // --- type-level features --------------------------------------------------
 
 #[test]

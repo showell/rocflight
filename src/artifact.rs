@@ -399,6 +399,11 @@ fn put_pattern(w: &mut Writer, p: &Pattern) {
             }
             w.seq(after, |w, p| put_pattern(w, p));
         }
+        Pattern::Nominal { name, inner } => {
+            w.tag(11);
+            w.s(name);
+            put_pattern(w, inner);
+        }
     }
 }
 
@@ -438,6 +443,10 @@ fn get_pattern(r: &mut Reader) -> Pattern {
                 other => unreachable_tag("Pattern::List rest", other),
             };
             Pattern::List { before, rest, after: r.seq(0, |r, _| get_pattern(r)) }
+        }
+        11 => {
+            let name = r.s();
+            Pattern::Nominal { name, inner: Box::new(get_pattern(r)) }
         }
         other => unreachable_tag("Pattern", other),
     }

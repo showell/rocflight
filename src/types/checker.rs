@@ -2001,9 +2001,9 @@ impl TypeChecker {
             Type::Nominal { backing, .. } => *backing,
             other => other,
         };
-        // An `as` pattern covers whatever its inner pattern does, so unwrap it.
+        // An `as` or a nominal pattern covers whatever its inner pattern does.
         fn base(p: &Pattern) -> &Pattern {
-            match p { Pattern::As { inner, .. } => base(inner), other => other }
+            match p { Pattern::As { inner, .. } | Pattern::Nominal { inner, .. } => base(inner), other => other }
         }
         let covers_everything = arms.iter().any(|arm| {
             arm.guard.is_none()
@@ -3601,6 +3601,14 @@ impl TypeChecker {
                 self.bind(name, scrutinee.clone());
                 self.bind_pattern(inner, scrutinee);
             }
+            // `Text.(units)` against a `Text` binds `units` to the backing.
+            Pattern::Nominal { name, inner } => {
+                let backing = match self.apply(scrutinee) {
+                    Type::Nominal { name: n, backing } if n == *name => *backing,
+                    other => other,
+                };
+                self.bind_pattern(inner, &backing);
+            }
             Pattern::Tag { name, args } => {
                 let payload = match scrutinee {
                     Type::TagUnion { tags, .. } => tags
@@ -3736,6 +3744,7 @@ impl TypeChecker {
             }
             Pattern::Str(_) | Pattern::StrInterp { .. } => Type::Str,
             Pattern::As { inner, .. } => self.pattern_type(inner)?,
+            Pattern::Nominal { name, .. } => self.nominal_named(name),
             Pattern::Tag { name, args } => {
                 let mut payload = Vec::with_capacity(args.len());
                 for arg in args {
