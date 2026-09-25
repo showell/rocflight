@@ -20,6 +20,26 @@ pub mod alloc_count {
     static ALLOCS: AtomicU64 = AtomicU64::new(0);
     static REALLOCS: AtomicU64 = AtomicU64::new(0);
     static BYTES: AtomicU64 = AtomicU64::new(0);
+    /// A list written by a builtin: taken whole (held only here), or copied.
+    pub static TAKEN: AtomicU64 = AtomicU64::new(0);
+    pub static COPIED: AtomicU64 = AtomicU64::new(0);
+    /// Copies by element type: how many, and how many elements in all.
+    static COPIES: std::sync::Mutex<Option<std::collections::HashMap<&'static str, (u64, u64)>>> = std::sync::Mutex::new(None);
+    pub fn copied<T>(len: usize) {
+        COPIED.fetch_add(1, Relaxed);
+        let mut c = COPIES.lock().unwrap();
+        let e = c.get_or_insert_with(Default::default).entry(std::any::type_name::<T>()).or_default();
+        e.0 += 1;
+        e.1 += len as u64;
+    }
+    fn report_copies() {
+        let c = COPIES.lock().unwrap();
+        let mut v: Vec<_> = c.iter().flatten().map(|(k, v)| (*k, *v)).collect();
+        v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        for (k, (n, len)) in v.iter().take(12) {
+            eprintln!("  copied {:>8} times, {:>9} elements: {}", n, len, k.replace("roc::", ""));
+        }
+    }
     pub struct Counting;
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -40,6 +60,8 @@ pub mod alloc_count {
     static COUNTING: Counting = Counting;
     pub fn report() {
         eprintln!("allocs {} reallocs {} bytes {}", ALLOCS.load(Relaxed), REALLOCS.load(Relaxed), BYTES.load(Relaxed));
+        eprintln!("lists written: taken {} copied {}", TAKEN.load(Relaxed), COPIED.load(Relaxed));
+        report_copies();
     }
 }
 
@@ -69,11 +91,20 @@ impl<T: Clone> List<T> {
     pub fn of(v: Vec<T>) -> Self {
         List(if v.is_empty() { None } else { Some(Rc::new(v)) })
     }
-    fn vec(self) -> Vec<T> {
-        match self.0 {
-            None => Vec::new(),
-            Some(rc) => Rc::try_unwrap(rc).unwrap_or_else(|rc| (*rc).clone()),
+    /// The elements, to write: in place when this list holds the only reference to
+    /// them, a copy otherwise (`Rc::make_mut`) -- Roc's rule for a list. The list
+    /// keeps its allocation either way.
+    fn edit(&mut self) -> &mut Vec<T> {
+        let rc = self.0.get_or_insert_with(|| Rc::new(Vec::new()));
+        #[cfg(roc2rust_count_allocs)]
+        {
+            if Rc::strong_count(rc) == 1 {
+                alloc_count::TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                alloc_count::copied::<T>(rc.len());
+            }
         }
+        Rc::make_mut(rc)
     }
     pub fn is_empty(&self) -> bool {
         self.items().is_empty()
@@ -95,42 +126,47 @@ pub fn List__len<T: Clone>(l: List<T>) -> u64 {
 pub fn List__get<T: Clone>(l: List<T>, i: u64) -> Result<T, ()> {
     l.items().get(i as usize).cloned().ok_or(())
 }
-pub fn List__set<T: Clone>(l: List<T>, i: u64, x: T) -> Result<List<T>, ()> {
+pub fn List__set<T: Clone>(mut l: List<T>, i: u64, x: T) -> Result<List<T>, ()> {
     let i = i as usize;
     if i >= l.items().len() {
         return Err(());
     }
-    let mut v = l.vec();
-    v[i] = x;
-    Ok(List::of(v))
+    l.edit()[i] = x;
+    Ok(l)
 }
-pub fn List__replace<T: Clone>(l: List<T>, i: u64, x: T) -> (List<T>, T) {
+/// `List.set(l, i, x) ?? l`: set in range, else the list as it was.
+pub fn List__set_or_same<T: Clone>(mut l: List<T>, i: u64, x: T) -> List<T> {
     let i = i as usize;
-    let mut v = l.vec();
-    if i >= v.len() {
-        return (List::of(v), x);
+    if i < l.items().len() {
+        l.edit()[i] = x;
     }
-    let old = std::mem::replace(&mut v[i], x);
-    (List::of(v), old)
+    l
 }
-pub fn List__insert<T: Clone>(l: List<T>, i: u64, x: T) -> Result<List<T>, ()> {
+pub fn List__replace<T: Clone>(mut l: List<T>, i: u64, x: T) -> (List<T>, T) {
+    let i = i as usize;
+    if i >= l.items().len() {
+        return (l, x);
+    }
+    let old = std::mem::replace(&mut l.edit()[i], x);
+    (l, old)
+}
+pub fn List__insert<T: Clone>(mut l: List<T>, i: u64, x: T) -> Result<List<T>, ()> {
     let i = i as usize;
     if i > l.items().len() {
         return Err(());
     }
-    let mut v = l.vec();
-    v.insert(i, x);
-    Ok(List::of(v))
+    l.edit().insert(i, x);
+    Ok(l)
 }
-pub fn List__append<T: Clone>(l: List<T>, x: T) -> List<T> {
-    let mut v = l.vec();
-    v.push(x);
-    List::of(v)
+pub fn List__append<T: Clone>(mut l: List<T>, x: T) -> List<T> {
+    l.edit().push(x);
+    l
 }
-pub fn List__concat<T: Clone>(a: List<T>, b: List<T>) -> List<T> {
-    let mut v = a.vec();
-    v.extend(b.items().iter().cloned());
-    List::of(v)
+pub fn List__concat<T: Clone>(mut a: List<T>, b: List<T>) -> List<T> {
+    if !b.is_empty() {
+        a.edit().extend(b.items().iter().cloned());
+    }
+    a
 }
 pub fn List__with_capacity<T: Clone>(n: u64) -> List<T> {
     List::of(Vec::with_capacity(n as usize))
@@ -138,17 +174,31 @@ pub fn List__with_capacity<T: Clone>(n: u64) -> List<T> {
 pub fn List__repeat<T: Clone>(x: T, n: u64) -> List<T> {
     List::of(vec![x; n as usize])
 }
-pub fn List__sublist<T: Clone>(l: List<T>, r: Rec_len_start) -> List<T> {
-    let start = (r.start as usize).min(l.items().len());
-    let end = start.saturating_add(r.len as usize).min(l.items().len());
-    List::of(l.items()[start..end].to_vec())
+pub fn List__sublist<T: Clone>(mut l: List<T>, r: Rec_len_start) -> List<T> {
+    let len = l.items().len();
+    let start = (r.start as usize).min(len);
+    let end = start.saturating_add(r.len as usize).min(len);
+    if start == 0 && end == len {
+        return l;
+    }
+    let v = l.edit();
+    v.truncate(end);
+    v.drain(..start);
+    l
 }
-pub fn List__drop_first<T: Clone>(l: List<T>, n: u64) -> List<T> {
-    l.rest(n as usize)
+pub fn List__drop_first<T: Clone>(mut l: List<T>, n: u64) -> List<T> {
+    let n = (n as usize).min(l.items().len());
+    if n > 0 {
+        l.edit().drain(..n);
+    }
+    l
 }
-pub fn List__drop_last<T: Clone>(l: List<T>, n: u64) -> List<T> {
+pub fn List__drop_last<T: Clone>(mut l: List<T>, n: u64) -> List<T> {
     let keep = l.items().len().saturating_sub(n as usize);
-    List::of(l.items()[..keep].to_vec())
+    if keep < l.items().len() {
+        l.edit().truncate(keep);
+    }
+    l
 }
 pub fn List__last<T: Clone>(l: List<T>) -> Result<T, ()> {
     l.items().last().cloned().ok_or(())
@@ -176,23 +226,23 @@ pub fn List__is_empty<T: Clone>(l: List<T>) -> bool {
 pub fn List__first<T: Clone>(l: List<T>) -> Result<T, ()> {
     l.items().first().cloned().ok_or(())
 }
-pub fn List__prepend<T: Clone>(l: List<T>, x: T) -> List<T> {
-    let mut v = Vec::with_capacity(l.items().len() + 1);
-    v.push(x);
-    v.extend(l.items().iter().cloned());
-    List::of(v)
+pub fn List__prepend<T: Clone>(mut l: List<T>, x: T) -> List<T> {
+    l.edit().insert(0, x);
+    l
 }
-pub fn List__take_first<T: Clone>(l: List<T>, n: u64) -> List<T> {
-    List::of(l.items()[..(n as usize).min(l.items().len())].to_vec())
-}
-pub fn List__drop_at<T: Clone>(l: List<T>, i: u64) -> List<T> {
-    let i = i as usize;
-    if i >= l.items().len() {
-        return l;
+pub fn List__take_first<T: Clone>(mut l: List<T>, n: u64) -> List<T> {
+    let n = n as usize;
+    if n < l.items().len() {
+        l.edit().truncate(n);
     }
-    let mut v = l.vec();
-    v.remove(i);
-    List::of(v)
+    l
+}
+pub fn List__drop_at<T: Clone>(mut l: List<T>, i: u64) -> List<T> {
+    let i = i as usize;
+    if i < l.items().len() {
+        l.edit().remove(i);
+    }
+    l
 }
 pub fn List__contains<T: Clone + PartialEq>(l: List<T>, x: T) -> bool {
     l.items().contains(&x)
@@ -206,11 +256,19 @@ pub fn List__all<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> bool {
 pub fn List__count_if<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> u64 {
     l.items().iter().cloned().filter(|x| f(x.clone())).count() as u64
 }
-pub fn List__keep_if<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> List<T> {
-    List::of(l.items().iter().cloned().filter(|x| f(x.clone())).collect())
+pub fn List__keep_if<T: Clone>(mut l: List<T>, f: &dyn Fn(T) -> bool) -> List<T> {
+    if l.items().iter().all(|x| f(x.clone())) {
+        return l;
+    }
+    l.edit().retain(|x| f(x.clone()));
+    l
 }
-pub fn List__drop_if<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> List<T> {
-    List::of(l.items().iter().cloned().filter(|x| !f(x.clone())).collect())
+pub fn List__drop_if<T: Clone>(mut l: List<T>, f: &dyn Fn(T) -> bool) -> List<T> {
+    if !l.items().iter().any(|x| f(x.clone())) {
+        return l;
+    }
+    l.edit().retain(|x| !f(x.clone()));
+    l
 }
 pub fn List__find_first<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> Result<T, ()> {
     l.items().iter().cloned().find(|x| f(x.clone())).ok_or(())
@@ -232,10 +290,9 @@ pub fn List__join_map<T: Clone, U: Clone>(l: List<T>, f: &dyn Fn(T) -> List<U>) 
 }
 /// `List.sort_with`: a stable sort, as Roc's is, by a comparison answering the
 /// program's own `[Before, Same, After]`.
-pub fn List__sort_with<T: Clone, O: RocOrder>(l: List<T>, f: &dyn Fn(T, T) -> O) -> List<T> {
-    let mut v = l.vec();
-    v.sort_by(|a, b| f(a.clone(), b.clone()).order());
-    List::of(v)
+pub fn List__sort_with<T: Clone, O: RocOrder>(mut l: List<T>, f: &dyn Fn(T, T) -> O) -> List<T> {
+    l.edit().sort_by(|a, b| f(a.clone(), b.clone()).order());
+    l
 }
 /// What a comparison answers, as Rust's `Ordering`; roc2rust writes the one
 /// implementation, for the union `[After, Before, Same]`.
