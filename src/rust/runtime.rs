@@ -23,6 +23,8 @@ pub mod alloc_count {
     /// A list written by a builtin: taken whole (held only here), or copied.
     pub static TAKEN: AtomicU64 = AtomicU64::new(0);
     pub static COPIED: AtomicU64 = AtomicU64::new(0);
+    /// Lists given an allocation of their own (the `Rc` apart from its elements).
+    pub static BOXES: AtomicU64 = AtomicU64::new(0);
     /// Copies by element type: how many, and how many elements in all.
     static COPIES: std::sync::Mutex<Option<std::collections::HashMap<&'static str, (u64, u64)>>> = std::sync::Mutex::new(None);
     /// Copies by the line of the program that caused them.
@@ -73,7 +75,7 @@ pub mod alloc_count {
     static COUNTING: Counting = Counting;
     pub fn report() {
         eprintln!("allocs {} reallocs {} bytes {}", ALLOCS.load(Relaxed), REALLOCS.load(Relaxed), BYTES.load(Relaxed));
-        eprintln!("lists written: taken {} copied {}", TAKEN.load(Relaxed), COPIED.load(Relaxed));
+        eprintln!("lists written: taken {} copied {}; list boxes {}", TAKEN.load(Relaxed), COPIED.load(Relaxed), BOXES.load(Relaxed));
         report_copies();
         report_sites();
     }
@@ -111,6 +113,10 @@ impl<T> List<T> {
 
 impl<T: Clone> List<T> {
     pub fn of(v: Vec<T>) -> Self {
+        #[cfg(roc2rust_count_allocs)]
+        if !v.is_empty() {
+            alloc_count::BOXES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         List(if v.is_empty() { None } else { Some(Rc::new(v)) })
     }
     /// The elements, to write: in place when this list holds the only reference to
@@ -118,6 +124,10 @@ impl<T: Clone> List<T> {
     /// keeps its allocation either way.
     #[cfg_attr(roc2rust_count_allocs, track_caller)]
     fn edit(&mut self) -> &mut Vec<T> {
+        #[cfg(roc2rust_count_allocs)]
+        if self.0.as_ref().map_or(true, |rc| Rc::strong_count(rc) > 1) {
+            alloc_count::BOXES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let rc = self.0.get_or_insert_with(|| Rc::new(Vec::new()));
         #[cfg(roc2rust_count_allocs)]
         {
