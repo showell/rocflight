@@ -401,6 +401,13 @@ impl<'a> Cx<'a> {
         // that has them all is its type -- a structural union, or a nominal's
         // (`Node := [Empty, ..]`): rocflight's checker unifies a tag with a
         // declared union without widening the tag's own type.
+        //
+        // WORKAROUND for a checker gap, a guess from the declarations: the checker's
+        // tag unions have no row variables, so a lone `Empty` never learns it is a
+        // `Node`. The fix belongs in rocflight's checker (row variables, stacked on
+        // PR #25); once a lone tag's recorded type is its full type, delete this
+        // search -- at least its nominal half.
+        //
         // `Ok` and `Err` alone are roc's `Try`, whatever else declares them.
         if tags.iter().all(|(n, _)| matches!(*n, "Ok" | "Err")) {
             return None;
