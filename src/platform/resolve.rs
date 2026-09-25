@@ -93,6 +93,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_local_dependency_is_a_path_ending_in_roc() {
+        assert!(is_local("cli/platform/main.roc"));
+        assert!(is_local("../pkg/main.roc"));
+        assert!(!is_local("nightly-2026-09-03-62fcb65"));
+        assert!(!is_local("https://example.com/a/HASH.tar.zst"));
+        assert!(!is_local("https://example.com/a/main.roc"));
+        assert_eq!(dependency_dir("cli/platform/main.roc", Path::new("/app")), Some(PathBuf::from("/app/cli/platform")));
+        assert_eq!(dependency_dir("/abs/plat/main.roc", Path::new("/app")), Some(PathBuf::from("/abs/plat")));
+        assert_eq!(dependency_dir("nightly-2026-09-03-62fcb65", Path::new("/app")), None);
+    }
+
+    #[test]
     fn hash_comes_from_the_url_filename() {
         assert_eq!(
             hash_from_url(

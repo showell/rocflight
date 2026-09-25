@@ -10,6 +10,12 @@
 //! Only `x64musl` (Linux on x86-64, statically against musl) is linked, with `zig`'s
 //! bundled lld. `ponytail:` mac and Windows are the same steps with their own recipe
 //! from the `targets:` block and their own linker.
+//!
+//! `librocflight_host.a` is Rust, and Rust built for musl expects the linker to be
+//! given `libunwind.a`. A platform whose host is Rust carries it in its own library;
+//! one whose host is Zig or C does not, and linking fails for want of `_Unwind_*`.
+//! `ponytail:` ship Rust's self-contained `libunwind.a` beside the embedded library
+//! and add it when the recipe lacks it; until then the failure says so.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -106,22 +112,29 @@ pub fn prepare(url: &str, app: &Path, embedded: &[u8]) -> Result<PathBuf, String
 
 /// A platform named by a path, `platform "cli/platform/main.roc"`: its directory,
 /// beside the app, and a name for its linked executable. Nothing content-addresses a
-/// local platform, so the name is its directory and the time its host library was
-/// built: rebuilding the host links a new executable.
+/// local platform, so the name covers what the link reads: the directory, its
+/// `main.roc` (the `hosted` table and the recipe come from it), and the size and
+/// modification time of every input the recipe names. Changing any of them links a
+/// new executable; the platform's other `.roc` files are read at run time.
 fn local_platform(url: &str, app: &Path) -> Result<(String, PathBuf), String> {
     use std::hash::{Hash, Hasher};
     let app_dir = app.parent().unwrap_or_else(|| Path::new("."));
     let dir = super::resolve::dependency_dir(url, app_dir).ok_or_else(|| format!("`{}` names no directory", url))?;
     let dir = std::fs::canonicalize(&dir).map_err(|e| format!("platform `{}`: {}", url, e))?;
-    let built = std::fs::metadata(dir.join("targets").join("x64musl").join("libhost.a"))
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let main = std::fs::read_to_string(dir.join("main.roc"))
+        .map_err(|e| format!("{}: {}", dir.join("main.roc").display(), e))?;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     dir.hash(&mut hasher);
-    Ok((format!("local-{:016x}-{}", hasher.finish(), built), dir))
+    main.hash(&mut hasher);
+    let target_dir = dir.join("targets").join("x64musl");
+    for input in real::link_inputs(&main, "x64musl").unwrap_or_default() {
+        if let Ok(meta) = std::fs::metadata(target_dir.join(&input)) {
+            input.hash(&mut hasher);
+            meta.len().hash(&mut hasher);
+            meta.modified().ok().hash(&mut hasher);
+        }
+    }
+    Ok((format!("local-{:016x}", hasher.finish()), dir))
 }
 
 /// The platform's link recipe, `app` filled with the hosted table and the library.
@@ -172,7 +185,18 @@ fn link(sources: &Path, lib: &Path, dir: &Path, exe: &Path) -> Result<(), String
             ld.arg(target_dir.join(input));
         }
     }
-    run(&mut ld)?;
+    run(&mut ld).map_err(|e| {
+        if e.contains("_Unwind_") && !inputs.iter().any(|i| i.contains("unwind")) {
+            format!(
+                "{}\nThe platform's x64musl recipe has no libunwind.a, which rocflight's \
+                 own library (Rust, built for musl) needs; a platform with a Rust host \
+                 carries it, one with a Zig or C host does not.",
+                e
+            )
+        } else {
+            e
+        }
+    })?;
     std::fs::rename(&tmp, exe).map_err(|e| format!("{}: {}", exe.display(), e))
 }
 

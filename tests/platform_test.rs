@@ -408,7 +408,7 @@ fn a_platform_named_by_a_path_is_loaded_from_beside_the_app() {
     // `pf: platform "plat/main.roc"` names a directory relative to the app, as a local
     // package does. Without it being resolved, the platform was skipped: its modules
     // were never read, and an import of one it lacks went unreported.
-    let dir = std::env::temp_dir().join("rocflight_local_platform");
+    let dir = std::env::temp_dir().join(format!("rocflight_local_platform_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("plat")).unwrap();
     std::fs::write(
