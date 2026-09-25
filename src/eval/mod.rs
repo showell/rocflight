@@ -213,6 +213,7 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             "len" | "is_empty" | "map" | "fold" | "keep_if" | "drop_if" | "fold_try" | "from_iter"
                 | "contains" | "iter" | "any" | "all" | "sum" | "find_first" | "size_hint"
                 | "fold_with_index" | "with_index" | "step_by" | "collect" | "count_if"
+                | "join_map" | "map_with_index"
         )
     {
         let items: Vec<Value> = elements(args[0].clone(), name)?.collect();
@@ -754,6 +755,8 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             Ok(Value::Bool(items.any(|v| values_equal(&v, &args[1]))))
         }
         // Does the list begin (end) with every element of the second, in order?
+        // Compared with `values_equal`, as `contains` is, not an element type's own
+        // `is_eq`, which `Builtin.roc`'s definitions would call.
         "starts_with" | "ends_with" => {
             expect(2, args.len())?;
             let items: Vec<Value> = elements(args[0].clone(), name)?.collect();
@@ -2744,7 +2747,9 @@ pub fn call_builtin_values(
             return result;
         }
     }
-    // `Try.map_ok(t, f)` is `t.map_ok(f)` with the receiver written first.
+    // `Try.map_ok(t, f)` is `t.map_ok(f)` with the receiver written first, for the
+    // names `try_method` answers (`is_ok`, `is_err`, `map_ok`, `map_err`, `ok_or`,
+    // `on_err`); any other `Try.x` is still unknown here, as `t.x` is.
     if module == "Try" {
         if let Some(Value::Tag(tag @ ("Ok" | "Err"), payload)) = args.first() {
             let (tag, payload) = (*tag, payload.clone());

@@ -2038,3 +2038,9 @@ fn constants_that_seem_to_read_each_other_keep_file_order() {
     let src = "a = f(0)\n\nf = |n| if n > 0 { b } else { 1.I64 }\n\nb : I64\nb = a + 1\n\nStr.inspect((a, b))";
     assert_eq!(as_str(src), "(1, 2)");
 }
+
+#[test]
+fn the_new_list_functions_as_methods_and_on_empty_lists() {
+    let src = "Str.inspect(([1.I64, 2].join_map(|n| [n, n]), [\"x\"].map_with_index(|s, i| (s, i)), List.find_last([], |n| n > 1.I64), List.join_map([], |n| [n, 1.I64]), List.ends_with([1.I64], []), Try.ok_or(Err(Odd), 7.I64), Try.ok_or(Ok(1.I64), 7)))";
+    assert_eq!(as_str(src), "([1, 1, 2, 2], [(\"x\", 0)], Err(NotFound), [], True, 7, 1)");
+}
