@@ -1672,18 +1672,18 @@ impl<'u> Compiler<'u> {
         locals.truncate(keep);
     }
 
-    /// `xs.fold(init, f)`, `xs.map(f)`, `xs.keep_if(p)` and friends as a loop in THIS
-    /// frame.
+    /// `xs.fold(init, f)`, `xs.map(f)`, `List.keep_if(xs, p)` and friends as a loop in
+    /// THIS frame.
     ///
     /// The builtin versions re-enter the VM from Rust once per element — a fresh
     /// machine, an argument `Vec` and a Rust frame each time — which was the whole of
     /// `iter_range`'s 199ms. Compiled, each element is an `IterNext`, a move or two
     /// and an ordinary `Call` on the same frame stack.
     ///
-    /// Only for a receiver the checker proved is a list (or an iterator over one), and
-    /// only when no roc-defined method of that name is loaded, which the caller checks:
-    /// anything else still dispatches at run time. `None` when the method is not one
-    /// of these two.
+    /// Only when no roc-defined method of that name is loaded, which the caller checks:
+    /// anything else still dispatches at run time. `names_list` is whether the call was
+    /// written `List.name(..)` (a pipe into `List.name` is that too) rather than as a
+    /// method. `None` when the method is not one of these.
     fn list_loop(
         &mut self,
         method: &str,
@@ -1693,9 +1693,9 @@ impl<'u> Compiler<'u> {
         names_list: bool,
     ) -> Result<Option<Reg>, String> {
         let shape = match (method, args.len()) {
-            // `List.keep_if(xs, p)` says which `keep_if` it is: `Iter.keep_if` is the lazy
-            // one, and roc rejects an iterator where `List.keep_if` wants a list. The
-            // ambiguity the note below describes is method syntax's alone.
+            // Written `List.keep_if(xs, p)`, the call says which `keep_if` it is, and roc
+            // types it `List(a) -> List(a)`: never the lazy `Iter.keep_if`. See below for
+            // why method syntax cannot say.
             ("keep_if", 1) if names_list => Shape::Filter(true),
             ("drop_if", 1) if names_list => Shape::Filter(false),
             ("fold", 2) => Shape::Fold,
@@ -1713,14 +1713,15 @@ impl<'u> Compiler<'u> {
             ("fold_try", 2) => Shape::FoldTry,
             _ => return Ok(None),
         };
-        // Every shape above answers a plain VALUE — a list of results, an accumulator, a
-        // `Bool`, a count, a `Try`. That is what makes them safe to compile whatever the
-        // checker thinks the receiver's module is.
+        // Every shape above but `Filter` answers a plain VALUE — a list of results, an
+        // accumulator, a `Bool`, a count, a `Try`. That is what makes them safe to compile
+        // whatever the checker thinks the receiver's module is. `Filter` is safe because
+        // the call named `List`.
         //
-        // `keep_if`/`drop_if` are NOT here, and were tried: `Builtin.roc` declares both
-        // `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, the second lazy, so a
-        // compiled loop may only stand in for the List one. There is no sound way to tell
-        // them apart here. `dispatch_modules` is not it — the checker calls
+        // `keep_if`/`drop_if` in METHOD syntax are not here, and were tried: `Builtin.roc`
+        // declares both `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, the
+        // second lazy, so a compiled loop may only stand in for the List one. For a method
+        // call there is no sound way to tell them apart here. `dispatch_modules` is not it — the checker calls
         // `(1..=5).iter()` a `List`, so lowering on that made
         // `Str.inspect((1..=5).iter().keep_if(p))` answer `[4.0, 5.0]` where roc answers
         // `<opaque>`; and nothing syntactic is it either, because `xs = (1..=n).iter()`

@@ -2677,11 +2677,12 @@ pub fn call_builtin_values(
             // inspects `[1, 2, 3].keep_if(p)` as `[2, 3]` but
             // `[1, 2, 3].iter().keep_if(p)` as `<opaque>`. Nothing here can tell those
             // apart, because `.iter()` on a list IS the list at run time — so this path
-            // answers the lazy one for both, and the COMPILER answers the eager one
-            // wherever the checker knows the receiver is a `List` (`Compiler::list_loop`).
-            // What is left divergent is a receiver whose module the checker cannot name,
-            // such as an unannotated `|xs| xs.keep_if(p)`: roc gives a list there and
-            // this gives an iterator. Fixing it needs an `Iter` that is its own value.
+            // answers the lazy one for both. A call WRITTEN `List.keep_if(xs, p)` (or
+            // piped into it) cannot be `Iter.keep_if`, and the compiler answers the eager
+            // one for it (`Compiler::list_loop`). What is left divergent is method syntax
+            // on a list, `[1, 2, 3].keep_if(p)`, and `List.keep_if` passed as a function
+            // value: roc gives a list there and this gives an iterator. Fixing those needs
+            // an `Iter` that is its own value.
             || matches!(name, "keep_if" | "drop_if" | "with_index")
             // `concat` and `size_hint` are shared with `List`: lazy only for a range
             // or an iterator, so `List.concat` of two lists stays an eager list.

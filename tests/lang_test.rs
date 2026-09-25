@@ -1984,16 +1984,10 @@ fn an_imported_modules_expects_do_not_run_with_the_app() {
 }
 
 #[test]
-fn a_call_that_names_list_drop_if_answers_a_list() {
-    // `List.drop_if(set, p)` names the eager one; `Iter.drop_if` is the lazy one. Here
-    // the checker cannot tell `set` is a list (it is an alias of one), and the call went
-    // lazy: `List.prepend needs a List, got <opaque>`.
-    let out = run_files(
-        "rocflight_named_list_drop_if",
-        &[(
-            "main.roc",
-            "app [main!] {}\n\nBag :: [].{\n\tItems(a) : List(a)\n\n\tinsert : Bag.Items(a), a -> Bag.Items(a) where [a.is_eq : a, a -> Bool]\n\tinsert = |set, item| List.prepend(List.drop_if(set, |other| other == item), item)\n\n\tbig : Bag.Items(I64) -> Bag.Items(I64)\n\tbig = |set| List.prepend(List.keep_if(set, |n| n > 1), 0)\n}\n\nmain! = |_args| Ok((Bag.insert([1.I64, 2, 3], 2), Bag.big([1, 2, 3])))\n",
-        )],
-    );
-    assert_eq!(out, "Ok(([2, 1, 3], [0, 2, 3]))");
+fn a_call_that_names_list_keep_if_answers_a_list() {
+    // `List.keep_if(xs, p)` cannot be the lazy `Iter.keep_if`, yet every such call
+    // answered an iterator (`<opaque>`), even on a list literal, and `List.prepend` of
+    // one failed with "needs a List". Inline and named predicates, a pipe, an empty list.
+    let src = "Bag :: [].{\n\tItems(a) : List(a)\n\n\tinsert : Bag.Items(a), a -> Bag.Items(a) where [a.is_eq : a, a -> Bool]\n\tinsert = |set, item| List.prepend(List.drop_if(set, |other| other == item), item)\n}\n\nbig : I64 -> Bool\nbig = |n| n > 1\n\nStr.inspect((Bag.insert([1.I64, 2, 3], 2), List.keep_if([1.I64, 2, 3], big), [1.I64, 2, 3] |> List.drop_if(|n| n > 1), List.keep_if([], big)))";
+    assert_eq!(as_str(src), "([2, 1, 3], [2, 3], [1], [])");
 }
