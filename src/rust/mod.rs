@@ -351,6 +351,14 @@ impl<'a> Cx<'a> {
             }
             Type::Nominal { name, backing } => {
                 let Some(n) = self.nominals.get(bare(name)) else {
+                    // A structural alias named before its declaration (`Locale :=
+                    // { date_order : Locale.DateOrder }`, `DateOrder : [..]` after)
+                    // is the parser's placeholder nominal; it means the alias.
+                    if matches!(**backing, Type::TypeVar(_)) {
+                        if let Some(alias) = self.structural_alias(name) {
+                            return self.ty(&alias);
+                        }
+                    }
                     return Err(format!("the nominal {} is not declared", name));
                 };
                 if erased(&n.backing) {
@@ -370,6 +378,22 @@ impl<'a> Cx<'a> {
         })
     }
 
+    /// The declared structural type named `name`, when it has no parameters.
+    fn structural_alias(&self, name: &str) -> Option<Type> {
+        self.input
+            .modules
+            .iter()
+            .flat_map(|m| m.types.iter())
+            .chain(self.input.app_types.iter())
+            .find(|(n, t)| bare(n) == bare(name) && !matches!(t, Type::Nominal { .. }))
+            .map(|(_, t)| t.clone())
+            .filter(|t| {
+                let mut vs = Vec::new();
+                vars_of(t, &mut vs);
+                vs.is_empty()
+            })
+    }
+
     /// An open union (`[MBReady, ..]`, a lone tag's type) as the one declared
     /// structural union holding all its tags, with the declaration's other tags:
     /// a Rust enum is its whole set of tags.
@@ -378,6 +402,10 @@ impl<'a> Cx<'a> {
         // that has them all is its type -- a structural union, or a nominal's
         // (`Node := [Empty, ..]`): rocflight's checker unifies a tag with a
         // declared union without widening the tag's own type.
+        // `Ok` and `Err` alone are roc's `Try`, whatever else declares them.
+        if tags.iter().all(|(n, _)| matches!(*n, "Ok" | "Err")) {
+            return None;
+        }
         let has_all = |d: &[(&'static str, Vec<Type>)]| tags.iter().all(|(n, _)| d.iter().any(|(m, _)| m == n)) && d.len() > tags.len();
         let mut found = self
             .input
@@ -1050,13 +1078,13 @@ impl<'a> Cx<'a> {
                     return Ok(wrap(format!("echo({})", xs.join(", "))));
                 }
                 match self.resolve(n, scope) {
-                    Some(top) if self.tops[&top] => format!("{}{}", sanitize(&top), self.turbofish(&top, func, scope)?),
+                    Some(top) if self.tops[&top] => format!("{}{}", sanitize(&top), self.turbofish(&top, func, args, e, scope)?),
                     Some(top) => format!("({})", self.top_value(&top, func, scope)?),
                     None => return Err(format!("a call to `{}`", n)),
                 }
             }
             Expr::Qualified { module, name, .. } => match self.qualified(module, name) {
-                Some(top) if self.tops[&top] => format!("{}{}", sanitize(&top), self.turbofish(&top, func, scope)?),
+                Some(top) if self.tops[&top] => format!("{}{}", sanitize(&top), self.turbofish(&top, func, args, e, scope)?),
                 Some(top) => format!("({})", self.top_value(&top, func, scope)?),
                 // The platform's one effect: a line out, its newline written for it.
                 None if *module == "Echo" && *name == "line!" => return Ok(wrap(format!("echo_line({})", xs.join(", ")))),
@@ -1125,17 +1153,31 @@ impl<'a> Cx<'a> {
     /// A generic function's type arguments at a call, from the use's type: Roc
     /// lets a variable stay unconstrained (`List.len(make_empty(0))`) and Rust
     /// does not, so one nothing binds is `()`.
-    fn turbofish(&self, top: &str, func: &Expr, scope: &Scope) -> Result<String, String> {
+    fn turbofish(&self, top: &str, func: &Expr, args: &[Expr], call: &Expr, scope: &Scope) -> Result<String, String> {
         let Some(sig) = self.sig_of(top) else { return Ok(String::new()) };
         let mut vars = Vec::new();
         vars_of(&sig, &mut vars);
         if vars.is_empty() {
             return Ok(String::new());
         }
-        // A qualified callee has no type of its own recorded; rustc infers there.
-        let Some(used) = self.types.get(&func.id()).cloned() else { return Ok(String::new()) };
         let mut bound = HashMap::new();
-        bind(&sig, &used, &mut bound);
+        match self.types.get(&func.id()) {
+            Some(used) => bind(&sig, used, &mut bound),
+            // A qualified callee has no type of its own recorded: its arguments'
+            // and the call's are what it was used at.
+            None => {
+                let Some((ps, result)) = peel(&sig, args.len()) else { return Ok(String::new()) };
+                for (p, a) in ps.iter().zip(args) {
+                    if let Some(t) = self.types.get(&a.id()) {
+                        bind(p, t, &mut bound);
+                    }
+                }
+                match self.types.get(&call.id()) {
+                    Some(t) => bind(&result, t, &mut bound),
+                    None => return Ok(String::new()),
+                }
+            }
+        }
         let mut args = Vec::new();
         for v in &vars {
             let t = bound.get(v).cloned().unwrap_or(Type::Unit);
@@ -1299,6 +1341,28 @@ impl<'a> Cx<'a> {
         if xs.is_empty() {
             return Ok(format!("{}::{}", enum_name, name));
         }
+        // A nominal's constructor knows its payload's types; a tag or a string
+        // literal inside it takes them from there. The checker cannot type the
+        // inner `Cell("9", Empty)` of `Cell("12", Cell("9", Empty))`: the
+        // recursive `Box_(a)` it fills is a fresh variable, not `Box_(CceText)`.
+        let mut xs = xs;
+        if matches!(t, Type::Nominal { .. }) {
+            for (i, (a, (pt, _))) in args.iter().zip(payload_types.iter()).enumerate() {
+                match a {
+                    Expr::Tag { name: inner, args: inner_args, .. } if matches!(pt, Type::Nominal { .. }) => {
+                        xs[i] = self.tag_typed(inner, inner_args, pt, scope)?;
+                    }
+                    Expr::Str(lit, _) => {
+                        if let Type::Nominal { name: n, .. } = pt {
+                            if let Some(from) = self.qualified(bare(n), "from_quote") {
+                                xs[i] = format!("{}(Str::lit({:?})).unwrap()", sanitize(&from), lit);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         let boxed: Vec<String> = xs
             .into_iter()
             .zip(payload_types.iter())
@@ -1322,7 +1386,7 @@ impl<'a> Cx<'a> {
                 };
                 let mut bound = HashMap::new();
                 bind(&n.backing, backing, &mut bound);
-                let p = tags.iter().find(|(x, _)| *x == tag).map(|(_, p)| p.iter().map(|x| (subst(x, &bound), self.boxed(x))).collect()).unwrap_or_default();
+                let p = tags.iter().find(|(x, _)| *x == tag).map(|(_, p)| p.iter().map(|x| (subst(&own_params(x, bare(name), n), &bound), self.boxed(x))).collect()).unwrap_or_default();
                 Ok((n.rust.clone(), p))
             }
             other => Err(format!("a tag {} of {}", tag, other)),
