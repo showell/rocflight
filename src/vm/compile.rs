@@ -3763,9 +3763,9 @@ fn resolved_shape_depth(nominals: &[(&'static str, crate::types::Type)], backing
         // A placeholder — a nominal named but not declared here — is resolved by its
         // name, whether it stands alone or is what a declared nominal is built over.
         let placeholder = match ty {
-            Type::Nominal { name, backing } if matches!(**backing, Type::TypeVar(_)) => Some(name),
+            Type::Nominal { name, backing, .. } if matches!(**backing, Type::TypeVar(_)) => Some(name),
             Type::Nominal { backing, .. } => match &**backing {
-                Type::Nominal { name, backing: inner } if matches!(**inner, Type::TypeVar(_)) => Some(name),
+                Type::Nominal { name, backing: inner, .. } if matches!(**inner, Type::TypeVar(_)) => Some(name),
                 _ => None,
             },
             _ => None,
@@ -3829,7 +3829,7 @@ fn type_descriptor(ty: &crate::types::Type) -> Value {
         // The second payload is what the nominal WRAPS — `Opt(Inner)`'s `Inner` — so a
         // `parser_for` that delegates through its type parameter has something to
         // delegate to.
-        Type::Nominal { name, backing } => Value::tag(
+        Type::Nominal { name, backing, .. } => Value::tag(
             "Nominal",
             vec![crate::eval::str_value(*name), wrapped_descriptor(backing)],
         ),

@@ -675,7 +675,7 @@ pub fn shape_of(ty: &crate::types::Type) -> NominalShape {
         Type::List(_) | Type::Str | Type::Bool | Type::F32 | Type::F64 | Type::Dec
         | Type::U8 | Type::U16 | Type::U32 | Type::U64
         | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 => NominalShape::Kind(FieldKind::of(ty)),
-        Type::Nominal { name, backing } => match crate::eval::simd_kind(name) {
+        Type::Nominal { name, backing, .. } => match crate::eval::simd_kind(name) {
             Some(kind) => NominalShape::Simd(kind),
             None => shape_of(backing),
         },

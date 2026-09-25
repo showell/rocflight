@@ -317,6 +317,47 @@ fn a_monomorphic_binding_is_not_generalised() {
 
 // --- declaration and construction -----------------------------------------
 
+// A nominal named inside a declaration -- its own recursive `IList(a)`, or a
+// `Step(a)` declared after it -- is the declaration's argument, not a fresh type.
+// roc rejects each `Str` below ("This string literal is being used where a
+// non-string type is needed"). Whole programs, because only `run_file` gives the
+// checker the declarations a placeholder expands to.
+fn app(decls: &str, value: &str) -> String {
+    format!("app [main!] {{}}\n\n{decls}\nmain! = |_args| {{\n\t_ = {value}\n\tOk({{}})\n}}\n")
+}
+const ILIST: &str = "IList(a) := [INil, ICons(a, IList(a))]\n";
+const ITER: &str = "Iter_(a) := { next : (I64 -> Step(a)) }\nStep(a) := [One(a, Iter_(a)), Done]\n\nempty : Iter_(I64)\nempty = Iter_.{ next: |_| Done }\n";
+
+#[test]
+fn a_recursive_nominal_keeps_its_argument() {
+    let bad = format!("{ILIST}\nl : IList(I64)\nl = ICons(1, ICons(\"x\", INil))\n");
+    let err = run_program(&app(&bad, "l")).expect_err("a Str inside an IList(I64)");
+    assert!(err.contains("Str") && err.contains("I64"), "got {}", err);
+    let good = format!("{ILIST}\nl : IList(I64)\nl = ICons(1, ICons(2, INil))\n");
+    assert_eq!(run_program(&app(&good, "l")), Ok(()));
+}
+
+#[test]
+fn a_nominal_named_before_its_declaration_keeps_its_argument() {
+    let bad = format!("{ITER}\nworse : Iter_(I64)\nworse = Iter_.{{ next: |_| One(\"oops\", empty) }}\n");
+    let err = run_program(&app(&bad, "worse")).expect_err("a Str inside an Iter_(I64)");
+    assert!(err.contains("Str") && err.contains("I64"), "got {}", err);
+    // And a well-typed one still checks: the same nominal at the same arguments is
+    // the same type, without unfolding `Iter_` inside `Step` inside `Iter_` for ever.
+    let good = format!("{ITER}\nfine : Iter_(I64)\nfine = Iter_.{{ next: |_| One(7, empty) }}\n");
+    assert_eq!(run_program(&app(&good, "fine")), Ok(()));
+}
+
+#[test]
+fn an_alias_to_a_nominal_keeps_the_nominals_own_arguments() {
+    // `Swap(I64, Str)` is `P(Str, I64)`: the alias's arguments are its own, not P's.
+    // roc rejects `t : P(I64, Str)` and accepts `u : P(Str, I64)`.
+    let decls = "P(a, b) := { x : a, y : b }\nSwap(a, b) : P(b, a)\n\ns : Swap(I64, Str)\ns = P.{ x: \"hi\", y: 1 }\n";
+    let err = run_program(&app(&format!("{decls}\nt : P(I64, Str)\nt = s\n"), "t")).expect_err("P(I64, Str) is not Swap(I64, Str)");
+    assert!(err.contains("Str") && err.contains("I64"), "got {}", err);
+    assert_eq!(run_program(&app(&format!("{decls}\nu : P(Str, I64)\nu = s\n"), "u")), Ok(()));
+}
+
 #[test]
 fn a_nominal_annotation_resolves_to_the_nominal() {
     assert_eq!(type_of("Point := { x: I64 }\np : Point\np = Point.{ x: 1 }\np"), "Point");
@@ -724,4 +765,36 @@ fn a_try_function_has_its_declared_type() {
     // lambda's `h` was a variable of its own and the call answered one too.
     let src = "t : Try(Str, [Odd])\nt = Ok(\"a\")\nTry.map_ok(t, |h| [h])";
     assert_eq!(defaulted_type_of(src), "[Err([Odd]), Ok(List(Str))]");
+}
+
+#[test]
+fn node_types_are_recorded_only_when_asked() {
+    // Off by default. Asked, every node's type is kept, defaulted as the program will
+    // see it: the whole program's, and the list literal's `List(Dec)`.
+    let ast = build("xs = [1, 2]\nList.len(xs)");
+    let mut quiet = TypeChecker::new();
+    quiet.synth(&ast).unwrap();
+    assert!(quiet.node_types().is_empty());
+
+    let mut checker = TypeChecker::new();
+    checker.record_types();
+    let ty = checker.synth(&ast).unwrap();
+    let types = checker.node_types();
+    assert_eq!(types.get(&ast.id()).map(|t| t.to_string()), Some(checker.defaulted(&ty).to_string()));
+    assert!(types.values().any(|t| t.to_string() == "List(Dec)"), "{:?}", types.values().map(|t| t.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_checked_node_keeps_the_type_it_was_checked_against() {
+    // `y` is an `I64`; `x : U8` checks it against `U8`, which the checker accepts
+    // between integer widths. The use of `y` keeps `U8`, the type it was checked
+    // against, not the `I64` it synthesises.
+    let ast = build("y : I64\ny = 3\n\nx : U8\nx = y\n\nx");
+    let mut checker = TypeChecker::new();
+    checker.record_types();
+    checker.synth(&ast).unwrap();
+    let types = checker.node_types();
+    let rocflight::ast::Expr::Let { body, .. } = &ast else { panic!("a let: {}", ast) };
+    let rocflight::ast::Expr::Let { name: "x", value, .. } = &**body else { panic!("x: {}", body) };
+    assert_eq!(types.get(&value.id()).map(|t| t.to_string()).as_deref(), Some("U8"));
 }

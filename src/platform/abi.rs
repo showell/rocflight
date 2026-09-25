@@ -193,7 +193,7 @@ mod tests {
         let p = plan(&func(&[Type::Unit], Type::I128));
         assert_eq!(p, Plan { slots: vec![], sret: false, ret_registers: 2, registers: 0, stack_bytes: 0 });
         // A boxed handle is one register.
-        let handle = Type::Nominal { name: "Box".into(), backing: Box::new(Type::TypeVar(u32::MAX)) };
+        let handle = Type::Nominal { name: "Box".into(), backing: Box::new(Type::TypeVar(u32::MAX)), args: Vec::new() };
         let p = plan(&func(&[handle, Type::List(Box::new(Type::U8))], Type::Unit));
         assert_eq!(p.slots, [Slot::Registers(1), Slot::Stack]);
     }

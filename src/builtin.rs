@@ -652,7 +652,7 @@ fn annotations_only<'a>(lines: impl Iterator<Item = &'a str>) -> String {
 fn normalise(ty: &crate::types::Type) -> crate::types::Type {
     use crate::types::Type;
     match ty {
-        Type::Nominal { name, backing } => match *name {
+        Type::Nominal { name, backing, args } => match *name {
             "Str" => Type::Str,
             "Bool" => Type::Bool,
             "U8" => Type::U8, "U16" => Type::U16, "U32" => Type::U32,
@@ -663,7 +663,7 @@ fn normalise(ty: &crate::types::Type) -> crate::types::Type {
             // `List(_item) :: [ProvidedByCompiler]` erases the element, so the most
             // that can be said is "a list of something".
             "List" => Type::List(Box::new(Type::TypeVar(u32::MAX))),
-            _ => Type::Nominal { name: *name, backing: Box::new(normalise(backing)) },
+            _ => Type::Nominal { name: *name, backing: Box::new(normalise(backing)), args: args.iter().map(normalise).collect() },
         },
         Type::Function(a, b) => {
             Type::Function(Box::new(normalise(a)), Box::new(normalise(b)))

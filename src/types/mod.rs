@@ -60,7 +60,15 @@ pub enum Type {
     /// that distinctness is the whole point. It is not opaque, though: roc accepts the
     /// backing type where the nominal is expected (`f({ x: 1 })` for `f : Point -> _`),
     /// so unification falls through to the backing when only one side is nominal.
-    Nominal { name: &'static str, backing: Box<Type> },
+    ///
+    /// `args` are the type arguments as written, `IList(I64)`'s `[I64]`, and two
+    /// uses of one nominal unify at them. A placeholder (see `is_placeholder`) has
+    /// nothing else: the recursive `IList(a)` inside
+    /// `IList(a) := [INil, ICons(a, IList(a))]`, or a `Step(a)` named before its
+    /// declaration, has no backing yet, and its declaration's parameters are these
+    /// once it is expanded. Empty for a nominal without parameters, and for one
+    /// rocflight builds itself.
+    Nominal { name: &'static str, backing: Box<Type>, args: Vec<Type> },
     /// The type of a range expression. Opaque, like roc's.
     /// A numeric range, `1..=n`; the element is what iterating it yields.
     Range(Box<Type>),
@@ -253,9 +261,10 @@ impl Substitution {
             // `I64.to_str(n)` had already made it an I64.
             Type::Tuple(items) => Type::Tuple(items.iter().map(|t| self.apply(t)).collect()),
             Type::Optional(inner) => Type::Optional(Box::new(self.apply(inner))),
-            Type::Nominal { name, backing } => Type::Nominal {
+            Type::Nominal { name, backing, args } => Type::Nominal {
                 name: *name,
                 backing: Box::new(self.apply(backing)),
+                args: args.iter().map(|t| self.apply(t)).collect(),
             },
             Type::Record { fields, open } => Type::Record {
                 fields: fields.iter().map(|(n, t)| (*n, self.apply(t))).collect(),

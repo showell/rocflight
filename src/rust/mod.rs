@@ -349,7 +349,7 @@ impl<'a> Cx<'a> {
                 }
                 if args.is_empty() { union_name(&names) } else { format!("{}<{}>", union_name(&names), args.join(", ")) }
             }
-            Type::Nominal { name, backing } => {
+            Type::Nominal { name, backing, args } => {
                 let Some(n) = self.nominals.get(bare(name)) else {
                     // A structural alias named before its declaration (`Locale :=
                     // { date_order : Locale.DateOrder }`, `DateOrder : [..]` after)
@@ -363,10 +363,9 @@ impl<'a> Cx<'a> {
                 };
                 if erased(&n.backing) {
                     // A nominal over a list or a scalar is its backing, as at run time.
-                    return self.ty(&self.instantiate(n, backing));
+                    return self.ty(&self.instantiate(n, backing, args));
                 }
-                let mut bound = HashMap::new();
-                bind(&n.backing, backing, &mut bound);
+                let bound = self.bound_of(n, backing, args);
                 if n.params.is_empty() {
                     n.rust.clone()
                 } else {
@@ -433,14 +432,26 @@ impl<'a> Cx<'a> {
             other => other,
         };
         Some(match nominal {
-            Some(name) => Type::Nominal { name, backing: Box::new(decl) },
+            Some(name) => Type::Nominal { name, backing: Box::new(decl), args: Vec::new() },
             None => decl,
         })
     }
 
     /// A nominal's backing with the use's arguments put in.
-    fn instantiate(&self, n: &Nominal, used_backing: &Type) -> Type {
-        if matches!(used_backing, Type::TypeVar(_)) { n.backing.clone() } else { used_backing.clone() }
+    fn instantiate(&self, n: &Nominal, used_backing: &Type, args: &[Type]) -> Type {
+        if matches!(used_backing, Type::TypeVar(_)) { subst(&n.backing, &self.bound_of(n, used_backing, args)) } else { used_backing.clone() }
+    }
+
+    /// A nominal's parameters at one use: its arguments, one per parameter, or
+    /// else what its backing there says.
+    fn bound_of(&self, n: &Nominal, backing: &Type, args: &[Type]) -> HashMap<u32, Type> {
+        let mut bound = HashMap::new();
+        if !args.is_empty() && args.len() == n.params.len() {
+            bound.extend(n.params.iter().copied().zip(args.iter().cloned()));
+        } else {
+            bind(&n.backing, backing, &mut bound);
+        }
+        bound
     }
 
     /// A tag's payload as one Rust type: nothing, the one, or a tuple.
@@ -463,6 +474,27 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// `holds_fn`, through the nominals a type names: a `Step(a)` holding an
+    /// `Iter_(a)` whose `next` is a function cannot derive `PartialEq` either.
+    fn holds_fn_within(&self, t: &Type, seen: &mut Vec<String>) -> bool {
+        match t {
+            Type::Nominal { name, .. } => {
+                let b = bare(name).to_string();
+                if seen.contains(&b) {
+                    return false;
+                }
+                seen.push(b);
+                self.nominals.get(bare(name)).is_some_and(|n| self.holds_fn_within(&n.backing, seen))
+            }
+            Type::Function(..) => true,
+            Type::List(e) => self.holds_fn_within(e, seen),
+            Type::Tuple(xs) => xs.iter().any(|x| self.holds_fn_within(x, seen)),
+            Type::Record { fields, .. } => fields.iter().any(|(_, x)| self.holds_fn_within(x, seen)),
+            Type::TagUnion { tags, .. } => tags.iter().flat_map(|(_, p)| p).any(|x| self.holds_fn_within(x, seen)),
+            _ => false,
+        }
+    }
+
     fn field_ty(&self, t: &Type) -> Result<String, String> {
         let s = self.ty(t)?;
         Ok(if self.boxed(t) { format!("Rc<{}>", s) } else { s })
@@ -471,9 +503,9 @@ impl<'a> Cx<'a> {
     /// The Rust definitions of every type the program named.
     fn type_defs(&self) -> Result<String, String> {
         let mut out = String::new();
-        let mut noms: Vec<(&String, &Nominal)> = self.nominals.iter().collect();
-        noms.sort_by(|a, b| a.1.rust.cmp(&b.1.rust));
-        for (own, n) in noms {
+        let mut noms: Vec<&Nominal> = self.nominals.values().collect();
+        noms.sort_by(|a, b| a.rust.cmp(&b.rust));
+        for n in noms {
             if erased(&n.backing) {
                 continue;
             }
@@ -482,12 +514,12 @@ impl<'a> Cx<'a> {
             } else {
                 format!("<{}>", n.params.iter().map(|p| format!("T{}", p)).collect::<Vec<_>>().join(", "))
             };
-            let derive = if holds_fn(&n.backing) { "#[derive(Clone)]" } else { "#[derive(Clone, PartialEq, Debug)]" };
+            let derive = if self.holds_fn_within(&n.backing, &mut Vec::new()) { "#[derive(Clone)]" } else { "#[derive(Clone, PartialEq, Debug)]" };
             match &n.backing {
                 Type::Record { fields, .. } => {
                     out.push_str(&format!("{}\npub struct {}{} {{\n", derive, n.rust, generics));
                     for (f, t) in fields {
-                        out.push_str(&format!("    pub {}: {},\n", sanitize(f), self.field_ty(&own_params(t, own, n))?));
+                        out.push_str(&format!("    pub {}: {},\n", sanitize(f), self.field_ty(t)?));
                     }
                     out.push_str("}\n\n");
                 }
@@ -497,7 +529,7 @@ impl<'a> Cx<'a> {
                         if p.is_empty() {
                             out.push_str(&format!("    {},\n", tag));
                         } else {
-                            let ps: Result<Vec<String>, String> = p.iter().map(|x| self.field_ty(&own_params(x, own, n))).collect();
+                            let ps: Result<Vec<String>, String> = p.iter().map(|x| self.field_ty(x)).collect();
                             out.push_str(&format!("    {}({}),\n", tag, ps?.join(", ")));
                         }
                     }
@@ -1219,16 +1251,14 @@ impl<'a> Cx<'a> {
     fn field_type(&self, t: &Type, field: &str) -> Result<(Type, bool), String> {
         match t {
             Type::Record { fields, .. } => fields.iter().find(|(f, _)| *f == field).map(|(_, t)| (t.clone(), false)).ok_or_else(|| format!("no field {} in {}", field, t)),
-            Type::Nominal { name, backing } => {
+            Type::Nominal { name, backing, args } => {
                 let n = self.nominals.get(bare(name)).ok_or_else(|| format!("the nominal {}", name))?;
                 let decl = match &n.backing {
                     Type::Record { fields, .. } => fields.iter().find(|(f, _)| *f == field).map(|(_, t)| t.clone()),
                     _ => None,
                 }
                 .ok_or_else(|| format!("no field {} in {}", field, name))?;
-                let mut bound = HashMap::new();
-                bind(&n.backing, backing, &mut bound);
-                Ok((subst(&decl, &bound), self.boxed(&decl)))
+                Ok((subst(&decl, &self.bound_of(n, backing, args)), self.boxed(&decl)))
             }
             other => Err(format!("a field {} of {}", field, other)),
         }
@@ -1269,7 +1299,7 @@ impl<'a> Cx<'a> {
         if found.next().is_some() {
             return None;
         }
-        let nt = Type::Nominal { name: crate::memory::string_pool::intern(name), backing: Box::new(n.backing.clone()) };
+        let nt = Type::Nominal { name: crate::memory::string_pool::intern(name), backing: Box::new(n.backing.clone()), args: Vec::new() };
         Some((n.rust.clone(), nt))
     }
 
@@ -1379,14 +1409,13 @@ impl<'a> Cx<'a> {
                 let p = tags.iter().find(|(n, _)| *n == tag).map(|(_, p)| p.iter().map(|x| (x.clone(), false)).collect()).unwrap_or_default();
                 Ok((s.split('<').next().unwrap_or(&s).to_string(), p))
             }
-            Type::Nominal { name, backing } => {
+            Type::Nominal { name, backing, args } => {
                 let n = self.nominals.get(bare(name)).ok_or_else(|| format!("the nominal {}", name))?;
                 let Type::TagUnion { tags, .. } = &n.backing else {
                     return Err(format!("a tag {} of the nominal {}", tag, name));
                 };
-                let mut bound = HashMap::new();
-                bind(&n.backing, backing, &mut bound);
-                let p = tags.iter().find(|(x, _)| *x == tag).map(|(_, p)| p.iter().map(|x| (subst(&own_params(x, bare(name), n), &bound), self.boxed(x))).collect()).unwrap_or_default();
+                let bound = self.bound_of(n, backing, args);
+                let p = tags.iter().find(|(x, _)| *x == tag).map(|(_, p)| p.iter().map(|x| (subst(x, &bound), self.boxed(x))).collect()).unwrap_or_default();
                 Ok((n.rust.clone(), p))
             }
             other => Err(format!("a tag {} of {}", tag, other)),
@@ -1516,9 +1545,9 @@ impl<'a> Cx<'a> {
             }
             Pattern::Nominal { inner: sub, .. } => {
                 let backing = match t {
-                    Type::Nominal { name, backing } => {
+                    Type::Nominal { name, backing, args } => {
                         let n = self.nominals.get(bare(name)).ok_or("an unknown nominal pattern")?;
-                        self.instantiate(n, backing)
+                        self.instantiate(n, backing, args)
                     }
                     other => other.clone(),
                 };
@@ -1706,17 +1735,6 @@ fn erased(backing: &Type) -> bool {
     !matches!(backing, Type::Record { .. } | Type::TagUnion { .. })
 }
 
-fn holds_fn(t: &Type) -> bool {
-    match t {
-        Type::Function(..) => true,
-        Type::List(e) => holds_fn(e),
-        Type::Tuple(xs) => xs.iter().any(holds_fn),
-        Type::Record { fields, .. } => fields.iter().any(|(_, x)| holds_fn(x)),
-        Type::TagUnion { tags, .. } => tags.iter().flat_map(|(_, p)| p).any(holds_fn),
-        _ => false,
-    }
-}
-
 /// A type with every variable not among `keep` made `()`: nothing constrains it.
 fn subst_free(t: &Type, keep: &[u32]) -> Type {
     let mut vars = Vec::new();
@@ -1733,25 +1751,7 @@ fn subst(t: &Type, bound: &HashMap<u32, Type>) -> Type {
         Type::Tuple(xs) => Type::Tuple(xs.iter().map(|x| subst(x, bound)).collect()),
         Type::Record { fields, open } => Type::Record { fields: fields.iter().map(|(n, x)| (*n, subst(x, bound))).collect(), open: *open },
         Type::TagUnion { tags, open } => Type::TagUnion { tags: tags.iter().map(|(n, p)| (*n, p.iter().map(|x| subst(x, bound)).collect())).collect(), open: *open },
-        Type::Nominal { name, backing } => Type::Nominal { name, backing: Box::new(subst(backing, bound)) },
-        other => other.clone(),
-    }
-}
-
-/// A field of nominal `n`'s declaration with `n`'s own references in it given
-/// `n`'s parameters. The parser leaves the recursive `IList(a)` inside
-/// `IList(a) := [INil, ICons(a, IList(a))]` a placeholder without its
-/// arguments; a Roc type refers to itself only with its own.
-fn own_params(t: &Type, own: &str, n: &Nominal) -> Type {
-    match t {
-        Type::Nominal { name, backing } if matches!(**backing, Type::TypeVar(_)) && bare(name) == own => {
-            Type::Nominal { name, backing: Box::new(n.backing.clone()) }
-        }
-        Type::List(e) => Type::List(Box::new(own_params(e, own, n))),
-        Type::Function(a, b) => Type::Function(Box::new(own_params(a, own, n)), Box::new(own_params(b, own, n))),
-        Type::Tuple(xs) => Type::Tuple(xs.iter().map(|x| own_params(x, own, n)).collect()),
-        Type::Record { fields, open } => Type::Record { fields: fields.iter().map(|(f, x)| (*f, own_params(x, own, n))).collect(), open: *open },
-        Type::TagUnion { tags, open } => Type::TagUnion { tags: tags.iter().map(|(g, p)| (*g, p.iter().map(|x| own_params(x, own, n)).collect())).collect(), open: *open },
+        Type::Nominal { name, backing, args } => Type::Nominal { name, backing: Box::new(subst(backing, bound)), args: args.iter().map(|x| subst(x, bound)).collect() },
         other => other.clone(),
     }
 }
