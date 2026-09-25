@@ -153,10 +153,10 @@ pub fn List__drop_last<T: Clone>(l: List<T>, n: u64) -> List<T> {
 pub fn List__last<T: Clone>(l: List<T>) -> Result<T, ()> {
     l.items().last().cloned().ok_or(())
 }
-pub fn List__map<T: Clone, U: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> U>) -> List<U> {
+pub fn List__map<T: Clone, U: Clone>(l: List<T>, f: &dyn Fn(T) -> U) -> List<U> {
     List::of(l.items().iter().cloned().map(|x| f(x)).collect())
 }
-pub fn List__fold<T: Clone, S: Clone>(l: List<T>, init: S, f: Rc<dyn Fn(S, T) -> S>) -> S {
+pub fn List__fold<T: Clone, S: Clone>(l: List<T>, init: S, f: &dyn Fn(S, T) -> S) -> S {
     let mut acc = init;
     for x in l.items().iter().cloned() {
         acc = f(acc, x);
@@ -197,42 +197,42 @@ pub fn List__drop_at<T: Clone>(l: List<T>, i: u64) -> List<T> {
 pub fn List__contains<T: Clone + PartialEq>(l: List<T>, x: T) -> bool {
     l.items().contains(&x)
 }
-pub fn List__any<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> bool {
+pub fn List__any<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> bool {
     l.items().iter().cloned().any(|x| f(x))
 }
-pub fn List__all<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> bool {
+pub fn List__all<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> bool {
     l.items().iter().cloned().all(|x| f(x))
 }
-pub fn List__count_if<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> u64 {
+pub fn List__count_if<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> u64 {
     l.items().iter().cloned().filter(|x| f(x.clone())).count() as u64
 }
-pub fn List__keep_if<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> List<T> {
+pub fn List__keep_if<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> List<T> {
     List::of(l.items().iter().cloned().filter(|x| f(x.clone())).collect())
 }
-pub fn List__drop_if<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> List<T> {
+pub fn List__drop_if<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> List<T> {
     List::of(l.items().iter().cloned().filter(|x| !f(x.clone())).collect())
 }
-pub fn List__find_first<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> Result<T, ()> {
+pub fn List__find_first<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> Result<T, ()> {
     l.items().iter().cloned().find(|x| f(x.clone())).ok_or(())
 }
-pub fn List__find_last<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> Result<T, ()> {
+pub fn List__find_last<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> Result<T, ()> {
     l.items().iter().rev().cloned().find(|x| f(x.clone())).ok_or(())
 }
-pub fn List__find_first_index<T: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> bool>) -> Result<u64, ()> {
+pub fn List__find_first_index<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> Result<u64, ()> {
     l.items().iter().cloned().position(|x| f(x)).map(|i| i as u64).ok_or(())
 }
-pub fn List__map_with_index<T: Clone, U: Clone>(l: List<T>, f: Rc<dyn Fn(T, u64) -> U>) -> List<U> {
+pub fn List__map_with_index<T: Clone, U: Clone>(l: List<T>, f: &dyn Fn(T, u64) -> U) -> List<U> {
     List::of(l.items().iter().cloned().enumerate().map(|(i, x)| f(x, i as u64)).collect())
 }
 pub fn List__join<T: Clone>(l: List<List<T>>) -> List<T> {
     List::of(l.items().iter().flat_map(|x| x.items().iter().cloned()).collect())
 }
-pub fn List__join_map<T: Clone, U: Clone>(l: List<T>, f: Rc<dyn Fn(T) -> List<U>>) -> List<U> {
+pub fn List__join_map<T: Clone, U: Clone>(l: List<T>, f: &dyn Fn(T) -> List<U>) -> List<U> {
     List::of(l.items().iter().cloned().flat_map(|x| f(x).items().iter().cloned().collect::<Vec<U>>()).collect())
 }
 /// `List.sort_with`: a stable sort, as Roc's is, by a comparison answering the
 /// program's own `[Before, Same, After]`.
-pub fn List__sort_with<T: Clone, O: RocOrder>(l: List<T>, f: Rc<dyn Fn(T, T) -> O>) -> List<T> {
+pub fn List__sort_with<T: Clone, O: RocOrder>(l: List<T>, f: &dyn Fn(T, T) -> O) -> List<T> {
     let mut v = l.vec();
     v.sort_by(|a, b| f(a.clone(), b.clone()).order());
     List::of(v)

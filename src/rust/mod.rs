@@ -727,7 +727,7 @@ impl<'a> Cx<'a> {
                 }
             }
             Expr::Tag { name, args, .. } => self.tag(name, args, e, scope)?,
-            Expr::Lambda { params, body, .. } => self.lambda(params, body, e, scope)?,
+            Expr::Lambda { params, body, .. } => self.lambda(params, body, e, scope, false)?,
             Expr::Crash(msg, _) => format!("panic!(\"{{}}\", {})", self.expr(msg, scope)?),
             Expr::Dispatch { receiver, method: "negate", args, .. } if args.is_empty() => format!("(-({}))", self.expr(receiver, scope)?),
             Expr::Dispatch { receiver, method: "not", args, .. } if args.is_empty() => format!("(!({}))", self.expr(receiver, scope)?),
@@ -924,7 +924,12 @@ impl<'a> Cx<'a> {
     }
 
     fn call(&self, func: &Expr, args: &[Expr], e: &Expr, scope: &Scope) -> Result<String, String> {
-        let xs: Result<Vec<String>, String> = args.iter().map(|a| self.expr(a, scope)).collect();
+        // A runtime `List`/`Str` builtin borrows a function argument: it only calls it.
+        let runtime = match func {
+            Expr::Qualified { module, name, .. } => matches!(*module, "List" | "Str") && self.qualified(module, name).is_none(),
+            _ => false,
+        };
+        let xs: Result<Vec<String>, String> = args.iter().map(|a| if runtime { self.builtin_arg(a, scope) } else { self.expr(a, scope) }).collect();
         let xs = xs?;
         let callee = match func {
             Expr::Ident(n, _) if !scope.local(n) => {
@@ -962,6 +967,18 @@ impl<'a> Cx<'a> {
         };
         let _ = e;
         Ok(format!("{}({})", callee, xs.join(", ")))
+    }
+
+    /// An argument to a runtime builtin: a function is passed as `&dyn Fn`, a lambda
+    /// written in place as a borrowed closure and anything else as `&*` its `Rc`.
+    fn builtin_arg(&self, a: &Expr, scope: &Scope) -> Result<String, String> {
+        if !matches!(self.ty_of(a)?, Type::Function(..)) {
+            return self.expr(a, scope);
+        }
+        match a {
+            Expr::Lambda { params, body, .. } => self.lambda(params, body, a, scope, true),
+            _ => Ok(format!("&*{}", self.place(a, scope)?.map_or_else(|| self.expr(a, scope), Ok)?)),
+        }
     }
 
     /// `.map_err(..)` turning a builtin's `Err(())` into this call's `Err(tag)`.
@@ -1190,7 +1207,9 @@ impl<'a> Cx<'a> {
         }
     }
 
-    fn lambda(&self, params: &[&'static str], body: &Expr, e: &Expr, scope: &Scope) -> Result<String, String> {
+    /// A lambda as an `Rc<dyn Fn>` value; or, `borrowed`, as a `&dyn Fn` closure that
+    /// reads its captures where they are, for a builtin that only calls it.
+    fn lambda(&self, params: &[&'static str], body: &Expr, e: &Expr, scope: &Scope, borrowed: bool) -> Result<String, String> {
         let t = self.ty_of(e)?;
         let (ps, result) = peel(&t, params.len()).ok_or("a lambda whose type is not a function")?;
         let mut inner = scope.clone();
@@ -1201,6 +1220,9 @@ impl<'a> Cx<'a> {
             inner.locals.push(p.to_string());
         }
         let b = self.expr(body, &inner)?;
+        if borrowed {
+            return Ok(format!("&|{}| -> {} {{ {} }}", typed.join(", "), erase_free(&self.ty(&result)?, &scope.generics), b));
+        }
         // Captures are cloned in, so the closure owns them and the caller keeps its own.
         let mut used = BTreeSet::new();
         names_in(body, &mut used);
