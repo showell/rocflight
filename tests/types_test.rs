@@ -709,3 +709,35 @@ fn an_open_record_that_meets_a_closed_one_is_that_record() {
                })";
     assert_eq!(defaulted_type_of(src), "List({ i: Str, k: Str })");
 }
+
+#[test]
+fn node_types_are_recorded_only_when_asked() {
+    // Off by default. Asked, every node's type is kept, defaulted as the program will
+    // see it: the whole program's, and the list literal's `List(Dec)`.
+    let ast = build("xs = [1, 2]\nList.len(xs)");
+    let mut quiet = TypeChecker::new();
+    quiet.synth(&ast).unwrap();
+    assert!(quiet.node_types().is_empty());
+
+    let mut checker = TypeChecker::new();
+    checker.record_types();
+    let ty = checker.synth(&ast).unwrap();
+    let types = checker.node_types();
+    assert_eq!(types.get(&ast.id()).map(|t| t.to_string()), Some(checker.defaulted(&ty).to_string()));
+    assert!(types.values().any(|t| t.to_string() == "List(Dec)"), "{:?}", types.values().map(|t| t.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_checked_node_keeps_the_type_it_was_checked_against() {
+    // `y` is an `I64`; `x : U8` checks it against `U8`, which the checker accepts
+    // between integer widths. The use of `y` keeps `U8`, the type it was checked
+    // against, not the `I64` it synthesises.
+    let ast = build("y : I64\ny = 3\n\nx : U8\nx = y\n\nx");
+    let mut checker = TypeChecker::new();
+    checker.record_types();
+    checker.synth(&ast).unwrap();
+    let types = checker.node_types();
+    let rocflight::ast::Expr::Let { body, .. } = &ast else { panic!("a let: {}", ast) };
+    let rocflight::ast::Expr::Let { name: "x", value, .. } = &**body else { panic!("x: {}", body) };
+    assert_eq!(types.get(&value.id()).map(|t| t.to_string()).as_deref(), Some("U8"));
+}
