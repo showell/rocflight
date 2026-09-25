@@ -113,6 +113,12 @@ struct Cx<'a> {
     /// variable's last use (`single_read`). A list read that way has one owner and
     /// is changed in place instead of copied, as roc does.
     moving: RefCell<std::collections::HashSet<NodeId>>,
+    /// A record update handing its base over (`{ ..game, players: .. }` at
+    /// `game`'s last use): the base's name, the record it became, and the fields
+    /// taken out of it for the new values to read (`game.players` is the taken list).
+    taking: RefCell<Vec<(String, String, HashMap<String, String>)>>,
+    /// Record updates written so far, for their records' names.
+    updates: RefCell<usize>,
 }
 
 fn sanitize(name: &str) -> String {
@@ -230,6 +236,8 @@ impl<'a> Cx<'a> {
             loops: RefCell::new(0),
             renames: RefCell::new(HashMap::new()),
             moving: RefCell::new(std::collections::HashSet::new()),
+            taking: RefCell::new(Vec::new()),
+            updates: RefCell::new(0),
         }
     }
 
@@ -703,17 +711,48 @@ impl<'a> Cx<'a> {
             Expr::Record(fields, _) => self.record(fields, e, scope)?,
             Expr::RecordUpdate { base, fields, .. } => {
                 let t = self.ty_of(e)?;
-                let mut out = format!("{{ let mut __r = {};", self.expr(base, scope)?);
-                for (f, v) in fields {
-                    let (_, boxed) = self.field_type(&t, f)?;
-                    let v = self.expr(v, scope)?;
-                    let v = if boxed { format!("Rc::new({})", v) } else { v };
-                    out.push_str(&format!(" __r.{} = {};", sanitize(f), v));
+                let r = { let mut n = self.updates.borrow_mut(); *n += 1; format!("__r{}", *n) };
+                // At the base's last use the record is handed over, and a list or
+                // string field the new values read is taken out of it, so the value
+                // that replaces it can be built in place: `{ ..game, players:
+                // update_player(game.players, ..) }` edits the players list.
+                let handed = match &**base {
+                    Expr::Ident(x, id) if self.moving.borrow().contains(id) => Some(*x),
+                    _ => None,
+                };
+                let mut out = format!("{{ let mut {} = {};", r, self.expr(base, scope)?);
+                if let Some(x) = handed {
+                    let mut taken = HashMap::new();
+                    for (f, _) in fields {
+                        let (ft, boxed) = self.field_type(&t, f)?;
+                        if !boxed && matches!(ft, Type::List(_) | Type::Str) && fields.iter().any(|(_, v)| reads_field(v, x, f)) {
+                            let tf = format!("__t{}_{}", &r[3..], sanitize(f));
+                            out.push_str(&format!(" let {} = std::mem::take(&mut {}.{});", tf, r, sanitize(f)));
+                            taken.insert(f.to_string(), tf);
+                        }
+                    }
+                    self.taking.borrow_mut().push((x.to_string(), r.clone(), taken));
                 }
-                out.push_str(" __r }");
+                let values: Result<Vec<String>, String> = fields
+                    .iter()
+                    .map(|(f, v)| {
+                        let (_, boxed) = self.field_type(&t, f)?;
+                        let v = self.expr(v, scope)?;
+                        Ok(format!(" {}.{} = {};", r, sanitize(f), if boxed { format!("Rc::new({})", v) } else { v }))
+                    })
+                    .collect();
+                if handed.is_some() {
+                    self.taking.borrow_mut().pop();
+                }
+                out.push_str(&values?.concat());
+                out.push_str(&format!(" {} }}", r));
                 out
             }
             Expr::FieldAccess { record, field, .. } => {
+                // A field taken out of a record update's base is read by moving it.
+                if let Some(t) = self.taken_field(record, field) {
+                    return Ok(t);
+                }
                 let rt = self.ty_of(record)?;
                 let (ft, boxed) = self.field_type(&rt, field)?;
                 // Read through a local without copying the whole record: `x.hand.clone()`,
@@ -773,14 +812,31 @@ impl<'a> Cx<'a> {
     /// for anything else, which is a temporary already.
     fn place(&self, e: &Expr, scope: &Scope) -> Result<Option<String>, String> {
         match e {
-            Expr::Ident(n, _) if scope.local(n) => Ok(Some(sanitize(n))),
+            Expr::Ident(n, _) if scope.local(n) => Ok(Some(self.taken_base(n).unwrap_or_else(|| sanitize(n)))),
             Expr::FieldAccess { record, field, .. } => {
+                if let Some(t) = self.taken_field(record, field) {
+                    return Ok(Some(t));
+                }
                 let Some(p) = self.place(record, scope)? else { return Ok(None) };
                 let (_, boxed) = self.field_type(&self.ty_of(record)?, field)?;
                 Ok(Some(if boxed { format!("(*{}.{})", p, sanitize(field)) } else { format!("{}.{}", p, sanitize(field)) }))
             }
             _ => Ok(None),
         }
+    }
+
+    /// Inside a record update that took over `n` as its base, the record `n` became.
+    fn taken_base(&self, n: &str) -> Option<String> {
+        self.taking.borrow().iter().rev().find(|(x, _, _)| x == n).map(|(_, r, _)| r.clone())
+    }
+
+    /// `game.players` inside a record update that took over `game`: the taken list,
+    /// or, for a field not taken, the field of the record `game` became.
+    fn taken_field(&self, record: &Expr, field: &str) -> Option<String> {
+        let Expr::Ident(n, _) = record else { return None };
+        let taking = self.taking.borrow();
+        let (_, _, taken) = taking.iter().rev().find(|(x, _, _)| x == n)?;
+        taken.get(field).cloned()
     }
 
     /// Mark each last use of `name` across `scope` (evaluated in that order) as a
@@ -1645,6 +1701,15 @@ fn last_uses(e: &Expr, name: &str, later: bool, marks: &mut Vec<NodeId>) -> bool
             }
             last_uses(scrutinee, name, later || after, marks) || after
         }
+        // `{ ..x, f: v }` where `v` reads `x` only as its fields, outside lambdas,
+        // and each field it replaces at most once: the update can take `x` over,
+        // so `x` itself is its use (the fields it reads come from the record).
+        Expr::RecordUpdate { base, fields, .. } if matches!(&**base, Expr::Ident(n, _) if *n == name) && field_take_ok(name, fields) => {
+            if !later {
+                marks.push(base.id());
+            }
+            true
+        }
         Expr::Call { func, args, .. } => {
             let in_args = call_last_uses(args, name, later, marks);
             last_uses(func, name, later || in_args, marks) || in_args
@@ -1688,6 +1753,33 @@ fn call_last_uses(args: &[Expr], name: &str, later: bool, marks: &mut Vec<NodeId
         }
     }
     seen
+}
+
+/// Can `{ ..x, fields }` take `x` over: the new values read `x` only as `x.f`,
+/// never whole and never inside a lambda, and each replaced field at most once?
+fn field_take_ok(x: &str, fields: &[(&'static str, Expr)]) -> bool {
+    fn walk(e: &Expr, x: &str, counts: &mut HashMap<String, usize>) -> bool {
+        match e {
+            Expr::FieldAccess { record, field, .. } if matches!(&**record, Expr::Ident(n, _) if *n == x) => {
+                *counts.entry(field.to_string()).or_default() += 1;
+                true
+            }
+            Expr::Ident(n, _) => *n != x,
+            Expr::Lambda { .. } => !mentions(e, x),
+            other => other.children().into_iter().all(|c| walk(c, x, counts)),
+        }
+    }
+    let mut counts = HashMap::new();
+    fields.iter().all(|(_, v)| walk(v, x, &mut counts))
+        && fields.iter().all(|(f, _)| counts.get(*f).copied().unwrap_or(0) <= 1)
+}
+
+/// Does `e` read `x.f`?
+fn reads_field(e: &Expr, x: &str, f: &str) -> bool {
+    match e {
+        Expr::FieldAccess { record, field, .. } if *field == f && matches!(&**record, Expr::Ident(n, _) if *n == x) => true,
+        other => other.children().into_iter().any(|c| reads_field(c, x, f)),
+    }
 }
 
 /// Does `e` read `name` anywhere, lambdas and loops included? Through
