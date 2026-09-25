@@ -872,73 +872,134 @@ struct Spares {
 /// reads, directly or through the functions it calls, and otherwise in file order.
 /// roc lets a declaration read one written below it — `relative_table` above
 /// `squares` — and in file order that read found nothing: "Used before it was
-/// defined". A name is resolved as the compiler resolves it, a bare one inside a
-/// namespace to that namespace's member first. A cycle keeps file order, and so
-/// fails as it did. Functions are not initialized, so they are not in the answer.
+/// defined".
+///
+/// Reads through a function count every branch, taken or not, so two constants can
+/// appear to read each other when only one really does. Constants that read each
+/// other keep file order among themselves, which is what they had before; only a
+/// read that is ordered one way and not the other moves anything. Functions are not
+/// initialized, so they are not in the answer.
 fn initialization_order(bindings: &[(&'static str, &Expr)]) -> Vec<usize> {
     let mut at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for (i, (name, _)) in bindings.iter().enumerate() {
         at.entry(name).or_insert(i);
     }
-    // The bindings each one names.
+    // The bindings each one reads.
     let direct: Vec<Vec<usize>> = bindings
         .iter()
         .map(|(name, value)| {
             let owner = name.rsplit_once('.').map(|(owner, _)| owner);
             let mut out = Vec::new();
-            names_bound(value, owner, &at, &mut out);
+            free_reads(value, owner, &at, &mut Vec::new(), &mut out);
             out
         })
         .collect();
     let is_function = |i: usize| matches!(bindings[i].1, Expr::Lambda { .. });
-    // The constants a constant reads: through functions, which run when called, but
-    // not through another constant, which is ordered on its own.
-    let reads = |c: usize| -> Vec<usize> {
-        let mut found = Vec::new();
-        let mut seen = vec![false; bindings.len()];
-        let mut stack = direct[c].clone();
-        while let Some(i) = stack.pop() {
-            if std::mem::replace(&mut seen[i], true) {
-                continue;
+    // The constants each constant reads: through functions, which run when called,
+    // but not through another constant, which is ordered on its own.
+    let reads: Vec<Vec<usize>> = (0..bindings.len())
+        .map(|c| {
+            if is_function(c) {
+                return Vec::new();
             }
-            if is_function(i) {
-                stack.extend(direct[i].iter().copied());
-            } else if i != c {
-                found.push(i);
+            let mut found = Vec::new();
+            let mut seen = vec![false; bindings.len()];
+            let mut stack = direct[c].clone();
+            while let Some(i) = stack.pop() {
+                if std::mem::replace(&mut seen[i], true) {
+                    continue;
+                }
+                if is_function(i) {
+                    stack.extend(direct[i].iter().copied());
+                } else {
+                    found.push(i);
+                }
+            }
+            found.sort_unstable();
+            found
+        })
+        .collect();
+    // Tarjan's strongly connected components, which come out each after every
+    // component it reads. Started in file order, with reads in file order, so where
+    // nothing is read forward the answer is file order.
+    struct Tarjan<'r> {
+        reads: &'r [Vec<usize>],
+        index: Vec<Option<usize>>,
+        low: Vec<usize>,
+        on_stack: Vec<bool>,
+        stack: Vec<usize>,
+        next: usize,
+        order: Vec<usize>,
+    }
+    impl Tarjan<'_> {
+        fn visit(&mut self, v: usize) {
+            self.index[v] = Some(self.next);
+            self.low[v] = self.next;
+            self.next += 1;
+            self.stack.push(v);
+            self.on_stack[v] = true;
+            for k in 0..self.reads[v].len() {
+                let w = self.reads[v][k];
+                match self.index[w] {
+                    None => {
+                        self.visit(w);
+                        self.low[v] = self.low[v].min(self.low[w]);
+                    }
+                    Some(wi) if self.on_stack[w] => self.low[v] = self.low[v].min(wi),
+                    Some(_) => {}
+                }
+            }
+            if Some(self.low[v]) == self.index[v] {
+                let mut component = Vec::new();
+                loop {
+                    let w = self.stack.pop().expect("v is on the stack");
+                    self.on_stack[w] = false;
+                    component.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                component.sort_unstable();
+                self.order.extend(component);
             }
         }
-        found.sort_unstable();
-        found
+    }
+    let n = bindings.len();
+    let mut tarjan = Tarjan {
+        reads: &reads,
+        index: vec![None; n],
+        low: vec![0; n],
+        on_stack: vec![false; n],
+        stack: Vec::new(),
+        next: 0,
+        order: Vec::new(),
     };
-    // 0 unvisited, 1 being ordered, 2 ordered.
-    let mut state = vec![0u8; bindings.len()];
-    let mut order = Vec::new();
-    fn visit(c: usize, reads: &dyn Fn(usize) -> Vec<usize>, state: &mut [u8], order: &mut Vec<usize>) {
-        if state[c] != 0 {
-            return;
-        }
-        state[c] = 1;
-        for d in reads(c) {
-            visit(d, reads, state, order);
-        }
-        state[c] = 2;
-        order.push(c);
-    }
-    for c in 0..bindings.len() {
-        if !is_function(c) {
-            visit(c, &reads, &mut state, &mut order);
+    for c in 0..n {
+        if !is_function(c) && tarjan.index[c].is_none() {
+            tarjan.visit(c);
         }
     }
-    order
+    tarjan.order
 }
 
-/// The bindings an expression names: `Board.squares` written out, or a bare
-/// `squares` inside `Board` (then a top-level `squares`).
-fn names_bound(e: &Expr, owner: Option<&str>, at: &std::collections::HashMap<&str, usize>, out: &mut Vec<usize>) {
+/// The bindings an expression reads, found the way the compiler resolves a name: a
+/// local first (a parameter, a `let`, a `var`, a `for` name, a pattern's), then a
+/// top-level name as written, then, inside a namespace, its member (`squares` in
+/// `Board` is `Board.squares`). A name exposed by an import is not followed.
+fn free_reads(
+    e: &Expr,
+    owner: Option<&str>,
+    at: &std::collections::HashMap<&str, usize>,
+    bound: &mut Vec<&'static str>,
+    out: &mut Vec<usize>,
+) {
     match e {
         Expr::Ident(n, _) => {
-            let member = owner.and_then(|o| at.get(format!("{}.{}", o, n).as_str()));
-            if let Some(&i) = member.or_else(|| at.get(n)) {
+            if bound.contains(n) {
+                return;
+            }
+            let member = || owner.and_then(|o| at.get(format!("{}.{}", o, n).as_str()));
+            if let Some(&i) = at.get(n).or_else(member) {
                 out.push(i);
             }
         }
@@ -947,11 +1008,68 @@ fn names_bound(e: &Expr, owner: Option<&str>, at: &std::collections::HashMap<&st
                 out.push(i);
             }
         }
-        other => {
-            for child in other.children() {
-                names_bound(child, owner, at, out);
+        Expr::Lambda { params, body, .. } => {
+            let mark = bound.len();
+            bound.extend(params.iter().copied());
+            free_reads(body, owner, at, bound, out);
+            bound.truncate(mark);
+        }
+        Expr::Let { name, value, body, .. } | Expr::VarDecl { name, value, body, .. } => {
+            free_reads(value, owner, at, bound, out);
+            bound.push(name);
+            free_reads(body, owner, at, bound, out);
+            bound.pop();
+        }
+        Expr::For { name, iterable, body, .. } => {
+            free_reads(iterable, owner, at, bound, out);
+            bound.push(name);
+            free_reads(body, owner, at, bound, out);
+            bound.pop();
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            free_reads(scrutinee, owner, at, bound, out);
+            for arm in arms {
+                let mark = bound.len();
+                for pattern in &arm.patterns {
+                    pattern_names(pattern, bound);
+                }
+                if let Some(guard) = &arm.guard {
+                    free_reads(guard, owner, at, bound, out);
+                }
+                free_reads(&arm.body, owner, at, bound, out);
+                bound.truncate(mark);
             }
         }
+        other => {
+            for child in other.children() {
+                free_reads(child, owner, at, bound, out);
+            }
+        }
+    }
+}
+
+/// The names a pattern binds.
+fn pattern_names(pattern: &Pattern, out: &mut Vec<&'static str>) {
+    match pattern {
+        Pattern::Binding(n) => out.push(n),
+        Pattern::As { name, inner } => {
+            out.push(name);
+            pattern_names(inner, out);
+        }
+        Pattern::Nominal { inner, .. } => pattern_names(inner, out),
+        Pattern::Tag { args, .. } => args.iter().for_each(|p| pattern_names(p, out)),
+        Pattern::Tuple(items) => items.iter().for_each(|p| pattern_names(p, out)),
+        Pattern::Record { fields, rest } => {
+            out.extend(rest.iter().copied());
+            fields.iter().for_each(|(_, p)| pattern_names(p, out));
+        }
+        Pattern::List { before, rest, after } => {
+            if let Some(Some(n)) = rest {
+                out.push(n);
+            }
+            before.iter().chain(after.iter()).for_each(|p| pattern_names(p, out));
+        }
+        _ => {}
     }
 }
 
@@ -999,8 +1117,8 @@ impl<'u> Compiler<'u> {
     /// trailing expression if this is the program's own rather than a group's.
     ///
     /// Two callers, which is why it is a method: the precompiled group gets one of
-    /// these and so does the program that loads it. Order matters within each — a
-    /// global that reads one declared below it gets "Used before it was defined".
+    /// these and so does the program that loads it. Within each, constants are
+    /// initialized in `initialization_order`.
     fn top_level(
         &mut self,
         unit: &Unit,

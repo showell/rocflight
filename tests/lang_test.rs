@@ -2022,3 +2022,19 @@ fn list_starts_with_and_ends_with() {
     let src = "Str.inspect((List.starts_with([1.I64, 2, 3], [1, 2]), List.starts_with([1.I64, 2], [2]), List.ends_with([1.I64, 2, 3], [2, 3]), List.ends_with([1.I64], [1, 1]), List.starts_with([1.I64], [])))";
     assert_eq!(as_str(src), "(True, False, True, False, True)");
 }
+
+#[test]
+fn a_name_a_lambda_binds_is_not_a_read_of_the_constant() {
+    // `|b| b + 1` is the lambda's own `b`, not the constant below; counted as a read,
+    // it made `a` and `b` read each other and `b` ran first.
+    let src = "xs = [1.I64, 2]\n\na = List.map(xs, |b| b + 1)\n\nb = List.len(a)\n\nStr.inspect((a, b))";
+    assert_eq!(as_str(src), "([2, 3], 2)");
+}
+
+#[test]
+fn constants_that_seem_to_read_each_other_keep_file_order() {
+    // `f` reads `b` only on a branch `a`'s call never takes, so `a` and `b` appear to
+    // read each other. They keep the order they were written in, which works.
+    let src = "a = f(0)\n\nf = |n| if n > 0 { b } else { 1.I64 }\n\nb : I64\nb = a + 1\n\nStr.inspect((a, b))";
+    assert_eq!(as_str(src), "(1, 2)");
+}
