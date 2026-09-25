@@ -309,12 +309,8 @@ pub fn compile_reporting(
             split_bindings = bindings.len();
             split_statements = statements.len();
         }
-        let mut cursor = module.ast;
-        while let Expr::Let { name, value, body, .. } = cursor {
-            bindings.push((name, value.as_ref()));
-            cursor = body;
-        }
-        statements.push(cursor);
+        let tail = flatten_top(module.ast, &mut bindings, &mut statements);
+        statements.push(tail);
         // `exposing [hello]` makes `Hello.hello` reachable as plain `hello`.
         for name in &module.exposed {
             aliases.push((name, qualify(module.type_name, name)));
@@ -325,35 +321,7 @@ pub fn compile_reporting(
         split_statements = statements.len();
     }
 
-    let mut cursor = ast;
-    let tail = loop {
-        match cursor {
-            Expr::Let { name: "_", value, body, .. } if matches!(**value, Expr::Let { .. }) => {
-                let mut inner = value.as_ref();
-                while let Expr::Let { name, value, body, .. } = inner {
-                    bindings.push((name, value.as_ref()));
-                    inner = body;
-                }
-                // Whatever the inner chain ended in was bound to `_` and discarded, so
-                // it stays a statement: run for its effects, value thrown away.
-                statements.push(inner);
-                cursor = body;
-            }
-            // `_ = <expr>` binds nothing: it is a statement run for its effect, and
-            // that is the shape a top-level `expect` arrives in. As a binding it
-            // would take a global slot under the name `_` and, worse, be compiled
-            // as an ordinary in-function `expect` rather than as a test.
-            Expr::Let { name: "_", value, body, .. } => {
-                statements.push(value.as_ref());
-                cursor = body;
-            }
-            Expr::Let { name, value, body, .. } => {
-                bindings.push((name, value.as_ref()));
-                cursor = body;
-            }
-            other => break other,
-        }
-    };
+    let tail = flatten_top(ast, &mut bindings, &mut statements);
 
     // Chunk 0 is the top level itself, so top-level functions start at 1. Ids are
     // handed out before any body is compiled — that is what lets two functions call
@@ -894,6 +862,45 @@ struct Spares {
     cur: Reg,
     /// Somewhere to put a tag's payload before building it.
     slot: Reg,
+}
+
+/// A file's top level as its global bindings and its statements, answering its
+/// trailing expression. The app's and every module's go through here alike: a
+/// module's `expect`s arrive in the same shapes as the app's.
+fn flatten_top<'e>(
+    ast: &'e Expr,
+    bindings: &mut Vec<(&'static str, &'e Expr)>,
+    statements: &mut Vec<&'e Expr>,
+) -> &'e Expr {
+    let mut cursor = ast;
+    loop {
+        match cursor {
+            Expr::Let { name: "_", value, body, .. } if matches!(**value, Expr::Let { .. }) => {
+                let mut inner = value.as_ref();
+                while let Expr::Let { name, value, body, .. } = inner {
+                    bindings.push((name, value.as_ref()));
+                    inner = body;
+                }
+                // Whatever the inner chain ended in was bound to `_` and discarded, so
+                // it stays a statement: run for its effects, value thrown away.
+                statements.push(inner);
+                cursor = body;
+            }
+            // `_ = <expr>` binds nothing: it is a statement run for its effect, and
+            // that is the shape a top-level `expect` arrives in. As a binding it
+            // would take a global slot under the name `_` and, worse, be compiled
+            // as an ordinary in-function `expect` rather than as a test.
+            Expr::Let { name: "_", value, body, .. } => {
+                statements.push(value.as_ref());
+                cursor = body;
+            }
+            Expr::Let { name, value, body, .. } => {
+                bindings.push((name, value.as_ref()));
+                cursor = body;
+            }
+            other => return other,
+        }
+    }
 }
 
 impl<'u> Compiler<'u> {

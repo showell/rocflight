@@ -1966,3 +1966,19 @@ fn a_nominal_built_through_its_module_is_not_the_files_own_of_that_name() {
     );
     assert_eq!(out, "Ok(\"(3, 0)\")");
 }
+
+#[test]
+fn an_imported_modules_expects_do_not_run_with_the_app() {
+    // `roc` runs a module's top-level `expect`s under `roc test` only. A module's
+    // top level went straight into the globals, so its `_ = expect` became a global
+    // evaluated on load: this one crashed the app, and in Fast Track one naming a
+    // helper outside the namespace block failed it with "Undefined variable".
+    let out = run_files(
+        "rocflight_module_expects_not_run",
+        &[
+            ("Rng.roc", "Rng :: [].{\n\tnext : U64 -> U64\n\tnext = |s| s + 1\n}\n\nboom : U64 -> U64\nboom = |_| crash \"a module's expect ran\"\n\nexpect boom(1) == 1\n"),
+            ("main.roc", "app [main!] {}\n\nimport Rng\n\nmain! = |_args| Ok(Rng.next(1))\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(2)");
+}
