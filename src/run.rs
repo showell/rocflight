@@ -37,6 +37,13 @@ pub struct Options {
     /// sets this: it needs `Builtin.roc` compiled through the real front end, and the
     /// front end lives here.
     pub emit_prefix: bool,
+    /// Write the checked program as Codex instead of running it: the path to write,
+    /// and a Cobblestone checkout's `codex/foreword/core` for the chapters every
+    /// Codex program carries. `roc2codex` sets this. See `crate::codex`.
+    pub emit_codex: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    /// Write the checked program as one Rust file instead of running it; see
+    /// `crate::rust`. `roc2rust` sets this.
+    pub emit_rust: Option<std::path::PathBuf>,
 }
 
 thread_local! {
@@ -67,7 +74,7 @@ pub struct Ran {
 /// the same pipeline serves `rocflight file.roc`, `rocflight test`, and `roc_main`
 /// inside a platform's host.
 pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn Error>> {
-    let Options { show_desugared, show_ast, ast_only, show_platforms, test_mode, args, host_entry, check_expects, inspect_result: _, emit_prefix } = options;
+    let Options { show_desugared, show_ast, ast_only, show_platforms, test_mode, args, host_entry, check_expects, inspect_result: _, emit_prefix, emit_codex, emit_rust } = options;
     // `roc test` times the whole invocation, compile included, not just the expects.
     let started = Instant::now();
 
@@ -201,6 +208,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     let mut module_defaults: Vec<(String, Vec<(String, crate::ast::Expr)>)> = Vec::new();
     let mut module_where_methods: Vec<String> = Vec::new();
     let mut enclosing_owners: Vec<(String, String)> = parser.enclosing_owners().to_vec();
+    let mut module_types: Vec<Vec<(&'static str, Type)>> = Vec::new();
     for (file, module_ast, module_parser) in loaded_modules.order {
         enclosing_owners.extend(module_parser.enclosing_owners().iter().cloned());
         // The last segment is the type the module's method block hangs its names on:
@@ -213,6 +221,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         // same as the app's: `read : item -> U64 where [item.get : item -> U64]`.
         module_where_methods.extend(module_parser.where_methods());
         module_defaults.extend(module_parser.field_default_exprs().iter().cloned());
+        module_types.push(module_parser.nominals().to_vec());
         module_asts.push((module_ast, type_name, exposed));
     }
 
@@ -247,6 +256,9 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     crate::tick("modules + platform", &mut phase);
     // Step 3: Type check
     let mut type_checker = TypeChecker::new();
+    if emit_codex.is_some() || emit_rust.is_some() {
+        type_checker.record_types();
+    }
     // Declarations first, so a name used before it is declared — or declared in a
     // module — resolves rather than standing as a placeholder.
     type_checker.declare_types(parser.nominals().iter().map(|(n, t)| (*n, t.clone())));
@@ -299,6 +311,37 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     }
     type_checker.predeclare(&ast);
     let inferred = type_checker.synth(&ast)?;
+    if emit_codex.is_some() || emit_rust.is_some() {
+        let (out, foreword) = match (&emit_codex, &emit_rust) {
+            (Some((out, foreword)), _) => (out.clone(), foreword.clone()),
+            (None, Some(out)) => (out.clone(), std::path::PathBuf::new()),
+            (None, None) => unreachable!("guarded"),
+        };
+        let app_name = std::path::Path::new(filename)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("App")
+            .split(['_', '@', '-'])
+            .filter(|w| !w.is_empty())
+            .map(|w| w[..1].to_uppercase() + &w[1..])
+            .collect::<String>();
+        let input = crate::codex::Input {
+            app_name,
+            app: &ast,
+            app_types: parser.nominals().to_vec(),
+            modules: module_asts
+                .iter()
+                .zip(&module_types)
+                .map(|((module_ast, name, _), types)| crate::codex::Module { name: name.clone(), ast: module_ast, types: types.clone() })
+                .collect(),
+            types: type_checker.node_types(),
+            foreword,
+            nominal_params: parser.nominal_params().iter().cloned().chain(module_params.iter().cloned()).collect(),
+        };
+        let text = if emit_rust.is_some() { crate::rust::emit(&input)? } else { crate::codex::emit(&input)? };
+        std::fs::write(out, text)?;
+        return Ok(None);
+    }
     // A literal that does not fit the type it was given: refused, as roc refuses it.
     if let Some(problem) = type_checker.method_problems() {
         return Err(format!("Type error: {}", problem).into());

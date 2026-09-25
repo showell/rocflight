@@ -251,6 +251,8 @@ fn launch_on_host(filename: &str, app_args: &[String]) -> Result<(), Box<dyn Err
 fn run(filename: &str, dbg: Debug, test_mode: bool) -> Result<(), Box<dyn Error>> {
     let options = rocflight::run::Options {
         emit_prefix: false,
+        emit_codex: None,
+        emit_rust: None,
         show_desugared: dbg.show_desugared,
         show_ast: dbg.show_ast,
         ast_only: dbg.ast_only,
