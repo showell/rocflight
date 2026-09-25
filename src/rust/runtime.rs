@@ -347,18 +347,161 @@ pub struct Rec_len_start {
 
 // ---- Str ----
 
-pub fn Str__concat(a: String, b: String) -> String {
-    a + &b
+/// A Roc `Str`, laid out as roc lays it out: up to 23 bytes held in place, a
+/// literal pointed at where it lies, and anything longer behind one reference
+/// count. Only a string longer than 23 bytes that the program builds allocates.
+#[derive(Clone)]
+pub enum Str {
+    Small(u8, [u8; SMALL]),
+    Static(&'static str),
+    Big(Rc<str>),
 }
-pub fn Str__to_utf8(s: String) -> List<u8> {
-    List::of(s.into_bytes())
+const SMALL: usize = 23;
+
+impl Str {
+    pub const fn lit(s: &'static str) -> Str {
+        Str::Static(s)
+    }
+    pub fn as_str(&self) -> &str {
+        match self {
+            // Only `StrBuf` writes a `Small`, and only whole `&str`s into it.
+            Str::Small(n, b) => unsafe { std::str::from_utf8_unchecked(&b[..*n as usize]) },
+            Str::Static(s) => s,
+            Str::Big(s) => s,
+        }
+    }
 }
-pub fn Str__from_utf8_lossy(l: List<u8>) -> String {
-    String::from_utf8_lossy(l.items()).into_owned()
+impl Default for Str {
+    fn default() -> Str {
+        Str::Static("")
+    }
+}
+impl std::ops::Deref for Str {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+impl From<&str> for Str {
+    fn from(s: &str) -> Str {
+        let mut b = StrBuf::new();
+        b.push(s);
+        b.finish()
+    }
+}
+impl From<String> for Str {
+    fn from(s: String) -> Str {
+        if s.len() <= SMALL { Str::from(s.as_str()) } else { Str::Big(Rc::from(s)) }
+    }
+}
+impl PartialEq for Str {
+    fn eq(&self, o: &Str) -> bool {
+        self.as_str() == o.as_str()
+    }
+}
+impl Eq for Str {}
+impl PartialEq<&str> for Str {
+    fn eq(&self, o: &&str) -> bool {
+        self.as_str() == *o
+    }
+}
+impl PartialEq<Str> for &str {
+    fn eq(&self, o: &Str) -> bool {
+        *self == o.as_str()
+    }
+}
+impl PartialOrd for Str {
+    fn partial_cmp(&self, o: &Str) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Str {
+    fn cmp(&self, o: &Str) -> std::cmp::Ordering {
+        self.as_str().cmp(o.as_str())
+    }
+}
+impl std::hash::Hash for Str {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.as_str().hash(h)
+    }
+}
+impl std::fmt::Debug for Str {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+impl std::fmt::Display for Str {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
-pub fn Str__join_with(l: List<String>, sep: String) -> String {
-    l.items().join(&sep)
+/// A `Str` being built: in place while it fits, on the heap once it does not.
+pub enum StrBuf {
+    Small(u8, [u8; SMALL]),
+    Big(String),
+}
+impl StrBuf {
+    pub fn new() -> StrBuf {
+        StrBuf::Small(0, [0; SMALL])
+    }
+    pub fn push(&mut self, s: &str) {
+        match self {
+            StrBuf::Small(n, b) if *n as usize + s.len() <= SMALL => {
+                b[*n as usize..*n as usize + s.len()].copy_from_slice(s.as_bytes());
+                *n += s.len() as u8;
+            }
+            StrBuf::Small(n, b) => {
+                let mut t = String::with_capacity(*n as usize + s.len());
+                t.push_str(unsafe { std::str::from_utf8_unchecked(&b[..*n as usize]) });
+                t.push_str(s);
+                *self = StrBuf::Big(t);
+            }
+            StrBuf::Big(t) => t.push_str(s),
+        }
+    }
+    pub fn finish(self) -> Str {
+        match self {
+            StrBuf::Small(n, b) => Str::Small(n, b),
+            StrBuf::Big(t) => Str::Big(Rc::from(t)),
+        }
+    }
+}
+impl std::fmt::Write for StrBuf {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.push(s);
+        Ok(())
+    }
+}
+/// A value's text, as `Num.to_str` gives it, built in place.
+pub fn display_str(x: impl std::fmt::Display) -> Str {
+    let mut b = StrBuf::new();
+    let _ = std::fmt::Write::write_fmt(&mut b, format_args!("{}", x));
+    b.finish()
+}
+
+pub fn Str__concat(a: Str, b: Str) -> Str {
+    let mut t = StrBuf::new();
+    t.push(&a);
+    t.push(&b);
+    t.finish()
+}
+pub fn Str__to_utf8(s: Str) -> List<u8> {
+    List::of(s.as_bytes().to_vec())
+}
+pub fn Str__from_utf8_lossy(l: List<u8>) -> Str {
+    Str::from(String::from_utf8_lossy(l.items()).into_owned())
+}
+
+pub fn Str__join_with(l: List<Str>, sep: Str) -> Str {
+    let mut t = StrBuf::new();
+    for (i, s) in l.items().iter().enumerate() {
+        if i > 0 {
+            t.push(&sep);
+        }
+        t.push(s);
+    }
+    t.finish()
 }
 
 // ---- integers ----
@@ -384,7 +527,7 @@ macro_rules! paste_int {
             pub fn max(a: $t, b: $t) -> $t { a.max(b) }
             pub fn shl_wrap(a: $t, n: impl Into<i128>) -> $t { a.wrapping_shl(n.into() as u32) }
             pub fn shr_wrap(a: $t, n: impl Into<i128>) -> $t { a.wrapping_shr(n.into() as u32) }
-            pub fn to_str(a: $t) -> String { a.to_string() }
+            pub fn to_str(a: $t) -> super::Str { super::display_str(a) }
             pub fn to_i64_wrap(a: $t) -> i64 { a as i64 }
             pub fn to_u64_wrap(a: $t) -> u64 { a as u64 }
             pub fn to_u8_wrap(a: $t) -> u8 { a as u8 }
@@ -432,17 +575,20 @@ pub mod F64 {
     pub fn is_infinite(a: f64) -> bool { a.is_infinite() }
     pub fn abs(a: f64) -> f64 { a.abs() }
     pub fn sqrt(a: f64) -> f64 { a.sqrt() }
-    pub fn to_str(a: f64) -> String { format!("{:?}", a) }
+    pub fn to_str(a: f64) -> super::Str { super::display_str(format_args!("{:?}", a)) }
 }
 
 // ---- the platform ----
 
-pub fn echo(s: String) {
+pub fn echo(s: Str) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(s.as_bytes());
 }
 /// fasttrack's cli platform: `Echo.line!`.
-pub fn echo_line(s: String) {
-    echo(s + "\n")
+pub fn echo_line(s: Str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(s.as_bytes());
+    let _ = out.write_all(b"\n");
 }

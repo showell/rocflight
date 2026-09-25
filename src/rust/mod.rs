@@ -73,7 +73,7 @@ pub fn emit(input: &Input) -> Result<String, String> {
     out.push_str("\n// ---- the program ----\n\n");
     out.push_str(&defs);
     out.push_str(
-        "fn main() {\n    let t = std::thread::Builder::new().stack_size(1 << 30).spawn(|| { main__e(List::<String>::of(vec![])); }).unwrap();\n    if t.join().is_err() { std::process::exit(1); }\n    #[cfg(roc2rust_count_allocs)]\n    alloc_count::report();\n}\n",
+        "fn main() {\n    let t = std::thread::Builder::new().stack_size(1 << 30).spawn(|| { main__e(List::<Str>::of(vec![])); }).unwrap();\n    if t.join().is_err() { std::process::exit(1); }\n    #[cfg(roc2rust_count_allocs)]\n    alloc_count::report();\n}\n",
     );
     Ok(out)
 }
@@ -296,7 +296,7 @@ impl<'a> Cx<'a> {
             Type::F32 => "f32".into(),
             Type::F64 | Type::Dec => "f64".into(),
             Type::Bool => "bool".into(),
-            Type::Str => "String".into(),
+            Type::Str => "Str".into(),
             Type::Unit => "()".into(),
             Type::TypeVar(v) => format!("T{}", v),
             Type::List(e) => format!("List<{}>", self.ty(e)?),
@@ -530,7 +530,7 @@ impl<'a> Cx<'a> {
                 scope.generics = vars;
                 let mut args = Vec::new();
                 for (p, t) in params.iter().zip(&ps) {
-                    let t = if name == "main!" { "List<String>".to_string() } else { self.ty(t)? };
+                    let t = if name == "main!" { "List<Str>".to_string() } else { self.ty(t)? };
                     args.push(format!("{}: {}", sanitize(p), t));
                     scope.locals.push(p.to_string());
                     self.mark_single_read(&[body], p);
@@ -612,7 +612,7 @@ impl<'a> Cx<'a> {
             Expr::Bool(b, _) => b.to_string(),
             Expr::Unit(_) => "()".into(),
             Expr::Str(s, _) => {
-                let lit = format!("String::from({:?})", s);
+                let lit = format!("Str::lit({:?})", s);
                 match self.ty_of(e)? {
                     Type::Nominal { name, .. } => {
                         let from = self.qualified(bare(name), "from_quote").ok_or_else(|| format!("a string literal as a {} with no from_quote", name))?;
@@ -683,19 +683,19 @@ impl<'a> Cx<'a> {
             ),
             Expr::Dbg(value, _) => format!("{{ let __d = {}; eprintln!(\"{{:?}}\", __d); __d }}", self.expr(value, scope)?),
             Expr::StrInterp(parts, _) => {
-                let mut out = String::from("{ let mut __t = String::new();");
+                let mut out = String::from("{ let mut __t = StrBuf::new();");
                 for part in parts {
                     match part {
-                        StrPart::Literal(l) => out.push_str(&format!(" __t.push_str({:?});", l)),
+                        StrPart::Literal(l) => out.push_str(&format!(" __t.push({:?});", l)),
                         StrPart::Expr(x) => {
                             if !matches!(self.ty_of(x)?, Type::Str) {
                                 return Err(format!("an interpolation of {}", short(x)));
                             }
-                            out.push_str(&format!(" __t.push_str(&{});", self.expr(x, scope)?))
+                            out.push_str(&format!(" __t.push(&{});", self.read_operand(x, scope, false)?))
                         }
                     }
                 }
-                out.push_str(" __t }");
+                out.push_str(" __t.finish() }");
                 out
             }
             Expr::Match { scrutinee, arms, .. } => self.matching(scrutinee, arms, &self.ty_of(e).ok(), scope)?,
@@ -852,7 +852,7 @@ impl<'a> Cx<'a> {
 
     /// An operand that is only read, as a comparison reads its operands: a local or
     /// a field of one in place, and with `literal`, a plain string literal as a
-    /// `&str`, which a `String` compares equal to without being one.
+    /// `&str`, which a `Str` compares equal to without being one.
     fn read_operand(&self, x: &Expr, scope: &Scope, literal: bool) -> Result<String, String> {
         if let Some(p) = self.place(x, scope)? {
             return Ok(p);
@@ -957,7 +957,7 @@ impl<'a> Cx<'a> {
 
     fn binop(&self, l: &Expr, op: BinOp, r: &Expr, scope: &Scope) -> Result<String, String> {
         // A comparison only reads its operands, so they are not copied; and `==`
-        // against a string literal needs no `String` for it.
+        // against a string literal needs no `Str` for it.
         let compares = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne);
         let equality = matches!(op, BinOp::Eq | BinOp::Ne);
         let (a, b) = if compares {
@@ -1405,9 +1405,9 @@ impl<'a> Cx<'a> {
                 let lit = match t {
                     Type::Nominal { name, .. } => {
                         let from = self.qualified(bare(name), "from_quote").ok_or("a string pattern with no from_quote")?;
-                        format!("{}(String::from({:?})).unwrap()", sanitize(&from), s)
+                        format!("{}(Str::lit({:?})).unwrap()", sanitize(&from), s)
                     }
-                    // A plain string compares against the literal as it is: no `String`.
+                    // A plain string compares against the literal as it is: no `Str`.
                     _ => return Ok(format!("if ({}).as_str() == {:?} {{ {} }}", v, s, inner)),
                 };
                 format!("if *{} == {} {{ {} }}", v, lit, inner)
