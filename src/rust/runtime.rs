@@ -20,6 +20,13 @@ pub mod alloc_count {
     static ALLOCS: AtomicU64 = AtomicU64::new(0);
     static REALLOCS: AtomicU64 = AtomicU64::new(0);
     static BYTES: AtomicU64 = AtomicU64::new(0);
+    /// Bytes allocated and not yet freed, and the most there ever were.
+    static LIVE: AtomicU64 = AtomicU64::new(0);
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+    fn grow(by: u64) {
+        let now = LIVE.fetch_add(by, Relaxed) + by;
+        PEAK.fetch_max(now, Relaxed);
+    }
     /// A list written by a builtin: taken whole (held only here), or copied.
     pub static TAKEN: AtomicU64 = AtomicU64::new(0);
     pub static COPIED: AtomicU64 = AtomicU64::new(0);
@@ -60,14 +67,18 @@ pub mod alloc_count {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             ALLOCS.fetch_add(1, Relaxed);
             BYTES.fetch_add(layout.size() as u64, Relaxed);
+            grow(layout.size() as u64);
             unsafe { System.alloc(layout) }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            LIVE.fetch_sub(layout.size() as u64, Relaxed);
             unsafe { System.dealloc(ptr, layout) }
         }
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             REALLOCS.fetch_add(1, Relaxed);
             BYTES.fetch_add(new_size as u64, Relaxed);
+            LIVE.fetch_sub(layout.size() as u64, Relaxed);
+            grow(new_size as u64);
             unsafe { System.realloc(ptr, layout, new_size) }
         }
     }
@@ -75,6 +86,7 @@ pub mod alloc_count {
     static COUNTING: Counting = Counting;
     pub fn report() {
         eprintln!("allocs {} reallocs {} bytes {}", ALLOCS.load(Relaxed), REALLOCS.load(Relaxed), BYTES.load(Relaxed));
+        eprintln!("peak live bytes {}", PEAK.load(Relaxed));
         eprintln!("lists written: taken {} copied {}; list boxes {}", TAKEN.load(Relaxed), COPIED.load(Relaxed), BOXES.load(Relaxed));
         report_copies();
         report_sites();
@@ -139,6 +151,25 @@ impl<T: Clone> List<T> {
         }
         Rc::make_mut(rc)
     }
+    /// `edit`, for a write that adds `extra` elements: a copy is made with
+    /// room for them, not grown again at once.
+    #[cfg_attr(roc2rust_count_allocs, track_caller)]
+    fn edit_growing(&mut self, extra: usize) -> &mut Vec<T> {
+        let shared = self.0.as_ref().map_or(false, |rc| Rc::strong_count(rc) > 1);
+        if !shared {
+            return self.edit();
+        }
+        let rc = self.0.as_mut().unwrap();
+        #[cfg(roc2rust_count_allocs)]
+        {
+            alloc_count::BOXES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            alloc_count::copied::<T>(rc.len());
+        }
+        let mut v = Vec::with_capacity(rc.len() + extra);
+        v.extend_from_slice(rc);
+        *rc = Rc::new(v);
+        Rc::make_mut(rc)
+    }
     pub fn is_empty(&self) -> bool {
         self.items().is_empty()
     }
@@ -197,13 +228,13 @@ pub fn List__insert<T: Clone>(mut l: List<T>, i: u64, x: T) -> Result<List<T>, (
 }
 #[cfg_attr(roc2rust_count_allocs, track_caller)]
 pub fn List__append<T: Clone>(mut l: List<T>, x: T) -> List<T> {
-    l.edit().push(x);
+    l.edit_growing(1).push(x);
     l
 }
 #[cfg_attr(roc2rust_count_allocs, track_caller)]
 pub fn List__concat<T: Clone>(mut a: List<T>, b: &List<T>) -> List<T> {
     if !b.is_empty() {
-        a.edit().extend(b.items().iter().cloned());
+        a.edit_growing(b.items().len()).extend(b.items().iter().cloned());
     }
     a
 }
@@ -270,7 +301,7 @@ pub fn List__first<T: Clone>(l: &List<T>) -> Result<T, ()> {
 }
 #[cfg_attr(roc2rust_count_allocs, track_caller)]
 pub fn List__prepend<T: Clone>(mut l: List<T>, x: T) -> List<T> {
-    l.edit().insert(0, x);
+    l.edit_growing(1).insert(0, x);
     l
 }
 #[cfg_attr(roc2rust_count_allocs, track_caller)]
@@ -330,10 +361,18 @@ pub fn List__map_with_index<T: Clone, U: Clone>(l: &List<T>, f: &dyn Fn(T, u64) 
     List::of(l.items().iter().cloned().enumerate().map(|(i, x)| f(x, i as u64)).collect())
 }
 pub fn List__join<T: Clone>(l: &List<List<T>>) -> List<T> {
-    List::of(l.items().iter().flat_map(|x| x.items().iter().cloned()).collect())
+    let mut v = Vec::with_capacity(l.items().iter().map(|x| x.items().len()).sum());
+    for x in l.items() {
+        v.extend_from_slice(x.items());
+    }
+    List::of(v)
 }
 pub fn List__join_map<T: Clone, U: Clone>(l: &List<T>, f: &dyn Fn(T) -> List<U>) -> List<U> {
-    List::of(l.items().iter().cloned().flat_map(|x| f(x).items().iter().cloned().collect::<Vec<U>>()).collect())
+    let mut v = Vec::new();
+    for x in l.items() {
+        v.extend_from_slice(f(x.clone()).items());
+    }
+    List::of(v)
 }
 /// `List.sort_with`: a stable sort, as Roc's is, by a comparison answering the
 /// program's own `[Before, Same, After]`.
@@ -360,13 +399,27 @@ pub struct Rec_len_start {
 /// A Roc `Str`, laid out as roc lays it out: up to 23 bytes held in place, a
 /// literal pointed at where it lies, and anything longer behind one reference
 /// count. Only a string longer than 23 bytes that the program builds allocates.
+/// A `Str` is 24 bytes, as roc's is: a small string's length is a `SmallLen`,
+/// whose unused values tell the other two apart.
 #[derive(Clone)]
 pub enum Str {
-    Small(u8, [u8; SMALL]),
+    Small(SmallLen, [u8; SMALL]),
     Static(&'static str),
     Big(Rc<str>),
 }
 const SMALL: usize = 23;
+
+/// The length of a small string, 0 to 23.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub enum SmallLen {
+    L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11,
+    L12, L13, L14, L15, L16, L17, L18, L19, L20, L21, L22, L23,
+}
+const SMALL_LENS: [SmallLen; SMALL + 1] = {
+    use SmallLen::*;
+    [L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12, L13, L14, L15, L16, L17, L18, L19, L20, L21, L22, L23]
+};
 
 impl Str {
     pub const fn lit(s: &'static str) -> Str {
@@ -472,7 +525,7 @@ impl StrBuf {
     }
     pub fn finish(self) -> Str {
         match self {
-            StrBuf::Small(n, b) => Str::Small(n, b),
+            StrBuf::Small(n, b) => Str::Small(SMALL_LENS[n as usize], b),
             StrBuf::Big(t) => Str::Big(Rc::from(t)),
         }
     }
