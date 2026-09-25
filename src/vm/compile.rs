@@ -813,6 +813,10 @@ enum Shape {
     /// `xs.fold_try(init, f)`: a fold that stops at the first `Err` and hands it back,
     /// and wraps the accumulator in `Ok` if it reaches the end.
     FoldTry,
+    /// `List.keep_if(xs, p)` (true) or `List.drop_if(xs, p)` (false), written with
+    /// `List.`: a list of the elements the predicate answered `keep` for. Only a call
+    /// that NAMES `List` gets this; see `list_loop`.
+    Filter(bool),
 }
 
 impl Shape {
@@ -1686,8 +1690,14 @@ impl<'u> Compiler<'u> {
         receiver: &Expr,
         args: &[Expr],
         module: &str,
+        names_list: bool,
     ) -> Result<Option<Reg>, String> {
         let shape = match (method, args.len()) {
+            // `List.keep_if(xs, p)` says which `keep_if` it is: `Iter.keep_if` is the lazy
+            // one, and roc rejects an iterator where `List.keep_if` wants a list. The
+            // ambiguity the note below describes is method syntax's alone.
+            ("keep_if", 1) if names_list => Shape::Filter(true),
+            ("drop_if", 1) if names_list => Shape::Filter(false),
             ("fold", 2) => Shape::Fold,
             ("map", 1) => Shape::Map,
             // `keep` vs `drop`, and `any` vs `all`, differ only in which answer from the
@@ -1725,7 +1735,7 @@ impl<'u> Compiler<'u> {
         // is `False` and `all` of nothing is `True`, nothing matches nothing, and a count
         // of nothing is zero. An element that settles it overwrites this and leaves.
         match shape {
-            Shape::Map => self.emit(Op::MakeList { dst, base: dst, n: 0 }),
+            Shape::Map | Shape::Filter(_) => self.emit(Op::MakeList { dst, base: dst, n: 0 }),
             Shape::Decide(want) => self.constant(dst, Value::Bool(!want))?,
             Shape::Count => self.constant(dst, Value::Int(0))?,
             Shape::Find | Shape::FindIndex(_) => self.constant(
@@ -1899,6 +1909,16 @@ impl<'u> Compiler<'u> {
                     out
                 };
                 self.emit(Op::ListPush { list: dst, src });
+                Ok(None)
+            }
+            // The element itself, when the predicate answers `keep`; anything else goes
+            // round again. A copy, because `ListPush` takes its element out of the
+            // register and the loop still holds `item`.
+            Shape::Filter(keep) => {
+                self.emit(Op::TestBool { cond: out, want: keep, to: top });
+                let copy = self.alloc()?;
+                self.emit(Op::Move { dst: copy, src: item });
+                self.emit(Op::ListPush { list: dst, src: copy });
                 Ok(None)
             }
             // The first element the predicate agrees with settles it: write the answer
@@ -2984,7 +3004,7 @@ impl<'u> Compiler<'u> {
                 // written first, and compiles to the same loop.
                 if *module == "List" {
                     if let Some((receiver, rest)) = args.split_first() {
-                        if let Some(dst) = self.list_loop(name, receiver, rest, module)? {
+                        if let Some(dst) = self.list_loop(name, receiver, rest, module, true)? {
                             return Ok(Some(dst));
                         }
                     }
@@ -3164,7 +3184,7 @@ impl<'u> Compiler<'u> {
             .copied()
             .filter(|m| candidates.is_empty() && matches!(*m, "List" | "Iter"))
         {
-            if let Some(dst) = self.list_loop(method, receiver, args, module)? {
+            if let Some(dst) = self.list_loop(method, receiver, args, module, false)? {
                 return Ok(dst);
             }
         }

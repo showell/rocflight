@@ -1982,3 +1982,18 @@ fn an_imported_modules_expects_do_not_run_with_the_app() {
     );
     assert_eq!(out, "Ok(2)");
 }
+
+#[test]
+fn a_call_that_names_list_drop_if_answers_a_list() {
+    // `List.drop_if(set, p)` names the eager one; `Iter.drop_if` is the lazy one. Here
+    // the checker cannot tell `set` is a list (it is an alias of one), and the call went
+    // lazy: `List.prepend needs a List, got <opaque>`.
+    let out = run_files(
+        "rocflight_named_list_drop_if",
+        &[(
+            "main.roc",
+            "app [main!] {}\n\nBag :: [].{\n\tItems(a) : List(a)\n\n\tinsert : Bag.Items(a), a -> Bag.Items(a) where [a.is_eq : a, a -> Bool]\n\tinsert = |set, item| List.prepend(List.drop_if(set, |other| other == item), item)\n\n\tbig : Bag.Items(I64) -> Bag.Items(I64)\n\tbig = |set| List.prepend(List.keep_if(set, |n| n > 1), 0)\n}\n\nmain! = |_args| Ok((Bag.insert([1.I64, 2, 3], 2), Bag.big([1, 2, 3])))\n",
+        )],
+    );
+    assert_eq!(out, "Ok(([2, 1, 3], [0, 2, 3]))");
+}
