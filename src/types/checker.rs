@@ -3720,7 +3720,14 @@ impl TypeChecker {
                 self.bind_pattern(inner, &backing);
             }
             Pattern::Tag { name, args } => {
-                let payload = match scrutinee {
+                // The scrutinee as known so far, and a nominal's tags are its
+                // backing's: `B(n)` against a `Crate := [B(I64), ..]` binds `n : I64`.
+                // Taking only a bare union left every nominal's payload unconstrained.
+                let resolved = match self.apply(scrutinee) {
+                    Type::Nominal { backing, .. } => *backing,
+                    other => other,
+                };
+                let payload = match resolved {
                     Type::TagUnion { tags, .. } => tags
                         .iter()
                         .find(|(tag, _)| tag == name)
