@@ -515,6 +515,11 @@ pub enum NominalShape {
     /// A SIMD backing — `Vector := U64x2`. Holds the element-kind byte so a
     /// `Value::Simd` of the right width is recognised as this nominal.
     Simd(u8),
+    /// A backing that is a list or a scalar — `Text :: List(U8)`, `Code :: I64`. It
+    /// rules out every value of another kind, and is never an exact fit, since a
+    /// plain list or integer is indistinguishable from it at run time: a list keeps
+    /// answering to `List`'s own methods.
+    Kind(FieldKind),
     /// A backing this cannot rule anything out from — a type variable, or another
     /// nominal whose own shape is unknown. Never filters.
     Unknown,
@@ -538,7 +543,7 @@ pub enum FieldKind {
 }
 
 impl FieldKind {
-    fn of(ty: &crate::types::Type) -> FieldKind {
+    pub(crate) fn of(ty: &crate::types::Type) -> FieldKind {
         use crate::types::Type;
         match ty {
             Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
@@ -641,6 +646,7 @@ impl NominalShape {
             (NominalShape::Tuple(_), _) => false,
             (NominalShape::Simd(kind), Value::Simd { kind: k, .. }) => k == kind,
             (NominalShape::Simd(_), _) => false,
+            (NominalShape::Kind(kind), value) => kind.holds(value),
             (NominalShape::Unknown, _) => true,
         }
     }
@@ -664,6 +670,11 @@ pub fn shape_of(ty: &crate::types::Type) -> NominalShape {
             NominalShape::Fields(fields.iter().map(|(name, ty)| ((*name).to_string(), FieldKind::of(ty))).collect())
         }
         Type::Tuple(items) => NominalShape::Tuple(items.len()),
+        // A U128 may be held as `Value::U128`, which `FieldKind::Int` does not
+        // hold, so it rules nothing out.
+        Type::List(_) | Type::Str | Type::Bool | Type::F32 | Type::F64 | Type::Dec
+        | Type::U8 | Type::U16 | Type::U32 | Type::U64
+        | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 => NominalShape::Kind(FieldKind::of(ty)),
         Type::Nominal { name, backing } => match crate::eval::simd_kind(name) {
             Some(kind) => NominalShape::Simd(kind),
             None => shape_of(backing),

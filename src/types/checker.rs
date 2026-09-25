@@ -858,8 +858,11 @@ impl TypeChecker {
             // (whose `_` param wraps the body in a match) checks its `{}` against the
             // annotated result rather than synthesising it to a bare unit. Still
             // exhaustiveness-checked, via the shared helper.
-            Expr::Match { scrutinee, arms, .. } => {
+            Expr::Match { scrutinee, arms, id } => {
                 let scrutinee_type = self.synth(scrutinee)?;
+                // Recorded as `synth` records it: a literal pattern against a nominal
+                // with a conversion needs the scrutinee's type (`match_types`).
+                self.matches.push((*id, scrutinee_type.clone()));
                 for arm in arms {
                     for pattern in &arm.patterns {
                         // `{ age: Ok(v) }` against `{ age ?: U8 }`: the sub-pattern
@@ -2016,9 +2019,9 @@ impl TypeChecker {
             Type::Nominal { backing, .. } => *backing,
             other => other,
         };
-        // An `as` pattern covers whatever its inner pattern does, so unwrap it.
+        // An `as` or a nominal pattern covers whatever its inner pattern does.
         fn base(p: &Pattern) -> &Pattern {
-            match p { Pattern::As { inner, .. } => base(inner), other => other }
+            match p { Pattern::As { inner, .. } | Pattern::Nominal { inner, .. } => base(inner), other => other }
         }
         let covers_everything = arms.iter().any(|arm| {
             arm.guard.is_none()
@@ -2270,6 +2273,25 @@ impl TypeChecker {
                             }
                         }
                         Ok(Type::closed_record(result))
+                    }
+                    // A nominal record updated is that nominal: `{ ..p, x: 1 }` on a
+                    // `P := { x : I64, .. }` is a `P`. The fields were checked against
+                    // the backing above; one it does not have is an error, as for a
+                    // plain record. A fresh variable here made the next update's base
+                    // an open record holding only the fields that update named.
+                    resolved @ Type::Nominal { .. } if !known.is_empty() => {
+                        for (name, _) in &updated {
+                            if !known.iter().any(|(field, _)| field == name) {
+                                return Err(TypeError {
+                                    message: format!("Record has no field `{}` to update", name),
+                                    expected: Type::closed_record(known.clone()).to_string(),
+                                    actual: name.to_string(),
+                                    line: 0,
+                                    col: 0,
+                                });
+                            }
+                        }
+                        Ok(resolved)
                     }
                     // Base type not resolved yet; eval catches a real mistake.
                     _ => Ok(self.fresh_var()),
@@ -3616,6 +3638,14 @@ impl TypeChecker {
                 self.bind(name, scrutinee.clone());
                 self.bind_pattern(inner, scrutinee);
             }
+            // `Text.(units)` against a `Text` binds `units` to the backing.
+            Pattern::Nominal { name, inner } => {
+                let backing = match self.apply(scrutinee) {
+                    Type::Nominal { name: n, backing } if n == *name => *backing,
+                    other => other,
+                };
+                self.bind_pattern(inner, &backing);
+            }
             Pattern::Tag { name, args } => {
                 let payload = match scrutinee {
                     Type::TagUnion { tags, .. } => tags
@@ -3751,6 +3781,7 @@ impl TypeChecker {
             }
             Pattern::Str(_) | Pattern::StrInterp { .. } => Type::Str,
             Pattern::As { inner, .. } => self.pattern_type(inner)?,
+            Pattern::Nominal { name, .. } => self.nominal_named(name),
             Pattern::Tag { name, args } => {
                 let mut payload = Vec::with_capacity(args.len());
                 for arg in args {
@@ -4175,6 +4206,16 @@ impl TypeChecker {
                             col: 0,
                         });
                     }
+                }
+                // An open record that meets a closed one IS that record: the
+                // parameter of `|acc, x| .. k.key == x.key ..`, folded over a list
+                // of `{ key, i }`, has an `i` too. Rebound by value, as field access
+                // grows one: the types arrive here already applied, so the variable
+                // that held it is not known.
+                if *a_open && !*b_open {
+                    self.subst.rebind_applied(&t1, t2.clone());
+                } else if *b_open && !*a_open {
+                    self.subst.rebind_applied(&t2, t1.clone());
                 }
                 Ok(())
             }

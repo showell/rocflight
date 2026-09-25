@@ -535,6 +535,24 @@ fn several_fields_may_be_updated_at_once() {
 }
 
 #[test]
+fn an_update_of_a_nominal_record_is_the_nominal() {
+    // Each update answers a `P`, so the next one sees every field: three deep, the
+    // result is still a whole `P`, not a record holding the last update's fields.
+    let src = "P := { x : I64, y : I64, z : I64 }\n\
+               bump : P, I64 -> P\nbump = |p, a| { ..{ ..{ ..p, x: a }, y: a }, z: a }\n\
+               start : P\nstart = P.{ x: 1, y: 2, z: 3 }\nq = bump(start, 10)\nq.x + q.y + q.z";
+    assert_eq!(value(src), "30");
+}
+
+#[test]
+fn updating_a_nominal_record_by_a_field_it_lacks_is_an_error() {
+    assert!(
+        !accepts("P := { a : I64 }\np : P\np = P.{ a: 1 }\n{ ..p, nope: 2 }"),
+        "adding a field to a nominal record via update should fail"
+    );
+}
+
+#[test]
 fn updating_a_field_the_record_lacks_is_an_error() {
     // An update cannot ADD a field.
     assert!(
@@ -1468,6 +1486,14 @@ fn a_lambda_boundary_is_not_read_as_a_pipe() {
 }
 
 #[test]
+fn a_lambda_whose_body_is_a_record_reads_its_field_inside() {
+    // `|b| { val: b.val + 1 }.val` is a lambda answering the field, not the field of
+    // a lambda: a record body takes postfix like any other expression.
+    let src = "Byte : { val : I64 }\nbump : Byte -> I64\nbump = |b| { val: (b.val + 1) }.val\nbump({ val: 41 })";
+    assert_eq!(value(src), "42");
+}
+
+#[test]
 fn or_is_not_read_as_a_pipe() {
     assert_eq!(
         as_str("Str.inspect(Bool.True or Bool.False)"),
@@ -1687,6 +1713,46 @@ fn a_user_defined_is_eq_decides_equality_both_ways() {
 }
 
 #[test]
+fn a_list_backed_nominals_is_eq_does_not_claim_a_record() {
+    // A record compared with `==` looks for an `is_eq` by the value's shape. `T` is
+    // over a list, so its `is_eq` is no candidate for the record; before, a list
+    // backing had no shape, ruled nothing out, and `T.is_eq` compared the records
+    // with `==` again, in Rust, until the stack ran out.
+    let file = std::env::temp_dir().join("rocflight_list_shape.roc");
+    std::fs::write(
+        &file,
+        "app [main!] {}\n\nT :: List(U8).{\n\tis_eq : T, T -> Bool\n\tis_eq = |T.(a), T.(b)| a == b\n\n\tof : List(U8) -> T\n\tof = |u| T.(u)\n}\n\n\
+         main! = |_args| Ok({ n: T.of([1]) } == { n: T.of([1]) })\n",
+    )
+    .unwrap();
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let ran = rocflight::run::run_file(file.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(ran.inspected.expect("inspected"), "Ok(True)");
+}
+
+#[test]
+fn a_scalar_backed_nominals_is_eq_does_not_claim_a_record() {
+    // The same for a nominal over an integer: `Code.is_eq` is no candidate for a
+    // record, so the record is compared field by field.
+    let file = std::env::temp_dir().join("rocflight_scalar_shape.roc");
+    std::fs::write(
+        &file,
+        "app [main!] {}\n\nCode :: I64.{\n\tis_eq : Code, Code -> Bool\n\tis_eq = |Code.(a), Code.(b)| a == b\n\n\tof : I64 -> Code\n\tof = |c| Code.(c)\n}\n\n\
+         main! = |_args| Ok({ c: Code.of(15) } == { c: Code.of(15) })\n",
+    )
+    .unwrap();
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let ran = rocflight::run::run_file(file.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(ran.inspected.expect("inspected"), "Ok(True)");
+}
+
+#[test]
 fn a_user_defined_operator_does_not_capture_the_primitives() {
     // A type defining `plus` must not hijack `1 + 2`.
     let src = "Money :: { cents: I64 }.{\n    plus : Money, Money -> Money\n    plus = |a, b| { cents: a.cents + b.cents }\n}\n1 + 2";
@@ -1711,6 +1777,49 @@ fn a_nested_nominals_methods_see_the_enclosing_blocks_members() {
         .expect("an app runs");
     let _ = std::fs::remove_file(&file);
     assert_eq!(ran.inspected.expect("inspected"), "Ok(True)");
+}
+
+#[test]
+fn a_nominal_unwrapped_by_a_pattern_is_its_backing_type() {
+    // `|Units.(a), Units.(b)| a == b` compares the two LISTS: `a` is a `List(U8)`, so
+    // its `==` is the list's, not `Units.is_eq` again. Typed as the nominal, the
+    // comparison called itself until the recursion limit. The whole pipeline, since
+    // the checker's operand types reach the compiler only through `run_file`.
+    let file = std::env::temp_dir().join("rocflight_nominal_unwrap.roc");
+    std::fs::write(
+        &file,
+        "app [main!] {}\n\nUnits :: List(U8).{\n\tis_eq : Units, Units -> Bool\n\tis_eq = |Units.(a), Units.(b)| a == b\n}\n\n\
+         main! = |_args| Ok(Units.([1, 2]) == Units.([1, 2]))\n",
+    )
+    .unwrap();
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let ran = rocflight::run::run_file(file.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(ran.inspected.expect("inspected"), "Ok(True)");
+}
+
+#[test]
+fn a_string_pattern_matches_a_nominal_through_from_quote() {
+    // `"zero"` against a `Text` is `Text.from_quote("zero")`, compared by `is_eq`.
+    // Inside an annotated function the match is checked, not synthesised, and must
+    // still hand its scrutinee's type to the compiler.
+    let file = std::env::temp_dir().join("rocflight_quote_pattern.roc");
+    std::fs::write(
+        &file,
+        "app [main!] {}\n\nText :: List(U8).{\n\tfrom_quote : Str -> Try(Text, [BadQuotedBytes(Str)])\n\tfrom_quote = |s| Ok(Text.(Str.to_utf8(s)))\n\n\
+         \tis_eq : Text, Text -> Bool\n\tis_eq = |Text.(a), Text.(b)| a == b\n}\n\n\
+         name : Text -> Str\nname = |t| match t {\n\t\"zero\" => \"matched\"\n\t_ => \"fell through\"\n}\n\n\
+         main! = |_args| Ok(name(\"zero\"))\n",
+    )
+    .unwrap();
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let ran = rocflight::run::run_file(file.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(ran.inspected.expect("inspected"), "Ok(\"matched\")");
 }
 
 // --- type-level features --------------------------------------------------
