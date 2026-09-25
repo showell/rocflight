@@ -783,16 +783,15 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// Mark the one read of `name` across `scope` as a move, when there is exactly
-    /// one and it is not inside a lambda or a loop there (either can run it again).
+    /// Mark each last use of `name` across `scope` (evaluated in that order) as a
+    /// move: a read after which no read of it can run (`last_uses`).
     fn mark_single_read(&self, scope: &[&Expr], name: &str) {
-        let mut reads = Vec::new();
-        for e in scope {
-            reads_of(e, name, false, &mut reads);
+        let mut marks = Vec::new();
+        let mut later = false;
+        for e in scope.iter().rev() {
+            later |= last_uses(e, name, later, &mut marks);
         }
-        if let [(id, true)] = reads.as_slice() {
-            self.moving.borrow_mut().insert(*id);
-        }
+        self.moving.borrow_mut().extend(marks);
     }
 
     /// An operand that is only read, as a comparison reads its operands: a local or
@@ -945,11 +944,25 @@ impl<'a> Cx<'a> {
             _ => false,
         };
         let xs: Result<Vec<String>, String> = args.iter().map(|a| if runtime { self.builtin_arg(a, scope) } else { self.expr(a, scope) }).collect();
-        let xs = xs?;
+        let mut xs = xs?;
+        // A variable handed over (its last use) is read after every other argument
+        // is evaluated, as Roc evaluates them all before the call: the others go
+        // into `let`s first, in order.
+        let moves_one = args.iter().any(|a| matches!(a, Expr::Ident(_, id) if self.moving.borrow().contains(id)));
+        let mut lets = String::new();
+        if moves_one {
+            for (k, a) in args.iter().enumerate() {
+                if !matches!(a, Expr::Ident(..)) {
+                    lets.push_str(&format!("let __a{} = {}; ", k, xs[k]));
+                    xs[k] = format!("__a{}", k);
+                }
+            }
+        }
+        let wrap = |call: String| if lets.is_empty() { call } else { format!("{{ {}{} }}", lets, call) };
         let callee = match func {
             Expr::Ident(n, _) if !scope.local(n) => {
                 if *n == "echo!" {
-                    return Ok(format!("echo({})", xs.join(", ")));
+                    return Ok(wrap(format!("echo({})", xs.join(", "))));
                 }
                 match self.resolve(n, scope) {
                     Some(top) if self.tops[&top] => format!("{}{}", sanitize(&top), self.turbofish(&top, func, scope)?),
@@ -961,15 +974,15 @@ impl<'a> Cx<'a> {
                 Some(top) if self.tops[&top] => format!("{}{}", sanitize(&top), self.turbofish(&top, func, scope)?),
                 Some(top) => format!("({})", self.top_value(&top, func, scope)?),
                 // The platform's one effect: a line out, its newline written for it.
-                None if *module == "Echo" && *name == "line!" => return Ok(format!("echo_line({})", xs.join(", "))),
-                None if *module == "Try" && *name == "is_ok" && xs.len() == 1 => return Ok(format!("({}).is_ok()", xs[0])),
-                None if *module == "Try" && *name == "map_ok" && xs.len() == 2 => return Ok(format!("({}).map(|__x| (*{})(__x))", xs[0], xs[1])),
+                None if *module == "Echo" && *name == "line!" => return Ok(wrap(format!("echo_line({})", xs.join(", ")))),
+                None if *module == "Try" && *name == "is_ok" && xs.len() == 1 => return Ok(wrap(format!("({}).is_ok()", xs[0]))),
+                None if *module == "Try" && *name == "map_ok" && xs.len() == 2 => return Ok(wrap(format!("({}).map(|__x| (*{})(__x))", xs[0], xs[1]))),
                 None if BUILTIN_MODULES.contains(module) => {
                     if matches!(*module, "List" | "Str") {
                         // A builtin's `Err` is `()` in runtime.rs; the program's is the
                         // tag it names, in the program's own union.
                         if let Some(tag) = builtin_err_tag(module, name) {
-                            return Ok(format!("{}__{}({}){}", module, name, xs.join(", "), self.err_as(e, tag)?));
+                            return Ok(wrap(format!("{}__{}({}){}", module, name, xs.join(", "), self.err_as(e, tag)?)));
                         }
                         format!("{}__{}", module, name)
                     } else {
@@ -981,7 +994,7 @@ impl<'a> Cx<'a> {
             other => format!("(*{})", self.expr(other, scope)?),
         };
         let _ = e;
-        Ok(format!("{}({})", callee, xs.join(", ")))
+        Ok(wrap(format!("{}({})", callee, xs.join(", "))))
     }
 
     /// An argument to a runtime builtin: a function is passed as `&dyn Fn`, a lambda
@@ -1252,7 +1265,13 @@ impl<'a> Cx<'a> {
     fn matching(&self, scrutinee: &Expr, arms: &[MatchArm], whole: &Option<Type>, scope: &Scope) -> Result<String, String> {
         // `List.set(x, i, v) ?? x`: one call, so `x` is read once and can be moved.
         if let Some((_, a)) = set_or_same_parts(scrutinee, arms) {
-            return Ok(format!("List__set_or_same({}, {}, {})", self.expr(&a[0], scope)?, self.expr(&a[1], scope)?, self.expr(&a[2], scope)?));
+            // As `call` does: a list handed over is read after the other arguments.
+            let (l, i, x) = (self.expr(&a[0], scope)?, self.expr(&a[1], scope)?, self.expr(&a[2], scope)?);
+            return Ok(if matches!(&a[0], Expr::Ident(_, id) if self.moving.borrow().contains(id)) {
+                format!("{{ let __a1 = {}; let __a2 = {}; List__set_or_same({}, __a1, __a2) }}", i, x, l)
+            } else {
+                format!("List__set_or_same({}, {}, {})", l, i, x)
+            });
         }
         let st = self.ty_of(scrutinee)?;
         // The patterns only read the value, by reference: a local or a field of one is
@@ -1568,48 +1587,149 @@ fn peel_all(t: &Type) -> Option<(Vec<Type>, Type)> {
 }
 
 /// Every bare name an expression reads, for a closure's captures.
-/// The reads of `name` in `e`, each with whether it may be moved: not inside a
-/// lambda or a loop (a `while`'s condition and body, a `for`'s body), which can
-/// run it more than once. A `List.set(x, ..) ?? x`'s second `x` is not a read:
-/// it is written as one call (`set_or_same`).
-fn reads_of(e: &Expr, name: &str, repeated: bool, out: &mut Vec<(NodeId, bool)>) {
+/// Walk `e` backwards from its end, marking each read of `name` that no later read
+/// of it can follow: with `later` false, nothing after `e` reads it. Answers whether
+/// `e` reads it at all. A read inside a lambda or a loop is never marked: either
+/// can run it again. Where the evaluation order of `e`'s parts is not fixed here
+/// (a record, a list, an operator's operands), a name read in two parts is marked
+/// in neither. A call evaluates every argument before the call, as Roc does, and
+/// `call` reads a moved variable argument last, after the others.
+fn last_uses(e: &Expr, name: &str, later: bool, marks: &mut Vec<NodeId>) -> bool {
     match e {
         Expr::Ident(n, id) => {
-            if *n == name {
-                out.push((*id, !repeated));
+            if *n == name && !later {
+                marks.push(*id);
             }
+            *n == name
         }
-        Expr::Lambda { body, .. } => reads_of(body, name, true, out),
-        Expr::While { condition, body, .. } => {
-            reads_of(condition, name, true, out);
-            reads_of(body, name, true, out);
+        Expr::Lambda { params, body, .. } => !params.contains(&name) && mentions(body, name),
+        Expr::While { .. } => mentions(e, name),
+        Expr::For { name: bound, iterable, body, .. } => {
+            let in_body = *bound != name && mentions(body, name);
+            last_uses(iterable, name, later || in_body, marks) || in_body
         }
-        Expr::For { iterable, body, .. } => {
-            reads_of(iterable, name, repeated, out);
-            reads_of(body, name, true, out);
+        Expr::Let { name: bound, value, body, .. } | Expr::VarDecl { name: bound, value, body, .. } => {
+            let in_body = *bound != name && last_uses(body, name, later, marks);
+            last_uses(value, name, later || in_body, marks) || in_body
         }
-        _ => {
-            if let Some((_, scrutinee_args)) = set_or_same(e) {
-                for a in scrutinee_args {
-                    reads_of(a, name, repeated, out);
+        // After `$x = v`, reads of `$x` read the new value: the old one's last use
+        // is in `v`.
+        Expr::Assign { name: bound, value, body, .. } => {
+            let in_body = last_uses(body, name, later, marks);
+            let value_later = if *bound == name { false } else { later || in_body };
+            last_uses(value, name, value_later, marks) || in_body
+        }
+        Expr::If { condition, then_branch, otherwise, .. } => {
+            let t = last_uses(then_branch, name, later, marks);
+            let o = last_uses(otherwise, name, later, marks);
+            last_uses(condition, name, later || t || o, marks) || t || o
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            if let Some((_, args)) = set_or_same_parts(scrutinee, arms) {
+                return call_last_uses(args, name, later, marks);
+            }
+            // Arms from the last: a guard that fails goes on to the arms after it.
+            let mut after = false;
+            for arm in arms.iter().rev() {
+                let mut bound = Vec::new();
+                pattern_binds(&arm.patterns, &mut bound);
+                if bound.contains(&name) {
+                    continue;
                 }
-                return;
+                let in_body = last_uses(&arm.body, name, later, marks);
+                let in_guard = match &arm.guard {
+                    Some(g) => last_uses(g, name, later || in_body || after, marks),
+                    None => false,
+                };
+                after |= in_body || in_guard;
             }
-            for c in e.children() {
-                reads_of(c, name, repeated, out);
+            last_uses(scrutinee, name, later || after, marks) || after
+        }
+        Expr::Call { func, args, .. } => {
+            let in_args = call_last_uses(args, name, later, marks);
+            last_uses(func, name, later || in_args, marks) || in_args
+        }
+        Expr::Dispatch { receiver, args, .. } => {
+            let all: Vec<Expr> = std::iter::once((**receiver).clone()).chain(args.iter().cloned()).collect();
+            // Marks are by node id, so the clones stand for the originals.
+            call_last_uses(&all, name, later, marks)
+        }
+        other => {
+            let parts: Vec<&Expr> = other.children().into_iter().filter(|c| mentions(c, name)).collect();
+            match parts.as_slice() {
+                [] => false,
+                [one] => last_uses(one, name, later, marks),
+                _ => true,
             }
         }
     }
 }
 
+/// A call's arguments: the ones that are not a bare variable first, left to right,
+/// then the bare variables, which `call` reads last. A variable passed twice is
+/// marked in neither place.
+fn call_last_uses(args: &[Expr], name: &str, later: bool, marks: &mut Vec<NodeId>) -> bool {
+    let bare: Vec<&Expr> = args.iter().filter(|a| matches!(a, Expr::Ident(n, _) if *n == name)).collect();
+    // A lambda passed straight to the call may be a borrowed closure the callee
+    // runs while it works: its reads happen during the call, so the variable
+    // cannot also be handed over to it.
+    let read_during = args.iter().any(|a| matches!(a, Expr::Lambda { .. }) && mentions(a, name));
+    let mut seen = false;
+    match bare.as_slice() {
+        [] => {}
+        [one] => seen = last_uses(one, name, later || read_during, marks),
+        _ => seen = true,
+    }
+    let mut after = later || seen;
+    for a in args.iter().rev().filter(|a| !matches!(a, Expr::Ident(..))) {
+        if last_uses(a, name, after, marks) {
+            after = true;
+            seen = true;
+        }
+    }
+    seen
+}
+
+/// Does `e` read `name` anywhere, lambdas and loops included? Through
+/// `Expr::children`, which is exhaustive, so no kind of expression hides a read.
+fn mentions(e: &Expr, name: &str) -> bool {
+    match e {
+        Expr::Ident(n, _) => *n == name,
+        other => other.children().into_iter().any(|c| mentions(c, name)),
+    }
+}
+
+/// The names a match arm's patterns bind.
+fn pattern_binds(patterns: &[Pattern], out: &mut Vec<&'static str>) {
+    fn one(p: &Pattern, out: &mut Vec<&'static str>) {
+        match p {
+            Pattern::Binding(n) => out.push(n),
+            Pattern::As { name, inner } => {
+                out.push(name);
+                one(inner, out);
+            }
+            Pattern::Nominal { inner, .. } => one(inner, out),
+            Pattern::Tag { args, .. } => args.iter().for_each(|p| one(p, out)),
+            Pattern::Tuple(items) => items.iter().for_each(|p| one(p, out)),
+            Pattern::Record { fields, rest } => {
+                out.extend(rest.iter().copied());
+                fields.iter().for_each(|(_, p)| one(p, out));
+            }
+            Pattern::List { before, rest, after } => {
+                if let Some(Some(n)) = rest {
+                    out.push(n);
+                }
+                before.iter().chain(after.iter()).for_each(|p| one(p, out));
+            }
+            _ => {}
+        }
+    }
+    patterns.iter().for_each(|p| one(p, out));
+}
+
 /// `match List.set(x, i, v) { Ok(l) => l, Err(_) => x }`, which is how
 /// `List.set(x, i, v) ?? x` arrives: set if in range, else the list unchanged.
 /// Answers `x` and the three arguments.
-fn set_or_same(e: &Expr) -> Option<(&'static str, &[Expr])> {
-    let Expr::Match { scrutinee, arms, .. } = e else { return None };
-    set_or_same_parts(scrutinee, arms)
-}
-
 fn set_or_same_parts<'e>(scrutinee: &'e Expr, arms: &'e [MatchArm]) -> Option<(&'static str, &'e [Expr])> {
     let Expr::Call { func, args, .. } = scrutinee else { return None };
     if !matches!(&**func, Expr::Qualified { module: "List", name: "set", .. }) || args.len() != 3 {
