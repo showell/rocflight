@@ -109,10 +109,10 @@ struct Cx<'a> {
     /// the annotation, so a lambda inside `set_insert : List(a), a -> ..` has
     /// the copy's variable, not `a`.
     renames: RefCell<HashMap<u32, Type>>,
-    /// The one use of a variable that hands it over rather than cloning it: `$x`
-    /// in `$x = List.append($x, y)`. The list then has one owner, and is changed
-    /// in place instead of copied, as roc does.
-    moving: RefCell<Option<NodeId>>,
+    /// Reads that hand their variable over rather than cloning it: each is the
+    /// variable's last use (`single_read`). A list read that way has one owner and
+    /// is changed in place instead of copied, as roc does.
+    moving: RefCell<std::collections::HashSet<NodeId>>,
 }
 
 fn sanitize(name: &str) -> String {
@@ -229,7 +229,7 @@ impl<'a> Cx<'a> {
             wanted: RefCell::new(BTreeSet::new()),
             loops: RefCell::new(0),
             renames: RefCell::new(HashMap::new()),
-            moving: RefCell::new(None),
+            moving: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -525,6 +525,7 @@ impl<'a> Cx<'a> {
                     let t = if name == "main!" { "List<String>".to_string() } else { self.ty(t)? };
                     args.push(format!("{}: {}", sanitize(p), t));
                     scope.locals.push(p.to_string());
+                    self.mark_single_read(&[body], p);
                 }
                 // `|_args|` on `main!` is the platform's; it is unused here.
                 let result_ty = self.ty(&result)?;
@@ -652,6 +653,7 @@ impl<'a> Cx<'a> {
                 }
                 let (label, mut inner) = self.loop_scope(scope);
                 inner.locals.push(name.to_string());
+                self.mark_single_read(&[body], name);
                 format!(
                     "{{ let __it = {}; {}: for {} in __it.items().iter().cloned() {{ {}; }} }}",
                     self.expr(iterable, scope)?,
@@ -781,6 +783,18 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// Mark the one read of `name` across `scope` as a move, when there is exactly
+    /// one and it is not inside a lambda or a loop there (either can run it again).
+    fn mark_single_read(&self, scope: &[&Expr], name: &str) {
+        let mut reads = Vec::new();
+        for e in scope {
+            reads_of(e, name, false, &mut reads);
+        }
+        if let [(id, true)] = reads.as_slice() {
+            self.moving.borrow_mut().insert(*id);
+        }
+    }
+
     /// An operand that is only read, as a comparison reads its operands: a local or
     /// a field of one in place, and with `literal`, a plain string literal as a
     /// `&str`, which a `String` compares equal to without being one.
@@ -798,7 +812,7 @@ impl<'a> Cx<'a> {
 
     fn read_local(&self, n: &str, e: &Expr) -> Result<String, String> {
         let t = self.ty_of(e)?;
-        let moved = *self.moving.borrow() == Some(e.id());
+        let moved = self.moving.borrow().contains(&e.id());
         Ok(if copy_type(&t) || moved { sanitize(n) } else { format!("{}.clone()", sanitize(n)) })
     }
 
@@ -825,6 +839,7 @@ impl<'a> Cx<'a> {
                     } else {
                         out.push_str(&format!("    let {} = {};\n", sanitize(name), indent(&v, 4)));
                         scope.locals.push(name.to_string());
+                        self.mark_single_read(&[body], name);
                     }
                     cursor = body;
                 }
@@ -835,10 +850,10 @@ impl<'a> Cx<'a> {
                     cursor = body;
                 }
                 Expr::Assign { name, value, body, .. } => {
-                    *self.moving.borrow_mut() = self_update(name, value);
-                    let v = self.expr(value, &scope);
-                    *self.moving.borrow_mut() = None;
-                    let v = v?;
+                    // The assignment replaces the variable, so its one read in the
+                    // value is its last: `$x = List.append($x, y)`.
+                    self.mark_single_read(&[value], name);
+                    let v = self.expr(value, &scope)?;
                     out.push_str(&format!("    {} = {};\n", sanitize(name), indent(&v, 4)));
                     cursor = body;
                 }
@@ -1218,6 +1233,7 @@ impl<'a> Cx<'a> {
         for (p, pt) in params.iter().zip(&ps) {
             typed.push(format!("{}: {}", sanitize(p), erase_free(&self.ty(pt)?, &scope.generics)));
             inner.locals.push(p.to_string());
+            self.mark_single_read(&[body], p);
         }
         let b = self.expr(body, &inner)?;
         if borrowed {
@@ -1234,6 +1250,10 @@ impl<'a> Cx<'a> {
     // ---- matching ----
 
     fn matching(&self, scrutinee: &Expr, arms: &[MatchArm], whole: &Option<Type>, scope: &Scope) -> Result<String, String> {
+        // `List.set(x, i, v) ?? x`: one call, so `x` is read once and can be moved.
+        if let Some((_, a)) = set_or_same_parts(scrutinee, arms) {
+            return Ok(format!("List__set_or_same({}, {}, {})", self.expr(&a[0], scope)?, self.expr(&a[1], scope)?, self.expr(&a[2], scope)?));
+        }
         let st = self.ty_of(scrutinee)?;
         // The patterns only read the value, by reference: a local or a field of one is
         // borrowed where it is, and anything else is held in `__s` and borrowed there.
@@ -1249,6 +1269,12 @@ impl<'a> Cx<'a> {
                 let tail = {
                     let mut probe = inner.clone();
                     self.pat_names(p, &mut probe.locals);
+                    let mut bound = Vec::new();
+                    self.pat_names(p, &mut bound);
+                    let guard: Vec<&Expr> = arm.guard.iter().chain(std::iter::once(&arm.body)).collect();
+                    for b in &bound {
+                        self.mark_single_read(&guard, b);
+                    }
                     let body = self.result(&arm.body, whole, &probe)?;
                     match &arm.guard {
                         Some(g) => format!("if {} {{ break 'm ({}); }}", self.expr(g, &probe)?, body),
@@ -1542,18 +1568,67 @@ fn peel_all(t: &Type) -> Option<(Vec<Type>, Type)> {
 }
 
 /// Every bare name an expression reads, for a closure's captures.
-/// In `$x = f($x, ..)`, the `$x` passed on, when it is the value's only use of
-/// `$x`: the assignment replaces it, so nothing reads the old one again.
-fn self_update(name: &str, value: &Expr) -> Option<NodeId> {
-    let first = match value {
-        Expr::Call { args, .. } => args.first()?,
-        Expr::Dispatch { receiver, .. } => &**receiver,
+/// The reads of `name` in `e`, each with whether it may be moved: not inside a
+/// lambda or a loop (a `while`'s condition and body, a `for`'s body), which can
+/// run it more than once. A `List.set(x, ..) ?? x`'s second `x` is not a read:
+/// it is written as one call (`set_or_same`).
+fn reads_of(e: &Expr, name: &str, repeated: bool, out: &mut Vec<(NodeId, bool)>) {
+    match e {
+        Expr::Ident(n, id) => {
+            if *n == name {
+                out.push((*id, !repeated));
+            }
+        }
+        Expr::Lambda { body, .. } => reads_of(body, name, true, out),
+        Expr::While { condition, body, .. } => {
+            reads_of(condition, name, true, out);
+            reads_of(body, name, true, out);
+        }
+        Expr::For { iterable, body, .. } => {
+            reads_of(iterable, name, repeated, out);
+            reads_of(body, name, true, out);
+        }
+        _ => {
+            if let Some((_, scrutinee_args)) = set_or_same(e) {
+                for a in scrutinee_args {
+                    reads_of(a, name, repeated, out);
+                }
+                return;
+            }
+            for c in e.children() {
+                reads_of(c, name, repeated, out);
+            }
+        }
+    }
+}
+
+/// `match List.set(x, i, v) { Ok(l) => l, Err(_) => x }`, which is how
+/// `List.set(x, i, v) ?? x` arrives: set if in range, else the list unchanged.
+/// Answers `x` and the three arguments.
+fn set_or_same(e: &Expr) -> Option<(&'static str, &[Expr])> {
+    let Expr::Match { scrutinee, arms, .. } = e else { return None };
+    set_or_same_parts(scrutinee, arms)
+}
+
+fn set_or_same_parts<'e>(scrutinee: &'e Expr, arms: &'e [MatchArm]) -> Option<(&'static str, &'e [Expr])> {
+    let Expr::Call { func, args, .. } = scrutinee else { return None };
+    if !matches!(&**func, Expr::Qualified { module: "List", name: "set", .. }) || args.len() != 3 {
+        return None;
+    }
+    let Expr::Ident(x, _) = &args[0] else { return None };
+    let [ok, err] = arms else { return None };
+    let ok_binds = match ok.patterns.as_slice() {
+        [Pattern::Tag { name: "Ok", args: p }] => match p.as_slice() {
+            [Pattern::Binding(b)] => *b,
+            _ => return None,
+        },
         _ => return None,
     };
-    let Expr::Ident(n, id) = first else { return None };
-    let mut uses = 0;
-    each_ident(value, &mut |m, _| uses += (m == name) as usize);
-    (*n == name && uses == 1).then_some(*id)
+    let ok_ok = ok.guard.is_none() && matches!(&ok.body, Expr::Ident(b, _) if *b == ok_binds);
+    let err_ok = err.guard.is_none()
+        && matches!(err.patterns.as_slice(), [Pattern::Tag { name: "Err", .. }])
+        && matches!(&err.body, Expr::Ident(n, _) if n == x);
+    (ok_ok && err_ok).then_some((*x, args.as_slice()))
 }
 
 /// The names a body refers to.
