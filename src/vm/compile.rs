@@ -813,6 +813,10 @@ enum Shape {
     /// `xs.fold_try(init, f)`: a fold that stops at the first `Err` and hands it back,
     /// and wraps the accumulator in `Ok` if it reaches the end.
     FoldTry,
+    /// `List.keep_if(xs, p)` (true) or `List.drop_if(xs, p)` (false), written with
+    /// `List.`: a list of the elements the predicate answered `keep` for. Only a call
+    /// that NAMES `List` gets this; see `list_loop`.
+    Filter(bool),
 }
 
 impl Shape {
@@ -903,13 +907,217 @@ fn flatten_top<'e>(
     }
 }
 
+/// The order to initialize a top level's constants in: each after every constant it
+/// reads, directly or through the functions it calls, and otherwise in file order.
+/// roc lets a declaration read one written below it — `relative_table` above
+/// `squares` — and in file order that read found nothing: "Used before it was
+/// defined".
+///
+/// Reads through a function count every branch, taken or not, so two constants can
+/// appear to read each other when only one really does. Constants that read each
+/// other keep file order among themselves, which is what they had before; only a
+/// read that is ordered one way and not the other moves anything. Functions are not
+/// initialized, so they are not in the answer.
+fn initialization_order(bindings: &[(&'static str, &Expr)]) -> Vec<usize> {
+    let mut at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, (name, _)) in bindings.iter().enumerate() {
+        at.entry(name).or_insert(i);
+    }
+    // The bindings each one reads.
+    let direct: Vec<Vec<usize>> = bindings
+        .iter()
+        .map(|(name, value)| {
+            let owner = name.rsplit_once('.').map(|(owner, _)| owner);
+            let mut out = Vec::new();
+            free_reads(value, owner, &at, &mut Vec::new(), &mut out);
+            out
+        })
+        .collect();
+    let is_function = |i: usize| matches!(bindings[i].1, Expr::Lambda { .. });
+    // The constants each constant reads: through functions, which run when called,
+    // but not through another constant, which is ordered on its own.
+    let reads: Vec<Vec<usize>> = (0..bindings.len())
+        .map(|c| {
+            if is_function(c) {
+                return Vec::new();
+            }
+            let mut found = Vec::new();
+            let mut seen = vec![false; bindings.len()];
+            let mut stack = direct[c].clone();
+            while let Some(i) = stack.pop() {
+                if std::mem::replace(&mut seen[i], true) {
+                    continue;
+                }
+                if is_function(i) {
+                    stack.extend(direct[i].iter().copied());
+                } else {
+                    found.push(i);
+                }
+            }
+            found.sort_unstable();
+            found
+        })
+        .collect();
+    // Tarjan's strongly connected components, which come out each after every
+    // component it reads. Started in file order, with reads in file order, so where
+    // nothing is read forward the answer is file order.
+    struct Tarjan<'r> {
+        reads: &'r [Vec<usize>],
+        index: Vec<Option<usize>>,
+        low: Vec<usize>,
+        on_stack: Vec<bool>,
+        stack: Vec<usize>,
+        next: usize,
+        order: Vec<usize>,
+    }
+    impl Tarjan<'_> {
+        fn visit(&mut self, v: usize) {
+            self.index[v] = Some(self.next);
+            self.low[v] = self.next;
+            self.next += 1;
+            self.stack.push(v);
+            self.on_stack[v] = true;
+            for k in 0..self.reads[v].len() {
+                let w = self.reads[v][k];
+                match self.index[w] {
+                    None => {
+                        self.visit(w);
+                        self.low[v] = self.low[v].min(self.low[w]);
+                    }
+                    Some(wi) if self.on_stack[w] => self.low[v] = self.low[v].min(wi),
+                    Some(_) => {}
+                }
+            }
+            if Some(self.low[v]) == self.index[v] {
+                let mut component = Vec::new();
+                loop {
+                    let w = self.stack.pop().expect("v is on the stack");
+                    self.on_stack[w] = false;
+                    component.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                component.sort_unstable();
+                self.order.extend(component);
+            }
+        }
+    }
+    let n = bindings.len();
+    let mut tarjan = Tarjan {
+        reads: &reads,
+        index: vec![None; n],
+        low: vec![0; n],
+        on_stack: vec![false; n],
+        stack: Vec::new(),
+        next: 0,
+        order: Vec::new(),
+    };
+    for c in 0..n {
+        if !is_function(c) && tarjan.index[c].is_none() {
+            tarjan.visit(c);
+        }
+    }
+    tarjan.order
+}
+
+/// The bindings an expression reads, found the way the compiler resolves a name: a
+/// local first (a parameter, a `let`, a `var`, a `for` name, a pattern's), then a
+/// top-level name as written, then, inside a namespace, its member (`squares` in
+/// `Board` is `Board.squares`). A name exposed by an import is not followed.
+fn free_reads(
+    e: &Expr,
+    owner: Option<&str>,
+    at: &std::collections::HashMap<&str, usize>,
+    bound: &mut Vec<&'static str>,
+    out: &mut Vec<usize>,
+) {
+    match e {
+        Expr::Ident(n, _) => {
+            if bound.contains(n) {
+                return;
+            }
+            let member = || owner.and_then(|o| at.get(format!("{}.{}", o, n).as_str()));
+            if let Some(&i) = at.get(n).or_else(member) {
+                out.push(i);
+            }
+        }
+        Expr::Qualified { module, name, .. } => {
+            if let Some(&i) = at.get(format!("{}.{}", module, name).as_str()) {
+                out.push(i);
+            }
+        }
+        Expr::Lambda { params, body, .. } => {
+            let mark = bound.len();
+            bound.extend(params.iter().copied());
+            free_reads(body, owner, at, bound, out);
+            bound.truncate(mark);
+        }
+        Expr::Let { name, value, body, .. } | Expr::VarDecl { name, value, body, .. } => {
+            free_reads(value, owner, at, bound, out);
+            bound.push(name);
+            free_reads(body, owner, at, bound, out);
+            bound.pop();
+        }
+        Expr::For { name, iterable, body, .. } => {
+            free_reads(iterable, owner, at, bound, out);
+            bound.push(name);
+            free_reads(body, owner, at, bound, out);
+            bound.pop();
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            free_reads(scrutinee, owner, at, bound, out);
+            for arm in arms {
+                let mark = bound.len();
+                for pattern in &arm.patterns {
+                    pattern_names(pattern, bound);
+                }
+                if let Some(guard) = &arm.guard {
+                    free_reads(guard, owner, at, bound, out);
+                }
+                free_reads(&arm.body, owner, at, bound, out);
+                bound.truncate(mark);
+            }
+        }
+        other => {
+            for child in other.children() {
+                free_reads(child, owner, at, bound, out);
+            }
+        }
+    }
+}
+
+/// The names a pattern binds.
+fn pattern_names(pattern: &Pattern, out: &mut Vec<&'static str>) {
+    match pattern {
+        Pattern::Binding(n) => out.push(n),
+        Pattern::As { name, inner } => {
+            out.push(name);
+            pattern_names(inner, out);
+        }
+        Pattern::Tag { args, .. } => args.iter().for_each(|p| pattern_names(p, out)),
+        Pattern::Tuple(items) => items.iter().for_each(|p| pattern_names(p, out)),
+        Pattern::Record { fields, rest } => {
+            out.extend(rest.iter().copied());
+            fields.iter().for_each(|(_, p)| pattern_names(p, out));
+        }
+        Pattern::List { before, rest, after } => {
+            if let Some(Some(n)) = rest {
+                out.push(n);
+            }
+            before.iter().chain(after.iter()).for_each(|p| pattern_names(p, out));
+        }
+        _ => {}
+    }
+}
+
 impl<'u> Compiler<'u> {
     /// One top-level chunk: bind each global in order, then the statements, then the
     /// trailing expression if this is the program's own rather than a group's.
     ///
     /// Two callers, which is why it is a method: the precompiled group gets one of
-    /// these and so does the program that loads it. Order matters within each — a
-    /// global that reads one declared below it gets "Used before it was defined".
+    /// these and so does the program that loads it. Within each, constants are
+    /// initialized in `initialization_order`.
     fn top_level(
         &mut self,
         unit: &Unit,
@@ -927,10 +1135,8 @@ impl<'u> Compiler<'u> {
                 self.st().next_reg = reg;
             }
         }
-        for (name, value) in bindings {
-            if matches!(value, Expr::Lambda { .. }) {
-                continue;
-            }
+        for i in initialization_order(bindings) {
+            let (name, value) = bindings[i];
             let save = self.st().next_reg;
             self.global_owner = name.rsplit_once('.').map(|(owner, _)| owner);
             let src = self.expr(value)?;
@@ -1668,26 +1874,32 @@ impl<'u> Compiler<'u> {
         locals.truncate(keep);
     }
 
-    /// `xs.fold(init, f)`, `xs.map(f)`, `xs.keep_if(p)` and friends as a loop in THIS
-    /// frame.
+    /// `xs.fold(init, f)`, `xs.map(f)`, `List.keep_if(xs, p)` and friends as a loop in
+    /// THIS frame.
     ///
     /// The builtin versions re-enter the VM from Rust once per element — a fresh
     /// machine, an argument `Vec` and a Rust frame each time — which was the whole of
     /// `iter_range`'s 199ms. Compiled, each element is an `IterNext`, a move or two
     /// and an ordinary `Call` on the same frame stack.
     ///
-    /// Only for a receiver the checker proved is a list (or an iterator over one), and
-    /// only when no roc-defined method of that name is loaded, which the caller checks:
-    /// anything else still dispatches at run time. `None` when the method is not one
-    /// of these two.
+    /// Only when no roc-defined method of that name is loaded, which the caller checks:
+    /// anything else still dispatches at run time. `names_list` is whether the call was
+    /// written `List.name(..)` (a pipe into `List.name` is that too) rather than as a
+    /// method. `None` when the method is not one of these.
     fn list_loop(
         &mut self,
         method: &str,
         receiver: &Expr,
         args: &[Expr],
         module: &str,
+        names_list: bool,
     ) -> Result<Option<Reg>, String> {
         let shape = match (method, args.len()) {
+            // Written `List.keep_if(xs, p)`, the call says which `keep_if` it is, and roc
+            // types it `List(a) -> List(a)`: never the lazy `Iter.keep_if`. See below for
+            // why method syntax cannot say.
+            ("keep_if", 1) if names_list => Shape::Filter(true),
+            ("drop_if", 1) if names_list => Shape::Filter(false),
             ("fold", 2) => Shape::Fold,
             ("map", 1) => Shape::Map,
             // `keep` vs `drop`, and `any` vs `all`, differ only in which answer from the
@@ -1703,14 +1915,15 @@ impl<'u> Compiler<'u> {
             ("fold_try", 2) => Shape::FoldTry,
             _ => return Ok(None),
         };
-        // Every shape above answers a plain VALUE — a list of results, an accumulator, a
-        // `Bool`, a count, a `Try`. That is what makes them safe to compile whatever the
-        // checker thinks the receiver's module is.
+        // Every shape above but `Filter` answers a plain VALUE — a list of results, an
+        // accumulator, a `Bool`, a count, a `Try`. That is what makes them safe to compile
+        // whatever the checker thinks the receiver's module is. `Filter` is safe because
+        // the call named `List`.
         //
-        // `keep_if`/`drop_if` are NOT here, and were tried: `Builtin.roc` declares both
-        // `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, the second lazy, so a
-        // compiled loop may only stand in for the List one. There is no sound way to tell
-        // them apart here. `dispatch_modules` is not it — the checker calls
+        // `keep_if`/`drop_if` in METHOD syntax are not here, and were tried: `Builtin.roc`
+        // declares both `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, the
+        // second lazy, so a compiled loop may only stand in for the List one. For a method
+        // call there is no sound way to tell them apart here. `dispatch_modules` is not it — the checker calls
         // `(1..=5).iter()` a `List`, so lowering on that made
         // `Str.inspect((1..=5).iter().keep_if(p))` answer `[4.0, 5.0]` where roc answers
         // `<opaque>`; and nothing syntactic is it either, because `xs = (1..=n).iter()`
@@ -1725,7 +1938,7 @@ impl<'u> Compiler<'u> {
         // is `False` and `all` of nothing is `True`, nothing matches nothing, and a count
         // of nothing is zero. An element that settles it overwrites this and leaves.
         match shape {
-            Shape::Map => self.emit(Op::MakeList { dst, base: dst, n: 0 }),
+            Shape::Map | Shape::Filter(_) => self.emit(Op::MakeList { dst, base: dst, n: 0 }),
             Shape::Decide(want) => self.constant(dst, Value::Bool(!want))?,
             Shape::Count => self.constant(dst, Value::Int(0))?,
             Shape::Find | Shape::FindIndex(_) => self.constant(
@@ -1899,6 +2112,16 @@ impl<'u> Compiler<'u> {
                     out
                 };
                 self.emit(Op::ListPush { list: dst, src });
+                Ok(None)
+            }
+            // The element itself, when the predicate answers `keep`; anything else goes
+            // round again. A copy, because `ListPush` takes its element out of the
+            // register and the loop still holds `item`.
+            Shape::Filter(keep) => {
+                self.emit(Op::TestBool { cond: out, want: keep, to: top });
+                let copy = self.alloc()?;
+                self.emit(Op::Move { dst: copy, src: item });
+                self.emit(Op::ListPush { list: dst, src: copy });
                 Ok(None)
             }
             // The first element the predicate agrees with settles it: write the answer
@@ -2981,7 +3204,7 @@ impl<'u> Compiler<'u> {
                 // written first, and compiles to the same loop.
                 if *module == "List" {
                     if let Some((receiver, rest)) = args.split_first() {
-                        if let Some(dst) = self.list_loop(name, receiver, rest, module)? {
+                        if let Some(dst) = self.list_loop(name, receiver, rest, module, true)? {
                             return Ok(Some(dst));
                         }
                     }
@@ -3161,7 +3384,7 @@ impl<'u> Compiler<'u> {
             .copied()
             .filter(|m| candidates.is_empty() && matches!(*m, "List" | "Iter"))
         {
-            if let Some(dst) = self.list_loop(method, receiver, args, module)? {
+            if let Some(dst) = self.list_loop(method, receiver, args, module, false)? {
                 return Ok(dst);
             }
         }

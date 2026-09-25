@@ -1890,3 +1890,67 @@ fn an_imported_modules_expects_do_not_run_with_the_app() {
     );
     assert_eq!(out, "Ok(2)");
 }
+
+#[test]
+fn a_call_that_names_list_keep_if_answers_a_list() {
+    // `List.keep_if(xs, p)` cannot be the lazy `Iter.keep_if`, yet every such call
+    // answered an iterator (`<opaque>`), even on a list literal, and `List.prepend` of
+    // one failed with "needs a List". Inline and named predicates, a pipe, an empty list.
+    let src = "Bag :: [].{\n\tItems(a) : List(a)\n\n\tinsert : Bag.Items(a), a -> Bag.Items(a) where [a.is_eq : a, a -> Bool]\n\tinsert = |set, item| List.prepend(List.drop_if(set, |other| other == item), item)\n}\n\nbig : I64 -> Bool\nbig = |n| n > 1\n\nStr.inspect((Bag.insert([1.I64, 2, 3], 2), List.keep_if([1.I64, 2, 3], big), [1.I64, 2, 3] |> List.drop_if(|n| n > 1), List.keep_if([], big)))";
+    assert_eq!(as_str(src), "([2, 1, 3], [2, 3], [1], [])");
+}
+
+
+#[test]
+fn list_join_map_find_last_and_map_with_index() {
+    let src = "Str.inspect((List.join_map([1.I64, 2], |n| [n, n * 10]), List.find_last([1.I64, 2, 3], |n| n < 3), List.find_last([1.I64], |n| n > 5), List.map_with_index([\"a\", \"b\"], |s, i| \"${s}${U64.to_str(i)}\")))";
+    assert_eq!(as_str(src), "([1, 10, 2, 20], Ok(2), Err(NotFound), [\"a0\", \"b1\"])");
+}
+
+#[test]
+fn a_try_function_called_through_its_module() {
+    // `Try.map_ok(t, f)` is `t.map_ok(f)` with the receiver written first; only the
+    // method form was known ("Unknown function Try.map_ok").
+    let src = "t : Try(I64, [Odd])\nt = Ok(2)\ne : Try(I64, [Odd])\ne = Err(Odd)\nStr.inspect((Try.map_ok(t, |n| n + 1), Try.map_ok(e, |n| n + 1), Try.is_ok(t), Try.map_err(e, |_| Bad)))";
+    assert_eq!(as_str(src), "(Ok(3), Err(Odd), True, Err(Bad))");
+}
+
+#[test]
+fn list_starts_with_and_ends_with() {
+    // Builtin.roc declares both; there was no native implementation ("Unknown
+    // function List.starts_with").
+    let src = "Str.inspect((List.starts_with([1.I64, 2, 3], [1, 2]), List.starts_with([1.I64, 2], [2]), List.ends_with([1.I64, 2, 3], [2, 3]), List.ends_with([1.I64], [1, 1]), List.starts_with([1.I64], [])))";
+    assert_eq!(as_str(src), "(True, False, True, False, True)");
+}
+
+#[test]
+fn the_new_list_functions_as_methods_and_on_empty_lists() {
+    let src = "Str.inspect(([1.I64, 2].join_map(|n| [n, n]), [\"x\"].map_with_index(|s, i| (s, i)), List.find_last([], |n| n > 1.I64), List.join_map([], |n| [n, 1.I64]), List.ends_with([1.I64], []), Try.ok_or(Err(Odd), 7.I64), Try.ok_or(Ok(1.I64), 7)))";
+    assert_eq!(as_str(src), "([1, 1, 2, 2], [(\"x\", 0)], Err(NotFound), [], True, 7, 1)");
+}
+
+
+#[test]
+fn a_constant_may_read_one_declared_below_it() {
+    // roc orders top-level constants by what they read; in file order `table` found
+    // `squares` undefined ("Used before it was defined"). `squares` itself reads
+    // `count` only through a function, `upto`.
+    let src = "Board :: [].{\n\ttable : List(U64)\n\ttable = List.map(squares, |s| s * 10)\n\n\tsquares : List(U64)\n\tsquares = upto(count)\n\n\tupto : U64 -> List(U64)\n\tupto = |n| List.repeat(1, n)\n\n\tcount : U64\n\tcount = 3\n}\n\ntotal = List.sum(Board.table) + later\n\nlater : U64\nlater = 1\n\nStr.inspect(total)";
+    assert_eq!(as_str(src), "31");
+}
+
+#[test]
+fn a_name_a_lambda_binds_is_not_a_read_of_the_constant() {
+    // `|b| b + 1` is the lambda's own `b`, not the constant below; counted as a read,
+    // it made `a` and `b` read each other and `b` ran first.
+    let src = "xs = [1.I64, 2]\n\na = List.map(xs, |b| b + 1)\n\nb = List.len(a)\n\nStr.inspect((a, b))";
+    assert_eq!(as_str(src), "([2, 3], 2)");
+}
+
+#[test]
+fn constants_that_seem_to_read_each_other_keep_file_order() {
+    // `f` reads `b` only on a branch `a`'s call never takes, so `a` and `b` appear to
+    // read each other. They keep the order they were written in, which works.
+    let src = "a = f(0)\n\nf = |n| if n > 0 { b } else { 1.I64 }\n\nb : I64\nb = a + 1\n\nStr.inspect((a, b))";
+    assert_eq!(as_str(src), "(1, 2)");
+}

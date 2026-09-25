@@ -99,7 +99,7 @@ fn a_real_platform_root_is_read() {
         eprintln!("skipped: run `roc check` on tests/roc/19_platform/basic_cli.roc once");
         return;
     }
-    let platform = real::load("cli", CLI).expect("should load");
+    let platform = real::load("cli", CLI, std::path::Path::new(".")).expect("should load");
 
     assert!(platform.exposes_module("Stdout"), "basic-cli exposes Stdout");
     assert!(platform.exposes.len() > 10, "exposes many modules");
@@ -116,7 +116,7 @@ fn an_exposed_modules_members_are_read_with_their_signatures() {
     if !cached() {
         return;
     }
-    let platform = real::load("cli", CLI).expect("should load");
+    let platform = real::load("cli", CLI, std::path::Path::new(".")).expect("should load");
     let members = platform.read_module("Stdout").expect("Stdout is exposed");
 
     let line = members.iter().find(|m| m.name == "line!").expect("line! is declared");
@@ -133,7 +133,7 @@ fn a_private_helper_is_not_a_member() {
         return;
     }
     // Stdout.roc closes its method block and then defines `widen_stdout_err`.
-    let platform = real::load("cli", CLI).expect("should load");
+    let platform = real::load("cli", CLI, std::path::Path::new(".")).expect("should load");
     let members = platform.read_module("Stdout").expect("Stdout is exposed");
     assert!(
         !members.iter().any(|m| m.name == "widen_stdout_err"),
@@ -147,7 +147,7 @@ fn importing_an_unexposed_module_names_what_is_available() {
     if !cached() {
         return;
     }
-    let platform = real::load("cli", CLI).expect("should load");
+    let platform = real::load("cli", CLI, std::path::Path::new(".")).expect("should load");
     let err = platform.read_module("Nope").expect_err("Nope is not exposed");
     assert!(err.contains("does not expose"), "got {}", err);
     assert!(err.contains("Stdout"), "the message should list what IS exposed: {}", err);
@@ -160,6 +160,7 @@ fn an_unfetched_platform_says_how_to_fetch_it() {
     let err = real::load(
         "cli",
         "https://github.com/roc-lang/basic-cli/releases/download/9.9.9/NOTFETCHED.tar.zst",
+        std::path::Path::new("."),
     )
     .expect_err("not cached");
     assert!(err.contains("roc check"), "the error should name the fix: {}", err);
@@ -169,7 +170,7 @@ fn an_unfetched_platform_says_how_to_fetch_it() {
 fn an_import_naming_no_declared_dependency_is_rejected() {
     let deps = vec![("cli".to_string(), CLI.to_string(), true)];
     let imports = vec![("other".to_string(), "Thing".to_string())];
-    let err = real::verify_app(&deps, &imports).expect_err("`other` was never declared");
+    let err = real::verify_app(&deps, &imports, std::path::Path::new(".")).expect_err("`other` was never declared");
     assert!(err.contains("no declared dependency"), "got {}", err);
 }
 
@@ -177,7 +178,7 @@ fn an_import_naming_no_declared_dependency_is_rejected() {
 fn a_compiler_pin_is_skipped_rather_than_fetched() {
     // `roc: "nightly-..."` must not be treated as a platform to load.
     let deps = vec![("roc".to_string(), "nightly-2026-09-03".to_string(), false)];
-    assert!(real::verify_app(&deps, &[]).is_ok());
+    assert!(real::verify_app(&deps, &[], std::path::Path::new(".")).is_ok());
 }
 
 // ==========================================================================
@@ -400,4 +401,27 @@ fn identifiers_now_carry_their_type() {
     assert_eq!(typed("n : I64\nn = 42\nn"), "I64");
     assert_eq!(typed("s = \"hi\"\ns"), "Str");
     assert_eq!(typed("b = Bool.True\nb"), "Bool");
+}
+
+#[test]
+fn a_platform_named_by_a_path_is_loaded_from_beside_the_app() {
+    // `pf: platform "plat/main.roc"` names a directory relative to the app, as a local
+    // package does. Without it being resolved, the platform was skipped: its modules
+    // were never read, and an import of one it lacks went unreported.
+    let dir = std::env::temp_dir().join(format!("rocflight_local_platform_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("plat")).unwrap();
+    std::fs::write(
+        dir.join("plat/main.roc"),
+        "platform \"\"\n\trequires {} { main! : List(Str) => Try({}, [Exit(I8), ..]) }\n\texposes [Echo]\n\tpackages {}\n\tprovides { \"roc_main\": main_for_host! }\n\thosted {\n\t\t\"roc_echo_line\": Echo.line!,\n\t}\n\nimport Echo\n\nmain_for_host! : List(Str) => I8\nmain_for_host! = |args|\n\tmatch main!(args) {\n\t\tOk(_) => 0\n\t\tErr(Exit(code)) => code\n\t}\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("plat/Echo.roc"), "Echo := [].{\n\tline! : Str => {}\n}\n").unwrap();
+    let deps = vec![("pf".to_string(), "plat/main.roc".to_string(), true)];
+    let platforms = real::verify_app(&deps, &[("pf".to_string(), "Echo".to_string())], &dir).expect("loads");
+    assert_eq!(platforms.len(), 1);
+    assert!(real::declares(&platforms, "Echo", "line!"));
+    let err = real::verify_app(&deps, &[("pf".to_string(), "Nope".to_string())], &dir).expect_err("no Nope");
+    assert!(err.contains("Nope"), "got {}", err);
+    let _ = std::fs::remove_dir_all(&dir);
 }

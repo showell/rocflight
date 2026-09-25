@@ -213,6 +213,7 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             "len" | "is_empty" | "map" | "fold" | "keep_if" | "drop_if" | "fold_try" | "from_iter"
                 | "contains" | "iter" | "any" | "all" | "sum" | "find_first" | "size_hint"
                 | "fold_with_index" | "with_index" | "step_by" | "collect" | "count_if"
+                | "join_map" | "map_with_index"
         )
     {
         let items: Vec<Value> = elements(args[0].clone(), name)?.collect();
@@ -380,6 +381,28 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             }
             Ok(Value::tag("Err", [Value::bare("NotFound")]))
         }
+        "find_last" => {
+            expect(2, args.len())?;
+            let items: Vec<Value> = elements(args[0].clone(), name)?.collect();
+            let func = args[1].clone();
+            for item in items.into_iter().rev() {
+                if matches!(call_function(func.clone(), vec![item.clone()])?, Value::Bool(true)) {
+                    return Ok(Value::tag("Ok", [item]));
+                }
+            }
+            Ok(Value::tag("Err", [Value::bare("NotFound")]))
+        }
+        // `map` whose transform also gets the element's position, as a `U64`.
+        "map_with_index" => {
+            expect(2, args.len())?;
+            let items = elements(args[0].clone(), name)?;
+            let func = args[1].clone();
+            let mut out = Vec::new();
+            for (i, item) in items.enumerate() {
+                out.push(call_function(func.clone(), vec![item, Value::Int(i as i128)])?);
+            }
+            Ok(Value::list(out))
+        }
         // The INDEX of the first match rather than the item, which is what a caller
         // that goes on to slice the list needs.
         "find_first_index" | "find_last_index" => {
@@ -534,6 +557,17 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             let mut out = Vec::new();
             for inner in elements(args[0].clone(), name)? {
                 out.extend(elements(inner, name)?);
+            }
+            Ok(Value::list(out))
+        }
+        // `List.join(List.map(list, transform))`, as `Builtin.roc` defines it.
+        "join_map" => {
+            expect(2, args.len())?;
+            let items = elements(args[0].clone(), name)?;
+            let func = args[1].clone();
+            let mut out = Vec::new();
+            for item in items {
+                out.extend(elements(call_function(func.clone(), vec![item])?, name)?);
             }
             Ok(Value::list(out))
         }
@@ -719,6 +753,19 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             expect(2, args.len())?;
             let mut items = elements(args[0].clone(), name)?;
             Ok(Value::Bool(items.any(|v| values_equal(&v, &args[1]))))
+        }
+        // Does the list begin (end) with every element of the second, in order?
+        // Compared with `values_equal`, as `contains` is, not an element type's own
+        // `is_eq`, which `Builtin.roc`'s definitions would call.
+        "starts_with" | "ends_with" => {
+            expect(2, args.len())?;
+            let items: Vec<Value> = elements(args[0].clone(), name)?.collect();
+            let part: Vec<Value> = elements(args[1].clone(), name)?.collect();
+            if part.len() > items.len() {
+                return Ok(Value::Bool(false));
+            }
+            let from = if name == "starts_with" { 0 } else { items.len() - part.len() };
+            Ok(Value::Bool(part.iter().zip(&items[from..]).all(|(p, v)| values_equal(v, p))))
         }
         _ => Err(EvalError {
             message: format!("Unknown function List.{}", name),
@@ -2677,11 +2724,12 @@ pub fn call_builtin_values(
             // inspects `[1, 2, 3].keep_if(p)` as `[2, 3]` but
             // `[1, 2, 3].iter().keep_if(p)` as `<opaque>`. Nothing here can tell those
             // apart, because `.iter()` on a list IS the list at run time — so this path
-            // answers the lazy one for both, and the COMPILER answers the eager one
-            // wherever the checker knows the receiver is a `List` (`Compiler::list_loop`).
-            // What is left divergent is a receiver whose module the checker cannot name,
-            // such as an unannotated `|xs| xs.keep_if(p)`: roc gives a list there and
-            // this gives an iterator. Fixing it needs an `Iter` that is its own value.
+            // answers the lazy one for both. A call WRITTEN `List.keep_if(xs, p)` (or
+            // piped into it) cannot be `Iter.keep_if`, and the compiler answers the eager
+            // one for it (`Compiler::list_loop`). What is left divergent is method syntax
+            // on a list, `[1, 2, 3].keep_if(p)`, and `List.keep_if` passed as a function
+            // value: roc gives a list there and this gives an iterator. Fixing those needs
+            // an `Iter` that is its own value.
             || matches!(name, "keep_if" | "drop_if" | "with_index")
             // `concat` and `size_hint` are shared with `List`: lazy only for a range
             // or an iterator, so `List.concat` of two lists stays an eager list.
@@ -2697,6 +2745,17 @@ pub fn call_builtin_values(
     if module == "Str" {
         if let Some(result) = call_str_more(name, &args) {
             return result;
+        }
+    }
+    // `Try.map_ok(t, f)` is `t.map_ok(f)` with the receiver written first, for the
+    // names `try_method` answers (`is_ok`, `is_err`, `map_ok`, `map_err`, `ok_or`,
+    // `on_err`); any other `Try.x` is still unknown here, as `t.x` is.
+    if module == "Try" {
+        if let Some(Value::Tag(tag @ ("Ok" | "Err"), payload)) = args.first() {
+            let (tag, payload) = (*tag, payload.clone());
+            if let Some(result) = try_method(tag, &payload, name, args[1..].to_vec())? {
+                return Ok(result);
+            }
         }
     }
     // A boxed value is the value: nothing here needs the indirection.

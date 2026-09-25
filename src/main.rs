@@ -242,7 +242,7 @@ fn launch_on_host(filename: &str, app_args: &[String]) -> Result<(), Box<dyn Err
     let Some(url) = rocflight::platform::driver::platform_url(&source) else {
         return Ok(());
     };
-    let exe = rocflight::platform::driver::prepare(&url, EMBEDDED_HOST_LIB)?;
+    let exe = rocflight::platform::driver::prepare(&url, std::path::Path::new(filename), EMBEDDED_HOST_LIB)?;
     rocflight::platform::driver::exec(&exe, std::path::Path::new(filename), app_args)?;
     Ok(())
 }

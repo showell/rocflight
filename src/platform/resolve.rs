@@ -68,6 +68,21 @@ pub fn sources_dir(url: &str) -> Option<PathBuf> {
     None
 }
 
+/// A dependency named by a path rather than a URL: `cli: platform "cli/platform/main.roc"`.
+pub fn is_local(spec: &str) -> bool {
+    !spec.contains("://") && spec.ends_with(".roc")
+}
+
+/// The directory of a dependency's sources: roc's cache for a URL, and for a local one
+/// the directory of its `main.roc`, relative to the app.
+pub fn dependency_dir(spec: &str, app_dir: &Path) -> Option<PathBuf> {
+    if is_local(spec) {
+        app_dir.join(spec).parent().map(Path::to_path_buf)
+    } else {
+        sources_dir(spec)
+    }
+}
+
 /// Does this URL name a dependency `roc` has already fetched?
 pub fn is_cached(url: &str) -> bool {
     sources_dir(url).is_some()
@@ -76,6 +91,18 @@ pub fn is_cached(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_local_dependency_is_a_path_ending_in_roc() {
+        assert!(is_local("cli/platform/main.roc"));
+        assert!(is_local("../pkg/main.roc"));
+        assert!(!is_local("nightly-2026-09-03-62fcb65"));
+        assert!(!is_local("https://example.com/a/HASH.tar.zst"));
+        assert!(!is_local("https://example.com/a/main.roc"));
+        assert_eq!(dependency_dir("cli/platform/main.roc", Path::new("/app")), Some(PathBuf::from("/app/cli/platform")));
+        assert_eq!(dependency_dir("/abs/plat/main.roc", Path::new("/app")), Some(PathBuf::from("/abs/plat")));
+        assert_eq!(dependency_dir("nightly-2026-09-03-62fcb65", Path::new("/app")), None);
+    }
 
     #[test]
     fn hash_comes_from_the_url_filename() {

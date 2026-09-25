@@ -116,6 +116,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     let platforms = crate::platform::real::verify_app(
         parser.dependencies(),
         parser.imports(),
+        &source_dir,
     )?;
     crate::platform::real::record_declared(&platforms);
     if show_platforms {
