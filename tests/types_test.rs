@@ -717,3 +717,11 @@ fn an_if_whose_type_is_not_known_yet_joins_its_branches() {
     let src = "List.map([\"a\", \"b\"], |x| if x == \"a\" { Above } else if x == \"b\" { Below } else { Equal })";
     assert_eq!(defaulted_type_of(src), "List([Above, Below, Equal, ..])");
 }
+
+#[test]
+fn a_try_function_has_its_declared_type() {
+    // `Try`'s method block is inside `Box`'s member of `Builtin.roc`; untyped, the
+    // lambda's `h` was a variable of its own and the call answered one too.
+    let src = "t : Try(Str, [Odd])\nt = Ok(\"a\")\nTry.map_ok(t, |h| [h])";
+    assert_eq!(defaulted_type_of(src), "[Err([Odd]), Ok(List(Str))]");
+}
