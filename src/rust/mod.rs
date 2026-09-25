@@ -653,7 +653,7 @@ impl<'a> Cx<'a> {
                 let (label, mut inner) = self.loop_scope(scope);
                 inner.locals.push(name.to_string());
                 format!(
-                    "{{ let __it = {}; {}: for {} in __it.0.iter().cloned() {{ {}; }} }}",
+                    "{{ let __it = {}; {}: for {} in __it.items().iter().cloned() {{ {}; }} }}",
                     self.expr(iterable, scope)?,
                     label,
                     sanitize(name),
@@ -1351,8 +1351,8 @@ impl<'a> Cx<'a> {
                 let Type::List(et) = t else { return Err(format!("a list pattern on {}", t)) };
                 let n = before.len() + after.len();
                 let cond = match rest {
-                    None => format!("({}).0.len() == {}", v, n),
-                    Some(_) => format!("({}).0.len() >= {}", v, n),
+                    None => format!("({}).items().len() == {}", v, n),
+                    Some(_) => format!("({}).items().len() >= {}", v, n),
                 };
                 let mut code = inner;
                 if let Some(Some(r)) = rest {
@@ -1365,7 +1365,7 @@ impl<'a> Cx<'a> {
                     code = self.pat(b, &format!("({}).at({})", v, i), et, binds, scope, code)?;
                 }
                 for (i, a) in after.iter().enumerate().rev() {
-                    code = self.pat(a, &format!("({v}).at(({v}).0.len() - {})", after.len() - i), et, binds, scope, code)?;
+                    code = self.pat(a, &format!("({v}).at(({v}).items().len() - {})", after.len() - i), et, binds, scope, code)?;
                 }
                 format!("if {} {{ {} }}", cond, code)
             }
