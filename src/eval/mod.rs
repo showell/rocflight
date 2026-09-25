@@ -380,6 +380,28 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             }
             Ok(Value::tag("Err", [Value::bare("NotFound")]))
         }
+        "find_last" => {
+            expect(2, args.len())?;
+            let items: Vec<Value> = elements(args[0].clone(), name)?.collect();
+            let func = args[1].clone();
+            for item in items.into_iter().rev() {
+                if matches!(call_function(func.clone(), vec![item.clone()])?, Value::Bool(true)) {
+                    return Ok(Value::tag("Ok", [item]));
+                }
+            }
+            Ok(Value::tag("Err", [Value::bare("NotFound")]))
+        }
+        // `map` whose transform also gets the element's position, as a `U64`.
+        "map_with_index" => {
+            expect(2, args.len())?;
+            let items = elements(args[0].clone(), name)?;
+            let func = args[1].clone();
+            let mut out = Vec::new();
+            for (i, item) in items.enumerate() {
+                out.push(call_function(func.clone(), vec![item, Value::Int(i as i128)])?);
+            }
+            Ok(Value::list(out))
+        }
         // The INDEX of the first match rather than the item, which is what a caller
         // that goes on to slice the list needs.
         "find_first_index" | "find_last_index" => {
@@ -534,6 +556,17 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             let mut out = Vec::new();
             for inner in elements(args[0].clone(), name)? {
                 out.extend(elements(inner, name)?);
+            }
+            Ok(Value::list(out))
+        }
+        // `List.join(List.map(list, transform))`, as `Builtin.roc` defines it.
+        "join_map" => {
+            expect(2, args.len())?;
+            let items = elements(args[0].clone(), name)?;
+            let func = args[1].clone();
+            let mut out = Vec::new();
+            for item in items {
+                out.extend(elements(call_function(func.clone(), vec![item])?, name)?);
             }
             Ok(Value::list(out))
         }
@@ -2698,6 +2731,15 @@ pub fn call_builtin_values(
     if module == "Str" {
         if let Some(result) = call_str_more(name, &args) {
             return result;
+        }
+    }
+    // `Try.map_ok(t, f)` is `t.map_ok(f)` with the receiver written first.
+    if module == "Try" {
+        if let Some(Value::Tag(tag @ ("Ok" | "Err"), payload)) = args.first() {
+            let (tag, payload) = (*tag, payload.clone());
+            if let Some(result) = try_method(tag, &payload, name, args[1..].to_vec())? {
+                return Ok(result);
+            }
         }
     }
     // A boxed value is the value: nothing here needs the indirection.

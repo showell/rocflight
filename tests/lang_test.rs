@@ -2000,3 +2000,17 @@ fn a_constant_may_read_one_declared_below_it() {
     let src = "Board :: [].{\n\ttable : List(U64)\n\ttable = List.map(squares, |s| s * 10)\n\n\tsquares : List(U64)\n\tsquares = upto(count)\n\n\tupto : U64 -> List(U64)\n\tupto = |n| List.repeat(1, n)\n\n\tcount : U64\n\tcount = 3\n}\n\ntotal = List.sum(Board.table) + later\n\nlater : U64\nlater = 1\n\nStr.inspect(total)";
     assert_eq!(as_str(src), "31");
 }
+
+#[test]
+fn list_join_map_find_last_and_map_with_index() {
+    let src = "Str.inspect((List.join_map([1.I64, 2], |n| [n, n * 10]), List.find_last([1.I64, 2, 3], |n| n < 3), List.find_last([1.I64], |n| n > 5), List.map_with_index([\"a\", \"b\"], |s, i| \"${s}${U64.to_str(i)}\")))";
+    assert_eq!(as_str(src), "([1, 10, 2, 20], Ok(2), Err(NotFound), [\"a0\", \"b1\"])");
+}
+
+#[test]
+fn a_try_function_called_through_its_module() {
+    // `Try.map_ok(t, f)` is `t.map_ok(f)` with the receiver written first; only the
+    // method form was known ("Unknown function Try.map_ok").
+    let src = "t : Try(I64, [Odd])\nt = Ok(2)\ne : Try(I64, [Odd])\ne = Err(Odd)\nStr.inspect((Try.map_ok(t, |n| n + 1), Try.map_ok(e, |n| n + 1), Try.is_ok(t), Try.map_err(e, |_| Bad)))";
+    assert_eq!(as_str(src), "(Ok(3), Err(Odd), True, Err(Bad))");
+}
