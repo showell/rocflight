@@ -592,15 +592,21 @@ macro_rules! paste_int {
             pub fn shr_wrap(a: $t, n: impl Into<i128>) -> $t { a.wrapping_shr(n.into() as u32) }
             pub fn to_str(a: $t) -> super::Str { super::display_str(a) }
             pub fn to_i64_wrap(a: $t) -> i64 { a as i64 }
+            pub fn to_i32_wrap(a: $t) -> i32 { a as i32 }
+            pub fn to_i16_wrap(a: $t) -> i16 { a as i16 }
+            pub fn to_i8_wrap(a: $t) -> i8 { a as i8 }
             pub fn to_u64_wrap(a: $t) -> u64 { a as u64 }
+            pub fn to_u32_wrap(a: $t) -> u32 { a as u32 }
+            pub fn to_u16_wrap(a: $t) -> u16 { a as u16 }
             pub fn to_u8_wrap(a: $t) -> u8 { a as u8 }
             pub fn to_u64(a: $t) -> u64 { a as u64 }
             pub fn to_i64(a: $t) -> i64 { a as i64 }
             pub fn to_f64(a: $t) -> f64 { a as f64 }
+            pub fn to_f32(a: $t) -> f32 { a as f32 }
         }
     };
 }
-ints!(ops_i64 i64 ops_u64 u64 ops_u8 u8 ops_i32 i32 ops_u32 u32 ops_u16 u16);
+ints!(ops_i64 i64 ops_u64 u64 ops_u8 u8 ops_i32 i32 ops_u32 u32 ops_u16 u16 ops_i16 i16 ops_i8 i8);
 
 pub mod I64 {
     pub use super::ops_i64::*;
@@ -625,6 +631,27 @@ pub mod U32 {
 pub mod U16 {
     pub use super::ops_u16::*;
 }
+pub mod I16 {
+    pub use super::ops_i16::*;
+}
+pub mod I8 {
+    pub use super::ops_i8::*;
+}
+
+/// A float's conversions to an integer that wrap: the whole part, then its low
+/// bits, as roc's are (Rust's `as` from a float saturates instead).
+macro_rules! float_wraps {
+    ($t:ident) => {
+        pub fn to_i8_wrap(a: $t) -> i8 { a as i128 as i8 }
+        pub fn to_i16_wrap(a: $t) -> i16 { a as i128 as i16 }
+        pub fn to_i32_wrap(a: $t) -> i32 { a as i128 as i32 }
+        pub fn to_i64_wrap(a: $t) -> i64 { a as i128 as i64 }
+        pub fn to_u8_wrap(a: $t) -> u8 { a as i128 as u8 }
+        pub fn to_u16_wrap(a: $t) -> u16 { a as i128 as u16 }
+        pub fn to_u32_wrap(a: $t) -> u32 { a as i128 as u32 }
+        pub fn to_u64_wrap(a: $t) -> u64 { a as i128 as u64 }
+    };
+}
 
 pub mod Bool {
     pub fn not(a: bool) -> bool { !a }
@@ -633,12 +660,29 @@ pub mod Bool {
 pub mod F64 {
     pub fn to_bits(a: f64) -> u64 { a.to_bits() }
     pub fn from_bits(a: u64) -> f64 { f64::from_bits(a) }
-    pub fn to_i64_wrap(a: f64) -> i64 { a as i64 }
+    float_wraps!(f64);
+    pub fn to_f64_wrap(a: f64) -> f64 { a }
     pub fn is_nan(a: f64) -> bool { a.is_nan() }
     pub fn is_infinite(a: f64) -> bool { a.is_infinite() }
+    pub fn is_finite(a: f64) -> bool { a.is_finite() }
     pub fn abs(a: f64) -> f64 { a.abs() }
     pub fn sqrt(a: f64) -> f64 { a.sqrt() }
+    pub fn to_f32_wrap(a: f64) -> f32 { a as f32 }
     pub fn to_str(a: f64) -> super::Str { super::display_str(format_args!("{:?}", a)) }
+}
+
+pub mod F32 {
+    pub fn to_bits(a: f32) -> u32 { a.to_bits() }
+    pub fn from_bits(a: u32) -> f32 { f32::from_bits(a) }
+    pub fn to_f64(a: f32) -> f64 { a as f64 }
+    pub fn to_f32_wrap(a: f32) -> f32 { a }
+    float_wraps!(f32);
+    pub fn is_nan(a: f32) -> bool { a.is_nan() }
+    pub fn is_infinite(a: f32) -> bool { a.is_infinite() }
+    pub fn is_finite(a: f32) -> bool { a.is_finite() }
+    pub fn abs(a: f32) -> f32 { a.abs() }
+    pub fn sqrt(a: f32) -> f32 { a.sqrt() }
+    pub fn to_str(a: f32) -> super::Str { super::display_str(format_args!("{:?}", a)) }
 }
 
 // ---- the platform ----

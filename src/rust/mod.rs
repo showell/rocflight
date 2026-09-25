@@ -35,7 +35,7 @@ use crate::types::Type;
 const RUNTIME: &str = include_str!("runtime.rs");
 
 /// Roc's own modules, which `runtime.rs` answers.
-const BUILTIN_MODULES: [&str; 12] = ["List", "Str", "I64", "U64", "U8", "I32", "U32", "U16", "F64", "Num", "Bool", "Dict"];
+const BUILTIN_MODULES: [&str; 15] = ["List", "Str", "I64", "U64", "U8", "I32", "U32", "U16", "I16", "I8", "F64", "F32", "Num", "Bool", "Dict"];
 
 pub fn emit(input: &Input) -> Result<String, String> {
     let mut cx = Cx::new(input);
@@ -610,7 +610,10 @@ impl<'a> Cx<'a> {
     fn expr(&self, e: &Expr, scope: &Scope) -> Result<String, String> {
         Ok(match e {
             Expr::Int(n, _) => self.int_lit(*n, e),
-            Expr::Float(f, _, _) => format!("{:?}f64", f),
+            Expr::Float(f, _, _) => match self.ty_of(e) {
+                Ok(Type::F32) => format!("{:?}f32", *f as f32),
+                _ => format!("{:?}f64", f),
+            },
             Expr::Bool(b, _) => b.to_string(),
             Expr::Unit(_) => "()".into(),
             Expr::Str(s, _) => {
@@ -787,7 +790,10 @@ impl<'a> Cx<'a> {
                     Type::I32 => "I32",
                     Type::U32 => "U32",
                     Type::U16 => "U16",
+                    Type::I16 => "I16",
+                    Type::I8 => "I8",
                     Type::F64 => "F64",
+                    Type::F32 => "F32",
                     Type::Nominal { name, .. } => crate::memory::string_pool::intern(bare(name)),
                     other => return Err(format!("a method {} of {}", method, other)),
                 };
