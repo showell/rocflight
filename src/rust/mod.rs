@@ -192,7 +192,7 @@ fn bind(decl: &Type, used: &Type, out: &mut HashMap<u32, Type>) {
 fn copy_type(t: &Type) -> bool {
     matches!(
         t,
-        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128 | Type::F32 | Type::F64 | Type::Bool | Type::Unit
+        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 | Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128 | Type::F32 | Type::F64 | Type::Dec | Type::Bool | Type::Unit
     )
 }
 
@@ -713,7 +713,12 @@ impl<'a> Cx<'a> {
             }
             Expr::FieldAccess { record, field, .. } => {
                 let rt = self.ty_of(record)?;
-                let (_, boxed) = self.field_type(&rt, field)?;
+                let (ft, boxed) = self.field_type(&rt, field)?;
+                // Read through a local without copying the whole record: `x.hand.clone()`,
+                // not `(x.clone()).hand`.
+                if let Some(path) = self.place(e, scope)? {
+                    return Ok(if copy_type(&ft) { path } else { format!("{}.clone()", path) });
+                }
                 let r = self.expr(record, scope)?;
                 if boxed {
                     format!("(*({}).{}).clone()", r, sanitize(field))
@@ -760,6 +765,35 @@ impl<'a> Cx<'a> {
         let mut inner = scope.clone();
         inner.in_loop = Some(label.clone());
         (label, inner)
+    }
+
+    /// A local, or a field of one (`x.a.b`), as a path to read from in place; `None`
+    /// for anything else, which is a temporary already.
+    fn place(&self, e: &Expr, scope: &Scope) -> Result<Option<String>, String> {
+        match e {
+            Expr::Ident(n, _) if scope.local(n) => Ok(Some(sanitize(n))),
+            Expr::FieldAccess { record, field, .. } => {
+                let Some(p) = self.place(record, scope)? else { return Ok(None) };
+                let (_, boxed) = self.field_type(&self.ty_of(record)?, field)?;
+                Ok(Some(if boxed { format!("(*{}.{})", p, sanitize(field)) } else { format!("{}.{}", p, sanitize(field)) }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// An operand that is only read, as a comparison reads its operands: a local or
+    /// a field of one in place, and with `literal`, a plain string literal as a
+    /// `&str`, which a `String` compares equal to without being one.
+    fn read_operand(&self, x: &Expr, scope: &Scope, literal: bool) -> Result<String, String> {
+        if let Some(p) = self.place(x, scope)? {
+            return Ok(p);
+        }
+        if let Expr::Str(s, _) = x {
+            if literal && matches!(self.ty_of(x)?, Type::Str) {
+                return Ok(format!("{:?}", s));
+            }
+        }
+        self.expr(x, scope)
     }
 
     fn read_local(&self, n: &str, e: &Expr) -> Result<String, String> {
@@ -852,8 +886,15 @@ impl<'a> Cx<'a> {
     }
 
     fn binop(&self, l: &Expr, op: BinOp, r: &Expr, scope: &Scope) -> Result<String, String> {
-        let a = self.expr(l, scope)?;
-        let b = self.expr(r, scope)?;
+        // A comparison only reads its operands, so they are not copied; and `==`
+        // against a string literal needs no `String` for it.
+        let compares = matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne);
+        let equality = matches!(op, BinOp::Eq | BinOp::Ne);
+        let (a, b) = if compares {
+            (self.read_operand(l, scope, equality)?, self.read_operand(r, scope, equality)?)
+        } else {
+            (self.expr(l, scope)?, self.expr(r, scope)?)
+        };
         let sym = match op {
             BinOp::Add => "+",
             BinOp::Sub => "-",
@@ -871,7 +912,8 @@ impl<'a> Cx<'a> {
                 let t = self.ty_of(l)?;
                 if let Type::Nominal { name, .. } = &t {
                     if let Some(eq) = self.qualified(bare(name), "is_eq") {
-                        let call = format!("{}({}, {})", sanitize(&eq), a, b);
+                        // A nominal's own `is_eq` takes its operands by value.
+                        let call = format!("{}({}, {})", sanitize(&eq), self.expr(l, scope)?, self.expr(r, scope)?);
                         return Ok(if matches!(op, BinOp::Ne) { format!("(!{})", call) } else { call });
                     }
                 }
@@ -1171,7 +1213,13 @@ impl<'a> Cx<'a> {
 
     fn matching(&self, scrutinee: &Expr, arms: &[MatchArm], whole: &Option<Type>, scope: &Scope) -> Result<String, String> {
         let st = self.ty_of(scrutinee)?;
-        let mut out = format!("{{ let __s = {}; 'm: {{\n", self.expr(scrutinee, scope)?);
+        // The patterns only read the value, by reference: a local or a field of one is
+        // borrowed where it is, and anything else is held in `__s` and borrowed there.
+        let (held, v) = match self.place(scrutinee, scope)? {
+            Some(p) => (format!("&{}", p), "__s"),
+            None => (self.expr(scrutinee, scope)?, "(&__s)"),
+        };
+        let mut out = format!("{{ let __s = {}; 'm: {{\n", held);
         for arm in arms {
             for p in &arm.patterns {
                 let mut inner = scope.clone();
@@ -1185,7 +1233,7 @@ impl<'a> Cx<'a> {
                         None => format!("break 'm ({});", body),
                     }
                 };
-                let code = self.pat(p, "(&__s)", &st, &mut binds, &mut inner, tail)?;
+                let code = self.pat(p, v, &st, &mut binds, &mut inner, tail)?;
                 out.push_str(&format!("    {}\n", indent(&code, 4)));
             }
         }
@@ -1236,7 +1284,8 @@ impl<'a> Cx<'a> {
                         let from = self.qualified(bare(name), "from_quote").ok_or("a string pattern with no from_quote")?;
                         format!("{}(String::from({:?})).unwrap()", sanitize(&from), s)
                     }
-                    _ => format!("String::from({:?})", s),
+                    // A plain string compares against the literal as it is: no `String`.
+                    _ => return Ok(format!("if ({}).as_str() == {:?} {{ {} }}", v, s, inner)),
                 };
                 format!("if *{} == {} {{ {} }}", v, lit, inner)
             }
