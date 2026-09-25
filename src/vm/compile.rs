@@ -983,9 +983,9 @@ fn initialization_order(bindings: &[(&'static str, &Expr)]) -> Vec<usize> {
 }
 
 /// The bindings an expression reads, found the way the compiler resolves a name: a
-/// local first (a parameter, a `let`, a `var`, a `for` name, a pattern's), then a
-/// top-level name as written, then, inside a namespace, its member (`squares` in
-/// `Board` is `Board.squares`). A name exposed by an import is not followed.
+/// local first (a parameter, a `let`, a `var`, a `for` name, a pattern's), then,
+/// inside a namespace, its member (`squares` in `Board` is `Board.squares`), then a
+/// top-level name as written. A name exposed by an import is not followed.
 fn free_reads(
     e: &Expr,
     owner: Option<&str>,
@@ -998,8 +998,8 @@ fn free_reads(
             if bound.contains(n) {
                 return;
             }
-            let member = || owner.and_then(|o| at.get(format!("{}.{}", o, n).as_str()));
-            if let Some(&i) = at.get(n).or_else(member) {
+            let member = owner.and_then(|o| at.get(format!("{}.{}", o, n).as_str()));
+            if let Some(&i) = member.or_else(|| at.get(n)) {
                 out.push(i);
             }
         }
@@ -1379,6 +1379,19 @@ impl<'u> Compiler<'u> {
             }
             Ok(Some(idx)) => return Some(Found::Capture(idx)),
             Ok(None) => {}
+        }
+        // Inside a namespace its own member comes before a top-level name, as in roc:
+        // `count` in `Board` is `Board.count` even beside an app's own `count`.
+        if !name.contains('.') {
+            for owner in self.enclosing_owners_of() {
+                let qualified = qualify(owner, name);
+                if let Some(idx) = self.tops.global(qualified) {
+                    return Some(Found::Global(idx));
+                }
+                if let Some((c, a)) = self.tops.func(qualified) {
+                    return Some(Found::Func(c, a));
+                }
+            }
         }
         if let Some(idx) = self.tops.global(name) {
             return Some(Found::Global(idx));

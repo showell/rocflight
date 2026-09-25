@@ -2044,3 +2044,12 @@ fn the_new_list_functions_as_methods_and_on_empty_lists() {
     let src = "Str.inspect(([1.I64, 2].join_map(|n| [n, n]), [\"x\"].map_with_index(|s, i| (s, i)), List.find_last([], |n| n > 1.I64), List.join_map([], |n| [n, 1.I64]), List.ends_with([1.I64], []), Try.ok_or(Err(Odd), 7.I64), Try.ok_or(Ok(1.I64), 7)))";
     assert_eq!(as_str(src), "([1, 1, 2, 2], [(\"x\", 0)], Err(NotFound), [], True, 7, 1)");
 }
+
+#[test]
+fn a_namespace_member_comes_before_a_top_level_name() {
+    // Inside `Board`, a bare `count` is `Board.count`, as in roc, even beside a
+    // top-level `count`. The top-level one won, and a program whose own `count` is a
+    // function handed that function to `List.repeat`.
+    let src = "count : U64\ncount = 5\n\nBoard :: [].{\n\tcount : U64\n\tcount = 3\n\n\ttable : List(U64)\n\ttable = List.repeat(0, count)\n\n\tsize : {} -> U64\n\tsize = |{}| count\n}\n\nStr.inspect((List.len(Board.table), Board.size({})))";
+    assert_eq!(as_str(src), "(3, 3)");
+}
