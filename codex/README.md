@@ -116,7 +116,7 @@ corpus (`codex/ported.sh`) and all five Fast Track experiments run on
 
 | Commit | For | Upstream | Remove when |
 |---|---|---|---|
-| fork: record each node's type | roc2codex, roc2rust read the typed tree | not yet proposed (changes no behavior) | a PR of it merges |
+| fork: record each node's type | roc2codex, roc2rust read the typed tree | PR #25 | #25 merges |
 | fork: roc2codex and roc2rust | the tools themselves | not for upstream | never |
 | fork (#13, partial): an if/match against an unsolved type joins its branches | roc2rust's types for a lambda whose branches return different tags | issue #13 | #13 is fixed, or nothing needs it (Fast Track's `Tables` is annotated) |
 | fork (#14): Try's functions have their declared types | roc2rust's types for `Try.map_ok(t, f)` | issue #14 | #14 is fixed |

@@ -73,7 +73,7 @@ pub fn emit(input: &Input) -> Result<String, String> {
     out.push_str("\n// ---- the program ----\n\n");
     out.push_str(&defs);
     out.push_str(
-        "fn main() {\n    let t = std::thread::Builder::new().stack_size(1 << 30).spawn(|| { main__e(List::<String>::of(vec![])); }).unwrap();\n    if t.join().is_err() { std::process::exit(1); }\n}\n",
+        "fn main() {\n    let t = std::thread::Builder::new().stack_size(1 << 30).spawn(|| { main__e(List::<String>::of(vec![])); }).unwrap();\n    if t.join().is_err() { std::process::exit(1); }\n    #[cfg(roc2rust_count_allocs)]\n    alloc_count::report();\n}\n",
     );
     Ok(out)
 }

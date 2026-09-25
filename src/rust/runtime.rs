@@ -10,6 +10,38 @@
 
 use std::rc::Rc;
 
+/// Allocation counts, for measuring the translation: built only with
+/// `rustc --cfg roc2rust_count_allocs`, and reported to stderr at exit.
+#[cfg(roc2rust_count_allocs)]
+pub mod alloc_count {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    static REALLOCS: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    pub struct Counting;
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(layout.size() as u64, Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            REALLOCS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(new_size as u64, Relaxed);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+    pub fn report() {
+        eprintln!("allocs {} reallocs {} bytes {}", ALLOCS.load(Relaxed), REALLOCS.load(Relaxed), BYTES.load(Relaxed));
+    }
+}
+
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct List<T>(pub Rc<Vec<T>>);
 
