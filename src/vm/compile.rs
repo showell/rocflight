@@ -868,6 +868,93 @@ struct Spares {
     slot: Reg,
 }
 
+/// The order to initialize a top level's constants in: each after every constant it
+/// reads, directly or through the functions it calls, and otherwise in file order.
+/// roc lets a declaration read one written below it — `relative_table` above
+/// `squares` — and in file order that read found nothing: "Used before it was
+/// defined". A name is resolved as the compiler resolves it, a bare one inside a
+/// namespace to that namespace's member first. A cycle keeps file order, and so
+/// fails as it did. Functions are not initialized, so they are not in the answer.
+fn initialization_order(bindings: &[(&'static str, &Expr)]) -> Vec<usize> {
+    let mut at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (i, (name, _)) in bindings.iter().enumerate() {
+        at.entry(name).or_insert(i);
+    }
+    // The bindings each one names.
+    let direct: Vec<Vec<usize>> = bindings
+        .iter()
+        .map(|(name, value)| {
+            let owner = name.rsplit_once('.').map(|(owner, _)| owner);
+            let mut out = Vec::new();
+            names_bound(value, owner, &at, &mut out);
+            out
+        })
+        .collect();
+    let is_function = |i: usize| matches!(bindings[i].1, Expr::Lambda { .. });
+    // The constants a constant reads: through functions, which run when called, but
+    // not through another constant, which is ordered on its own.
+    let reads = |c: usize| -> Vec<usize> {
+        let mut found = Vec::new();
+        let mut seen = vec![false; bindings.len()];
+        let mut stack = direct[c].clone();
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut seen[i], true) {
+                continue;
+            }
+            if is_function(i) {
+                stack.extend(direct[i].iter().copied());
+            } else if i != c {
+                found.push(i);
+            }
+        }
+        found.sort_unstable();
+        found
+    };
+    // 0 unvisited, 1 being ordered, 2 ordered.
+    let mut state = vec![0u8; bindings.len()];
+    let mut order = Vec::new();
+    fn visit(c: usize, reads: &dyn Fn(usize) -> Vec<usize>, state: &mut [u8], order: &mut Vec<usize>) {
+        if state[c] != 0 {
+            return;
+        }
+        state[c] = 1;
+        for d in reads(c) {
+            visit(d, reads, state, order);
+        }
+        state[c] = 2;
+        order.push(c);
+    }
+    for c in 0..bindings.len() {
+        if !is_function(c) {
+            visit(c, &reads, &mut state, &mut order);
+        }
+    }
+    order
+}
+
+/// The bindings an expression names: `Board.squares` written out, or a bare
+/// `squares` inside `Board` (then a top-level `squares`).
+fn names_bound(e: &Expr, owner: Option<&str>, at: &std::collections::HashMap<&str, usize>, out: &mut Vec<usize>) {
+    match e {
+        Expr::Ident(n, _) => {
+            let member = owner.and_then(|o| at.get(format!("{}.{}", o, n).as_str()));
+            if let Some(&i) = member.or_else(|| at.get(n)) {
+                out.push(i);
+            }
+        }
+        Expr::Qualified { module, name, .. } => {
+            if let Some(&i) = at.get(format!("{}.{}", module, name).as_str()) {
+                out.push(i);
+            }
+        }
+        other => {
+            for child in other.children() {
+                names_bound(child, owner, at, out);
+            }
+        }
+    }
+}
+
 /// A file's top level as its global bindings and its statements, answering its
 /// trailing expression. The app's and every module's go through here alike: a
 /// module's `expect`s arrive in the same shapes as the app's.
@@ -931,10 +1018,8 @@ impl<'u> Compiler<'u> {
                 self.st().next_reg = reg;
             }
         }
-        for (name, value) in bindings {
-            if matches!(value, Expr::Lambda { .. }) {
-                continue;
-            }
+        for i in initialization_order(bindings) {
+            let (name, value) = bindings[i];
             let save = self.st().next_reg;
             self.global_owner = name.rsplit_once('.').map(|(owner, _)| owner);
             let src = self.expr(value)?;

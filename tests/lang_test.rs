@@ -1991,3 +1991,12 @@ fn a_call_that_names_list_keep_if_answers_a_list() {
     let src = "Bag :: [].{\n\tItems(a) : List(a)\n\n\tinsert : Bag.Items(a), a -> Bag.Items(a) where [a.is_eq : a, a -> Bool]\n\tinsert = |set, item| List.prepend(List.drop_if(set, |other| other == item), item)\n}\n\nbig : I64 -> Bool\nbig = |n| n > 1\n\nStr.inspect((Bag.insert([1.I64, 2, 3], 2), List.keep_if([1.I64, 2, 3], big), [1.I64, 2, 3] |> List.drop_if(|n| n > 1), List.keep_if([], big)))";
     assert_eq!(as_str(src), "([2, 1, 3], [2, 3], [1], [])");
 }
+
+#[test]
+fn a_constant_may_read_one_declared_below_it() {
+    // roc orders top-level constants by what they read; in file order `table` found
+    // `squares` undefined ("Used before it was defined"). `squares` itself reads
+    // `count` only through a function, `upto`.
+    let src = "Board :: [].{\n\ttable : List(U64)\n\ttable = List.map(squares, |s| s * 10)\n\n\tsquares : List(U64)\n\tsquares = upto(count)\n\n\tupto : U64 -> List(U64)\n\tupto = |n| List.repeat(1, n)\n\n\tcount : U64\n\tcount = 3\n}\n\ntotal = List.sum(Board.table) + later\n\nlater : U64\nlater = 1\n\nStr.inspect(total)";
+    assert_eq!(as_str(src), "31");
+}
