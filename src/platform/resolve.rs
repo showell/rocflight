@@ -68,6 +68,21 @@ pub fn sources_dir(url: &str) -> Option<PathBuf> {
     None
 }
 
+/// A dependency named by a path rather than a URL: `cli: platform "cli/platform/main.roc"`.
+pub fn is_local(spec: &str) -> bool {
+    !spec.contains("://") && spec.ends_with(".roc")
+}
+
+/// The directory of a dependency's sources: roc's cache for a URL, and for a local one
+/// the directory of its `main.roc`, relative to the app.
+pub fn dependency_dir(spec: &str, app_dir: &Path) -> Option<PathBuf> {
+    if is_local(spec) {
+        app_dir.join(spec).parent().map(Path::to_path_buf)
+    } else {
+        sources_dir(spec)
+    }
+}
+
 /// Does this URL name a dependency `roc` has already fetched?
 pub fn is_cached(url: &str) -> bool {
     sources_dir(url).is_some()

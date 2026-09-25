@@ -123,6 +123,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     let platforms = crate::platform::real::verify_app(
         parser.dependencies(),
         parser.imports(),
+        &source_dir,
     )?;
     crate::platform::real::record_declared(&platforms);
     if show_platforms {
@@ -560,12 +561,7 @@ fn package_dirs(
         if *is_platform {
             continue;
         }
-        let dir = if spec.contains("://") {
-            crate::platform::resolve::sources_dir(spec)
-        } else {
-            source_dir.join(spec).parent().map(|d| d.to_path_buf())
-        };
-        if let Some(dir) = dir {
+        if let Some(dir) = crate::platform::resolve::dependency_dir(spec, source_dir) {
             dirs.insert(alias.clone(), dir);
         }
     }

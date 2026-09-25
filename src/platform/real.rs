@@ -286,9 +286,9 @@ fn method_block(text: &str) -> Option<&str> {
     None
 }
 
-/// Read a platform from a dependency URL, if `roc` has fetched it.
-pub fn load(alias: &str, url: &str) -> Result<RealPlatform, String> {
-    let sources = super::resolve::sources_dir(url).ok_or_else(|| {
+/// Read a platform from a dependency URL, if `roc` has fetched it, or from a path.
+pub fn load(alias: &str, url: &str, app_dir: &std::path::Path) -> Result<RealPlatform, String> {
+    let sources = super::resolve::dependency_dir(url, app_dir).ok_or_else(|| {
         format!(
             "Platform `{}` is not in roc's cache. Run `roc check` on this app once to \
              fetch it: {}",
@@ -379,12 +379,13 @@ mod tests {
 pub fn verify_app(
     dependencies: &[(String, String, bool)],
     imports: &[(String, String)],
+    app_dir: &std::path::Path,
 ) -> Result<Vec<RealPlatform>, String> {
     let mut platforms = Vec::new();
 
     for (alias, spec, is_platform) in dependencies {
         // `roc: "nightly-..."` pins the compiler; it names nothing to fetch.
-        if super::resolve::hash_from_url(spec).is_none() {
+        if super::resolve::hash_from_url(spec).is_none() && !super::resolve::is_local(spec) {
             continue;
         }
         if !*is_platform {
@@ -392,7 +393,7 @@ pub fn verify_app(
             // to evaluate. Not refused, just not loaded.
             continue;
         }
-        platforms.push(load(alias, spec)?);
+        platforms.push(load(alias, spec, app_dir)?);
     }
 
     for (alias, module) in imports {

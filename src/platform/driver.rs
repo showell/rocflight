@@ -71,14 +71,19 @@ fn cache_root() -> Result<PathBuf, String> {
 /// The executable for `url`'s platform, linking it first if this platform and this
 /// library have not met before. `embedded` is the host library the binary carries,
 /// or empty when it was built without one.
-pub fn prepare(url: &str, embedded: &[u8]) -> Result<PathBuf, String> {
+pub fn prepare(url: &str, app: &Path, embedded: &[u8]) -> Result<PathBuf, String> {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return Err("running on a platform's host is only linked for x86-64 Linux so far".into());
     }
-    let hash = super::resolve::hash_from_url(url).ok_or_else(|| format!("`{}` names no package", url))?;
-    let sources = super::resolve::sources_dir(url).ok_or_else(|| {
-        format!("platform {} is not in roc's cache; run `roc check` on the app once to fetch it", hash)
-    })?;
+    let (hash, sources) = if super::resolve::is_local(url) {
+        local_platform(url, app)?
+    } else {
+        let hash = super::resolve::hash_from_url(url).ok_or_else(|| format!("`{}` names no package", url))?;
+        let sources = super::resolve::sources_dir(url).ok_or_else(|| {
+            format!("platform {} is not in roc's cache; run `roc check` on the app once to fetch it", hash)
+        })?;
+        (hash.to_string(), sources)
+    };
     let lib = library(embedded)?;
     let lib_meta = std::fs::metadata(&lib).map_err(|e| format!("{}: {}", lib.display(), e))?;
     let modified = lib_meta
@@ -97,6 +102,26 @@ pub fn prepare(url: &str, embedded: &[u8]) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
     link(&sources, &lib, &dir, &exe)?;
     Ok(exe)
+}
+
+/// A platform named by a path, `platform "cli/platform/main.roc"`: its directory,
+/// beside the app, and a name for its linked executable. Nothing content-addresses a
+/// local platform, so the name is its directory and the time its host library was
+/// built: rebuilding the host links a new executable.
+fn local_platform(url: &str, app: &Path) -> Result<(String, PathBuf), String> {
+    use std::hash::{Hash, Hasher};
+    let app_dir = app.parent().unwrap_or_else(|| Path::new("."));
+    let dir = super::resolve::dependency_dir(url, app_dir).ok_or_else(|| format!("`{}` names no directory", url))?;
+    let dir = std::fs::canonicalize(&dir).map_err(|e| format!("platform `{}`: {}", url, e))?;
+    let built = std::fs::metadata(dir.join("targets").join("x64musl").join("libhost.a"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dir.hash(&mut hasher);
+    Ok((format!("local-{:016x}-{}", hasher.finish(), built), dir))
 }
 
 /// The platform's link recipe, `app` filled with the hosted table and the library.
