@@ -131,6 +131,10 @@ pub struct TypeChecker {
     enclosing_type: Vec<String>,
     /// A nested nominal's enclosing owner — see `Parser::enclosing_owners`.
     enclosing_owners: std::collections::HashMap<String, String>,
+    /// Every node's type as `synth` found it or `check` was told it, when
+    /// `record_types` asks; see `node_types`. Off by default: it costs a type clone
+    /// per node, and only a tool that reads the whole typed tree needs it.
+    node_types: Option<Vec<(crate::ast::NodeId, Type)>>,
     /// Each `BinOp` node and the type its operands unified to, before the
     /// substitution is finished.
     ///
@@ -421,6 +425,7 @@ impl TypeChecker {
             collect_targets: std::collections::HashMap::new(),
             enclosing_type: Vec::new(),
             enclosing_owners: std::collections::HashMap::new(),
+            node_types: None,
             literals: Vec::new(),
             numeral_vars: std::collections::HashSet::new(),
             generalized_numerals: std::collections::HashSet::new(),
@@ -652,6 +657,14 @@ impl TypeChecker {
     ///
     /// Everything else falls back to synthesising and unifying, which is equivalent.
     pub fn check(&mut self, expr: &Expr, expected: &Type) -> Result<(), TypeError> {
+        self.check_node(expr, expected)?;
+        if let Some(types) = self.node_types.as_mut() {
+            types.push((expr.id(), expected.clone()));
+        }
+        Ok(())
+    }
+
+    fn check_node(&mut self, expr: &Expr, expected: &Type) -> Result<(), TypeError> {
         let resolved = self.apply(expected);
 
         // A string literal where a nominal with `from_quote` is expected IS that
@@ -2069,6 +2082,42 @@ impl TypeChecker {
     }
 
     pub fn synth(&mut self, expr: &Expr) -> Result<Type, TypeError> {
+        let ty = self.synth_node(expr)?;
+        if let Some(types) = self.node_types.as_mut() {
+            types.push((expr.id(), ty.clone()));
+        }
+        Ok(ty)
+    }
+
+    /// Record every node's type from here on; read them with `node_types`.
+    pub fn record_types(&mut self) {
+        self.node_types.get_or_insert_with(Vec::new);
+    }
+
+    /// Each recorded node's type, once inference is done: the substitution applied
+    /// and an unpinned numeral defaulted, as the program will see it. A node typed
+    /// more than once (checked, then synthesised inside) keeps its last type,
+    /// except as follows.
+    ///
+    /// A node synthesised and also checked against a nominal (a tag or a record
+    /// literal where a `Node` or a `Particle` is wanted) keeps the nominal: it is
+    /// what the value is, where the synthesised type is only its shape.
+    pub fn node_types(&self) -> std::collections::HashMap<crate::ast::NodeId, Type> {
+        let mut out: std::collections::HashMap<crate::ast::NodeId, Type> = std::collections::HashMap::new();
+        for (id, ty) in self.node_types.iter().flatten() {
+            let ty = self.defaulted(ty);
+            let nominal = |t: &Type| matches!(t, Type::Nominal { backing, .. } if !matches!(**backing, Type::TypeVar(_)));
+            match out.get(id) {
+                Some(kept) if nominal(kept) && !nominal(&ty) => {}
+                _ => {
+                    out.insert(*id, ty);
+                }
+            }
+        }
+        out
+    }
+
+    fn synth_node(&mut self, expr: &Expr) -> Result<Type, TypeError> {
         match expr {
             _ if expr_id_has_nominal(self, expr) => {
                 // Taken OUT while it is checked: `check` falls back to `synth` for a
