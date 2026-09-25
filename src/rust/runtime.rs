@@ -209,13 +209,13 @@ pub fn List__set_or_same<T: Clone>(mut l: List<T>, i: u64, x: T) -> List<T> {
     l
 }
 #[cfg_attr(roc2rust_count_allocs, track_caller)]
-pub fn List__replace<T: Clone>(mut l: List<T>, i: u64, x: T) -> (List<T>, T) {
+pub fn List__replace<T: Clone>(mut l: List<T>, i: u64, x: T) -> Result<Rec_list_prev<List<T>, T>, ()> {
     let i = i as usize;
     if i >= l.items().len() {
-        return (l, x);
+        return Err(());
     }
-    let old = std::mem::replace(&mut l.edit()[i], x);
-    (l, old)
+    let prev = std::mem::replace(&mut l.edit()[i], x);
+    Ok(Rec_list_prev { list: l, prev })
 }
 #[cfg_attr(roc2rust_count_allocs, track_caller)]
 pub fn List__insert<T: Clone>(mut l: List<T>, i: u64, x: T) -> Result<List<T>, ()> {
@@ -392,6 +392,14 @@ pub trait RocOrder {
 pub struct Rec_len_start {
     pub len: u64,
     pub start: u64,
+}
+
+/// `{ list, prev }`, what `List.replace` answers: written as roc2rust writes
+/// any record, so a program's own `{ list, prev }` is this one.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Rec_list_prev<T0, T1> {
+    pub list: T0,
+    pub prev: T1,
 }
 
 // ---- Str ----

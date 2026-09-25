@@ -374,26 +374,39 @@ impl<'a> Cx<'a> {
     /// structural union holding all its tags, with the declaration's other tags:
     /// a Rust enum is its whole set of tags.
     fn declared_union(&self, tags: &[(&'static str, Vec<Type>)]) -> Option<Type> {
+        // An open union's tags are what one expression used; the declared type
+        // that has them all is its type -- a structural union, or a nominal's
+        // (`Node := [Empty, ..]`): rocflight's checker unifies a tag with a
+        // declared union without widening the tag's own type.
+        let has_all = |d: &[(&'static str, Vec<Type>)]| tags.iter().all(|(n, _)| d.iter().any(|(m, _)| m == n)) && d.len() > tags.len();
         let mut found = self
             .input
             .modules
             .iter()
             .flat_map(|m| m.types.iter())
             .chain(self.input.app_types.iter())
-            .filter_map(|(_, t)| match t {
-                Type::TagUnion { tags: d, .. } if tags.iter().all(|(n, _)| d.iter().any(|(m, _)| m == n)) && d.len() > tags.len() => Some(t.clone()),
+            .filter_map(|(name, t)| match t {
+                Type::TagUnion { tags: d, .. } if has_all(d) => Some((t.clone(), None)),
+                Type::Nominal { backing, .. } => match &**backing {
+                    Type::TagUnion { tags: d, .. } if has_all(d) && self.nominals.contains_key(bare(name)) => Some(((**backing).clone(), Some(name.clone()))),
+                    _ => None,
+                },
                 _ => None,
             });
-        let decl = found.next()?;
-        if found.any(|other| sorted_names(tag_names(&other).into_iter()) != sorted_names(tag_names(&decl).into_iter())) {
+        let (decl, nominal) = found.next()?;
+        if found.any(|(other, _)| sorted_names(tag_names(&other).into_iter()) != sorted_names(tag_names(&decl).into_iter())) {
             return None;
         }
         let mut bound = HashMap::new();
         bind(&decl, &Type::TagUnion { tags: tags.to_vec(), open: true }, &mut bound);
         let decl = subst(&decl, &bound);
-        Some(match decl {
+        let decl = match decl {
             Type::TagUnion { tags, .. } => Type::TagUnion { tags, open: false },
             other => other,
+        };
+        Some(match nominal {
+            Some(name) => Type::Nominal { name, backing: Box::new(decl) },
+            None => decl,
         })
     }
 
@@ -430,9 +443,9 @@ impl<'a> Cx<'a> {
     /// The Rust definitions of every type the program named.
     fn type_defs(&self) -> Result<String, String> {
         let mut out = String::new();
-        let mut noms: Vec<&Nominal> = self.nominals.values().collect();
-        noms.sort_by(|a, b| a.rust.cmp(&b.rust));
-        for n in noms {
+        let mut noms: Vec<(&String, &Nominal)> = self.nominals.iter().collect();
+        noms.sort_by(|a, b| a.1.rust.cmp(&b.1.rust));
+        for (own, n) in noms {
             if erased(&n.backing) {
                 continue;
             }
@@ -446,7 +459,7 @@ impl<'a> Cx<'a> {
                 Type::Record { fields, .. } => {
                     out.push_str(&format!("{}\npub struct {}{} {{\n", derive, n.rust, generics));
                     for (f, t) in fields {
-                        out.push_str(&format!("    pub {}: {},\n", sanitize(f), self.field_ty(t)?));
+                        out.push_str(&format!("    pub {}: {},\n", sanitize(f), self.field_ty(&own_params(t, own, n))?));
                     }
                     out.push_str("}\n\n");
                 }
@@ -456,7 +469,7 @@ impl<'a> Cx<'a> {
                         if p.is_empty() {
                             out.push_str(&format!("    {},\n", tag));
                         } else {
-                            let ps: Result<Vec<String>, String> = p.iter().map(|x| self.field_ty(x)).collect();
+                            let ps: Result<Vec<String>, String> = p.iter().map(|x| self.field_ty(&own_params(x, own, n))).collect();
                             out.push_str(&format!("    {}({}),\n", tag, ps?.join(", ")));
                         }
                     }
@@ -468,7 +481,7 @@ impl<'a> Cx<'a> {
         // Types reached only while writing these definitions are written too; the
         // structural ones are generic, so each is written once.
         for names in self.records.borrow().iter() {
-            if names == &["len".to_string(), "start".to_string()] {
+            if names == &["len".to_string(), "start".to_string()] || names == &["list".to_string(), "prev".to_string()] {
                 continue; // runtime.rs has it
             }
             let ps: Vec<String> = (0..names.len()).map(|i| format!("T{}", i)).collect();
@@ -1561,7 +1574,7 @@ fn builtin_borrows(module: &str, name: &str) -> &'static [usize] {
 
 fn builtin_err_tag(module: &str, name: &str) -> Option<&'static str> {
     Some(match (module, name) {
-        ("List", "get") => "OutOfBounds",
+        ("List", "get" | "replace") => "OutOfBounds",
         ("List", "first" | "last") => "ListWasEmpty",
         ("List", "find_first" | "find_last" | "find_first_index") => "NotFound",
         _ => return None,
@@ -1657,6 +1670,24 @@ fn subst(t: &Type, bound: &HashMap<u32, Type>) -> Type {
         Type::Record { fields, open } => Type::Record { fields: fields.iter().map(|(n, x)| (*n, subst(x, bound))).collect(), open: *open },
         Type::TagUnion { tags, open } => Type::TagUnion { tags: tags.iter().map(|(n, p)| (*n, p.iter().map(|x| subst(x, bound)).collect())).collect(), open: *open },
         Type::Nominal { name, backing } => Type::Nominal { name, backing: Box::new(subst(backing, bound)) },
+        other => other.clone(),
+    }
+}
+
+/// A field of nominal `n`'s declaration with `n`'s own references in it given
+/// `n`'s parameters. The parser leaves the recursive `IList(a)` inside
+/// `IList(a) := [INil, ICons(a, IList(a))]` a placeholder without its
+/// arguments; a Roc type refers to itself only with its own.
+fn own_params(t: &Type, own: &str, n: &Nominal) -> Type {
+    match t {
+        Type::Nominal { name, backing } if matches!(**backing, Type::TypeVar(_)) && bare(name) == own => {
+            Type::Nominal { name, backing: Box::new(n.backing.clone()) }
+        }
+        Type::List(e) => Type::List(Box::new(own_params(e, own, n))),
+        Type::Function(a, b) => Type::Function(Box::new(own_params(a, own, n)), Box::new(own_params(b, own, n))),
+        Type::Tuple(xs) => Type::Tuple(xs.iter().map(|x| own_params(x, own, n)).collect()),
+        Type::Record { fields, open } => Type::Record { fields: fields.iter().map(|(f, x)| (*f, own_params(x, own, n))).collect(), open: *open },
+        Type::TagUnion { tags, open } => Type::TagUnion { tags: tags.iter().map(|(g, p)| (*g, p.iter().map(|x| own_params(x, own, n)).collect())).collect(), open: *open },
         other => other.clone(),
     }
 }
