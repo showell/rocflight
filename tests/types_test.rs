@@ -359,6 +359,17 @@ fn an_alias_to_a_nominal_keeps_the_nominals_own_arguments() {
 }
 
 #[test]
+fn a_tag_pattern_on_a_nominal_binds_its_payload_types() {
+    // `B(n)` against a `Crate := [B(I64), Empty]` binds `n : I64`, so returning it
+    // where a Str is declared is rejected, as roc rejects it ("The first branch of
+    // this match does not match the previous branch").
+    let src = "Crate := [B(I64), Empty]\nf : Crate -> Str\nf = |c| match c {\n    B(n) => n\n    Empty => \"empty\"\n}\nf";
+    let err = type_error(src);
+    assert!(err.contains("Str") && err.contains("I64"), "got {}", err);
+    assert!(accepts("Crate := [B(I64), Empty]\nf : Crate -> I64\nf = |c| match c {\n    B(n) => n\n    Empty => 0\n}\nf"));
+}
+
+#[test]
 fn a_nominal_annotation_resolves_to_the_nominal() {
     assert_eq!(type_of("Point := { x: I64 }\np : Point\np = Point.{ x: 1 }\np"), "Point");
 }
