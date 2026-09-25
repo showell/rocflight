@@ -131,10 +131,11 @@ pub struct TypeChecker {
     enclosing_type: Vec<String>,
     /// A nested nominal's enclosing owner — see `Parser::enclosing_owners`.
     enclosing_owners: std::collections::HashMap<String, String>,
-    /// Every node's type as `synth` found it or `check` was told it, when
-    /// `record_types` asks; see `node_types`. Off by default: it costs a type clone
-    /// per node, and only a tool that reads the whole typed tree needs it.
-    node_types: Option<Vec<(crate::ast::NodeId, Type)>>,
+    /// Every type `synth` found and every type `check` was told, in the order they
+    /// were pushed, when `record_types` asks; `node_types` resolves them. Off by
+    /// default: it costs a type clone per call, and only a tool that reads the whole
+    /// typed tree needs it.
+    recorded_types: Option<Vec<(crate::ast::NodeId, Type)>>,
     /// Each `BinOp` node and the type its operands unified to, before the
     /// substitution is finished.
     ///
@@ -425,7 +426,7 @@ impl TypeChecker {
             collect_targets: std::collections::HashMap::new(),
             enclosing_type: Vec::new(),
             enclosing_owners: std::collections::HashMap::new(),
-            node_types: None,
+            recorded_types: None,
             literals: Vec::new(),
             numeral_vars: std::collections::HashSet::new(),
             generalized_numerals: std::collections::HashSet::new(),
@@ -658,7 +659,7 @@ impl TypeChecker {
     /// Everything else falls back to synthesising and unifying, which is equivalent.
     pub fn check(&mut self, expr: &Expr, expected: &Type) -> Result<(), TypeError> {
         self.check_node(expr, expected)?;
-        if let Some(types) = self.node_types.as_mut() {
+        if let Some(types) = self.recorded_types.as_mut() {
             types.push((expr.id(), expected.clone()));
         }
         Ok(())
@@ -2088,7 +2089,7 @@ impl TypeChecker {
 
     pub fn synth(&mut self, expr: &Expr) -> Result<Type, TypeError> {
         let ty = self.synth_node(expr)?;
-        if let Some(types) = self.node_types.as_mut() {
+        if let Some(types) = self.recorded_types.as_mut() {
             types.push((expr.id(), ty.clone()));
         }
         Ok(ty)
@@ -2096,30 +2097,22 @@ impl TypeChecker {
 
     /// Record every node's type from here on; read them with `node_types`.
     pub fn record_types(&mut self) {
-        self.node_types.get_or_insert_with(Vec::new);
+        self.recorded_types.get_or_insert_with(Vec::new);
     }
 
     /// Each recorded node's type, once inference is done: the substitution applied
-    /// and an unpinned numeral defaulted, as the program will see it. A node typed
-    /// more than once (checked, then synthesised inside) keeps its last type,
-    /// except as follows.
+    /// and an unpinned numeral defaulted, as the program will see it. Meaningful only
+    /// after checking succeeded: a check that fails leaves a partial record. It builds
+    /// the map on each call, so a caller asks once.
     ///
-    /// A node synthesised and also checked against a nominal (a tag or a record
-    /// literal where a `Node` or a `Particle` is wanted) keeps the nominal: it is
-    /// what the value is, where the synthesised type is only its shape.
+    /// A node typed more than once keeps the last type recorded for it, and a node
+    /// that is checked records the type it was checked AGAINST after its own
+    /// synthesised type, so that is the one kept. Unification is lenient in places,
+    /// so the two can differ: a nominal against its backing, a range where a list is
+    /// expected, one integer width against another. For a translator the expected
+    /// type is usually the one wanted (a `5` checked against `U8` is a `U8`).
     pub fn node_types(&self) -> std::collections::HashMap<crate::ast::NodeId, Type> {
-        let mut out: std::collections::HashMap<crate::ast::NodeId, Type> = std::collections::HashMap::new();
-        for (id, ty) in self.node_types.iter().flatten() {
-            let ty = self.defaulted(ty);
-            let nominal = |t: &Type| matches!(t, Type::Nominal { backing, .. } if !matches!(**backing, Type::TypeVar(_)));
-            match out.get(id) {
-                Some(kept) if nominal(kept) && !nominal(&ty) => {}
-                _ => {
-                    out.insert(*id, ty);
-                }
-            }
-        }
-        out
+        self.recorded_types.iter().flatten().map(|(id, ty)| (*id, self.defaulted(ty))).collect()
     }
 
     fn synth_node(&mut self, expr: &Expr) -> Result<Type, TypeError> {
