@@ -1371,28 +1371,6 @@ impl<'a> Cx<'a> {
         if xs.is_empty() {
             return Ok(format!("{}::{}", enum_name, name));
         }
-        // A nominal's constructor knows its payload's types; a tag or a string
-        // literal inside it takes them from there. The checker cannot type the
-        // inner `Cell("9", Empty)` of `Cell("12", Cell("9", Empty))`: the
-        // recursive `Box_(a)` it fills is a fresh variable, not `Box_(CceText)`.
-        let mut xs = xs;
-        if matches!(t, Type::Nominal { .. }) {
-            for (i, (a, (pt, _))) in args.iter().zip(payload_types.iter()).enumerate() {
-                match a {
-                    Expr::Tag { name: inner, args: inner_args, .. } if matches!(pt, Type::Nominal { .. }) => {
-                        xs[i] = self.tag_typed(inner, inner_args, pt, scope)?;
-                    }
-                    Expr::Str(lit, _) => {
-                        if let Type::Nominal { name: n, .. } = pt {
-                            if let Some(from) = self.qualified(bare(n), "from_quote") {
-                                xs[i] = format!("{}(Str::lit({:?})).unwrap()", sanitize(&from), lit);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
         let boxed: Vec<String> = xs
             .into_iter()
             .zip(payload_types.iter())
