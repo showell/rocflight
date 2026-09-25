@@ -237,7 +237,7 @@ impl TypeChecker {
 
     /// The nominal a suffix names, as the program declared it.
     fn nominal_named(&self, name: &str) -> Type {
-        self.apply(&Type::Nominal { name: intern(name), backing: Box::new(Type::TypeVar(u32::MAX)) })
+        self.apply(&Type::Nominal { name: intern(name), backing: Box::new(Type::TypeVar(u32::MAX)), args: Vec::new() })
     }
 
     /// What `Name.from_interpolation` gives back, where it is declared.
@@ -266,7 +266,7 @@ impl TypeChecker {
             // NOT one — it names `Thing`, which resolves — so it must win over the
             // app's own `Nominal { ThingAlias, ? }` stand-in.
             let placeholder = |t: &Type| {
-                matches!(t, Type::Nominal { name: n, backing }
+                matches!(t, Type::Nominal { name: n, backing, .. }
                     if *n == name && matches!(**backing, Type::TypeVar(u32::MAX)))
             };
             // A module is an empty namespace, `Maybe :: [].{ ... }`, and types are
@@ -340,28 +340,52 @@ impl TypeChecker {
             // declaration, not a stand-in. A cross-module alias to another nominal,
             // `ThingAlias : ThingMod.Thing`, has a different name and does resolve:
             // one more expansion reaches `Thing`'s declaration.
-            Type::Nominal { name: n, backing }
+            Type::Nominal { name: n, backing, .. }
                 if matches!(**backing, Type::TypeVar(_)) && (*n == name || *n == bare) => None,
             _ => Some(declared),
         }
     }
 
+    /// A parameterised nominal's declared parameters, by its name or its bare name.
+    fn params_of(&self, name: &str) -> Option<&Vec<u32>> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        self.nominal_params.get(name).or_else(|| self.nominal_params.get(bare))
+    }
+
     fn expand(&self, ty: &Type, seen: &mut Vec<String>) -> Type {
         match ty {
-            Type::Nominal { name, backing } => {
+            Type::Nominal { name, backing, args } => {
+                let args: Vec<Type> = args.iter().map(|t| self.expand(t, seen)).collect();
                 if matches!(**backing, Type::TypeVar(_)) && !seen.iter().any(|s| s == *name) {
                     if let Some(target) = self.placeholder_target(name) {
-                        let target = target.clone();
+                        // The declaration at THIS reference's arguments: `Step(a)`
+                        // named inside `Iter_(a)` is `Step` over `Iter_`'s `a`, not
+                        // over a type of its own.
+                        let target = match self.params_of(name) {
+                            Some(params) if !args.is_empty() => {
+                                let mapping: Vec<(u32, Type)> = params.iter().copied().zip(args.iter().cloned()).collect();
+                                Self::substitute_vars(target, &mapping)
+                            }
+                            _ => target.clone(),
+                        };
                         seen.push((*name).to_string());
                         let expanded = self.expand(&target, seen);
                         seen.pop();
-                        return expanded;
+                        // The arguments stay on the nominal they name; an alias to
+                        // another nominal (`Foo(a) : Bar`) is that one's.
+                        let bare = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+                        return match expanded {
+                            Type::Nominal { name: n, backing, args: none } if none.is_empty() && bare(n) == bare(name) => {
+                                Type::Nominal { name: n, backing, args }
+                            }
+                            other => other,
+                        };
                     }
                 }
                 seen.push((*name).to_string());
                 let backing = self.expand(backing, seen);
                 seen.pop();
-                Type::Nominal { name: *name, backing: Box::new(backing) }
+                Type::Nominal { name: *name, backing: Box::new(backing), args }
             }
             Type::List(inner) => Type::List(Box::new(self.expand(inner, seen))),
             Type::Range(inner) => Type::Range(Box::new(self.expand(inner, seen))),
@@ -609,9 +633,10 @@ impl TypeChecker {
                     .collect(),
                 open: *open,
             },
-            Type::Nominal { name, backing } => Type::Nominal {
+            Type::Nominal { name, backing, args } => Type::Nominal {
                 name: *name,
                 backing: Box::new(Self::substitute_vars(backing, mapping)),
+                args: args.iter().map(|t| Self::substitute_vars(t, mapping)).collect(),
             },
             other => other.clone(),
         }
@@ -631,8 +656,10 @@ impl TypeChecker {
                     out.push(*id);
                 }
             }
-            Type::List(inner) | Type::Range(inner) | Type::Nominal { backing: inner, .. } => {
-                Self::type_vars_in(inner, out)
+            Type::List(inner) | Type::Range(inner) => Self::type_vars_in(inner, out),
+            Type::Nominal { backing, args, .. } => {
+                Self::type_vars_in(backing, out);
+                args.iter().for_each(|t| Self::type_vars_in(t, out));
             }
             Type::Function(param, result) => {
                 Self::type_vars_in(param, out);
@@ -1348,9 +1375,10 @@ impl TypeChecker {
                 Box::new(self.default_numerals(a, numerals)),
                 Box::new(self.default_numerals(b, numerals)),
             ),
-            Type::Nominal { name, backing } => Type::Nominal {
+            Type::Nominal { name, backing, args } => Type::Nominal {
                 name: *name,
                 backing: Box::new(self.default_numerals(backing, numerals)),
+                args: args.iter().map(|t| self.default_numerals(t, numerals)).collect(),
             },
             Type::Record { fields, open } => Type::Record {
                 fields: fields
@@ -1455,7 +1483,7 @@ impl TypeChecker {
         // an integer range still fall through to `List`.
         if module == "Range" && !self.declared_types.contains_key("Range") {
             let num = self.fresh_var();
-            let range = Type::Nominal { name: "Range", backing: Box::new(num.clone()) };
+            let range = Type::Nominal { name: "Range", backing: Box::new(num.clone()), args: Vec::new() };
             let closed = |tags: Vec<(&'static str, Vec<Type>)>| Type::TagUnion { tags, open: false };
             let len_hint = closed(vec![
                 ("Known", vec![Type::U64]),
@@ -2128,7 +2156,7 @@ impl TypeChecker {
                 // `MyTag.Foo({ x: 42 })` checked its payload against a bare variable
                 // and the literal defaulted to `Dec`.
                 let declared = match &declared {
-                    Type::Nominal { name, backing } if matches!(**backing, Type::TypeVar(u32::MAX)) => {
+                    Type::Nominal { name, backing, .. } if matches!(**backing, Type::TypeVar(u32::MAX)) => {
                         self.declared_types.get(*name).cloned().unwrap_or_else(|| declared.clone())
                     }
                     _ => declared,
@@ -3425,7 +3453,7 @@ impl TypeChecker {
             "U64x2" => Type::U64, "I64x2" => Type::I64,
             _ => Type::I64,
         };
-        let vector = Type::Nominal { name: intern(module), backing: Box::new(Type::U128) };
+        let vector = Type::Nominal { name: intern(module), backing: Box::new(Type::U128), args: Vec::new() };
         match method {
             "get_lane" => elem,
             "to_u128_bits" => Type::U128,
@@ -3442,6 +3470,7 @@ impl TypeChecker {
         Type::Nominal {
             name: intern(name),
             backing: Box::new(Type::closed_record(vec![("bytes", Type::List(Box::new(Type::U8)))])),
+            args: Vec::new(),
         }
     }
 
@@ -3685,7 +3714,7 @@ impl TypeChecker {
             // `Text.(units)` against a `Text` binds `units` to the backing.
             Pattern::Nominal { name, inner } => {
                 let backing = match self.apply(scrutinee) {
-                    Type::Nominal { name: n, backing } if n == *name => *backing,
+                    Type::Nominal { name: n, backing, .. } if n == *name => *backing,
                     other => other,
                 };
                 self.bind_pattern(inner, &backing);
@@ -4036,9 +4065,21 @@ impl TypeChecker {
             // `Graph` satisfies a `Dict` exactly as a plain record satisfies a nominal
             // over one. Refusing it made `GraphTraversal` fail with "Dict and Graph are
             // different nominal types".
-            (Type::Nominal { name: a, backing: a_backing },
-             Type::Nominal { name: b, backing: b_backing }) => {
+            (Type::Nominal { name: a, backing: a_backing, args: a_args },
+             Type::Nominal { name: b, backing: b_backing, args: b_args }) => {
                 if a == b {
+                    // The same nominal is the same type exactly when its ARGUMENTS
+                    // are: a backing is the declaration at those arguments. It is
+                    // also what ends a recursive type -- `Iter_(a)` holds a `Step(a)`
+                    // holding an `Iter_(a)` -- which unifying backings would unfold
+                    // for ever. Without arguments on both sides (a construction, or
+                    // a nominal rocflight builds itself) the backings are compared.
+                    if !a_args.is_empty() && a_args.len() == b_args.len() {
+                        for (x, y) in a_args.clone().iter().zip(b_args.clone().iter()) {
+                            self.unify(x, y)?;
+                        }
+                        return Ok(());
+                    }
                     if a_backing == b_backing {
                         return Ok(());
                     }
@@ -4068,8 +4109,8 @@ impl TypeChecker {
             // whole list, which the generic nominal-vs-other arm below would wrongly try.
             // This is what lets `mk : U64 -> Range(U64)` accept `0..<n` and a `for` loop
             // bind the element, while the nominal identity still routes `Range.custom`.
-            (Type::Nominal { name, backing }, Type::List(elem) | Type::Range(elem))
-            | (Type::List(elem) | Type::Range(elem), Type::Nominal { name, backing })
+            (Type::Nominal { name, backing, .. }, Type::List(elem) | Type::Range(elem))
+            | (Type::List(elem) | Type::Range(elem), Type::Nominal { name, backing, .. })
                 if *name == "Range" =>
             {
                 let (backing, elem) = ((**backing).clone(), (**elem).clone());

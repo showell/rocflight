@@ -22,7 +22,7 @@ use crate::types::Type;
 
 /// Bumped whenever the FORMAT changes, so an artifact from an older tree is rejected by
 /// `build.rs` rather than decoded as nonsense.
-pub const MAGIC: &[u8; 8] = b"ROCFLT05";
+pub const MAGIC: &[u8; 8] = b"ROCFLT06";
 
 /// FNV-1a of the source an artifact was built from. `build.rs` computes the same thing
 /// over `src/roc/Builtin.roc` and refuses to build if they differ.
@@ -274,10 +274,18 @@ fn put_type(w: &mut Writer, ty: &Type) {
             });
             w.bool(*open);
         }
-        Type::Nominal { name, backing } => {
+        // A nominal's arguments ride in tag 25; tag 23 is one without, as it
+        // always was, so an artifact with none reads the same.
+        Type::Nominal { name, backing, args } if args.is_empty() => {
             w.tag(23);
             w.s(name);
             put_type(w, backing);
+        }
+        Type::Nominal { name, backing, args } => {
+            w.tag(25);
+            w.s(name);
+            put_type(w, backing);
+            w.seq(args, |w, t| put_type(w, t));
         }
         Type::TagUnion { tags, open } => {
             w.tag(24);
@@ -324,7 +332,12 @@ fn get_type(r: &mut Reader) -> Type {
         }
         23 => {
             let name = r.s();
-            Type::Nominal { name, backing: Box::new(get_type(r)) }
+            Type::Nominal { name, backing: Box::new(get_type(r)), args: Vec::new() }
+        }
+        25 => {
+            let name = r.s();
+            let backing = Box::new(get_type(r));
+            Type::Nominal { name, backing, args: r.seq(0, |r, _| get_type(r)) }
         }
         24 => {
             let tags = r.seq(0, |r, _| (r.s(), r.seq(0, |r, _| get_type(r))));

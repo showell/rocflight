@@ -224,7 +224,7 @@ fn layout_at(ty: &Type, decls: &Declarations, depth: u32) -> Result<Layout, Stri
             }
             union(variants)
         }
-        Type::Nominal { name, backing } => {
+        Type::Nominal { name, backing, .. } => {
             if *name == "Box" {
                 Layout { size: WORD, align: WORD, class: Class::Pointer, shape: Shape::Box }
             } else if matches!(**backing, Type::TypeVar(u32::MAX)) {
@@ -375,7 +375,7 @@ mod tests {
         // ORACLE: size_of::<RocStr>() == 3 * size_of::<usize>().
         assert_eq!((lay(&Type::Str).size, lay(&Type::Str).align), (24, 8));
         assert_eq!((lay(&list(Type::U8)).size, lay(&list(Type::U8)).align), (24, 8));
-        let boxed = Type::Nominal { name: "Box".into(), backing: Box::new(Type::TypeVar(u32::MAX)) };
+        let boxed = Type::Nominal { name: "Box".into(), backing: Box::new(Type::TypeVar(u32::MAX)), args: Vec::new() };
         assert_eq!((lay(&boxed).size, lay(&boxed).shape), (8, Shape::Box));
         assert_eq!(lay(&Type::Unit).size, 0);
         assert_eq!(lay(&Type::I32).size, 4);
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn a_declared_name_resolves_through_the_platform() {
-        let named = Type::Nominal { name: "IOErr".into(), backing: Box::new(Type::TypeVar(u32::MAX)) };
+        let named = Type::Nominal { name: "IOErr".into(), backing: Box::new(Type::TypeVar(u32::MAX)), args: Vec::new() };
         let decls = Declarations::new([("IOErr".to_string(), io_err())]);
         assert_eq!(layout_of(&named, &decls).unwrap(), lay(&io_err()));
         assert!(layout_of(&named, &Declarations::default()).unwrap_err().contains("IOErr"));
