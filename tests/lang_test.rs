@@ -1748,3 +1748,12 @@ fn constants_that_seem_to_read_each_other_keep_file_order() {
     let src = "a = f(0)\n\nf = |n| if n > 0 { b } else { 1.I64 }\n\nb : I64\nb = a + 1\n\nStr.inspect((a, b))";
     assert_eq!(as_str(src), "(1, 2)");
 }
+
+#[test]
+fn a_namespace_member_comes_before_a_top_level_name() {
+    // Inside `Board`, a bare `count` is `Board.count`, as in roc, even beside a
+    // top-level `count`. The top-level one won, and a program whose own `count` is a
+    // function handed that function to `List.repeat`.
+    let src = "count : U64\ncount = 5\n\nBoard :: [].{\n\tcount : U64\n\tcount = 3\n\n\ttable : List(U64)\n\ttable = List.repeat(0, count)\n\n\tsize : {} -> U64\n\tsize = |{}| count\n}\n\nStr.inspect((List.len(Board.table), Board.size({})))";
+    assert_eq!(as_str(src), "(3, 3)");
+}
