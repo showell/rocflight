@@ -753,6 +753,17 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             let mut items = elements(args[0].clone(), name)?;
             Ok(Value::Bool(items.any(|v| values_equal(&v, &args[1]))))
         }
+        // Does the list begin (end) with every element of the second, in order?
+        "starts_with" | "ends_with" => {
+            expect(2, args.len())?;
+            let items: Vec<Value> = elements(args[0].clone(), name)?.collect();
+            let part: Vec<Value> = elements(args[1].clone(), name)?.collect();
+            if part.len() > items.len() {
+                return Ok(Value::Bool(false));
+            }
+            let from = if name == "starts_with" { 0 } else { items.len() - part.len() };
+            Ok(Value::Bool(part.iter().zip(&items[from..]).all(|(p, v)| values_equal(v, p))))
+        }
         _ => Err(EvalError {
             message: format!("Unknown function List.{}", name),
         }),

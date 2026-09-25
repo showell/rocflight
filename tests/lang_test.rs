@@ -2014,3 +2014,11 @@ fn a_try_function_called_through_its_module() {
     let src = "t : Try(I64, [Odd])\nt = Ok(2)\ne : Try(I64, [Odd])\ne = Err(Odd)\nStr.inspect((Try.map_ok(t, |n| n + 1), Try.map_ok(e, |n| n + 1), Try.is_ok(t), Try.map_err(e, |_| Bad)))";
     assert_eq!(as_str(src), "(Ok(3), Err(Odd), True, Err(Bad))");
 }
+
+#[test]
+fn list_starts_with_and_ends_with() {
+    // Builtin.roc declares both; there was no native implementation ("Unknown
+    // function List.starts_with").
+    let src = "Str.inspect((List.starts_with([1.I64, 2, 3], [1, 2]), List.starts_with([1.I64, 2], [2]), List.ends_with([1.I64, 2, 3], [2, 3]), List.ends_with([1.I64], [1, 1]), List.starts_with([1.I64], [])))";
+    assert_eq!(as_str(src), "(True, False, True, False, True)");
+}
