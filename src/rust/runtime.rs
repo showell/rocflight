@@ -153,10 +153,10 @@ impl<T: Clone> List<T> {
 
 // ---- List ----
 
-pub fn List__len<T: Clone>(l: List<T>) -> u64 {
+pub fn List__len<T: Clone>(l: &List<T>) -> u64 {
     l.items().len() as u64
 }
-pub fn List__get<T: Clone>(l: List<T>, i: u64) -> Result<T, ()> {
+pub fn List__get<T: Clone>(l: &List<T>, i: u64) -> Result<T, ()> {
     l.items().get(i as usize).cloned().ok_or(())
 }
 #[cfg_attr(roc2rust_count_allocs, track_caller)]
@@ -201,7 +201,7 @@ pub fn List__append<T: Clone>(mut l: List<T>, x: T) -> List<T> {
     l
 }
 #[cfg_attr(roc2rust_count_allocs, track_caller)]
-pub fn List__concat<T: Clone>(mut a: List<T>, b: List<T>) -> List<T> {
+pub fn List__concat<T: Clone>(mut a: List<T>, b: &List<T>) -> List<T> {
     if !b.is_empty() {
         a.edit().extend(b.items().iter().cloned());
     }
@@ -242,30 +242,30 @@ pub fn List__drop_last<T: Clone>(mut l: List<T>, n: u64) -> List<T> {
     }
     l
 }
-pub fn List__last<T: Clone>(l: List<T>) -> Result<T, ()> {
+pub fn List__last<T: Clone>(l: &List<T>) -> Result<T, ()> {
     l.items().last().cloned().ok_or(())
 }
-pub fn List__map<T: Clone, U: Clone>(l: List<T>, f: &dyn Fn(T) -> U) -> List<U> {
+pub fn List__map<T: Clone, U: Clone>(l: &List<T>, f: &dyn Fn(T) -> U) -> List<U> {
     List::of(l.items().iter().cloned().map(|x| f(x)).collect())
 }
-pub fn List__fold<T: Clone, S: Clone>(l: List<T>, init: S, f: &dyn Fn(S, T) -> S) -> S {
+pub fn List__fold<T: Clone, S: Clone>(l: &List<T>, init: S, f: &dyn Fn(S, T) -> S) -> S {
     let mut acc = init;
     for x in l.items().iter().cloned() {
         acc = f(acc, x);
     }
     acc
 }
-pub fn List__starts_with<T: Clone + PartialEq>(l: List<T>, p: List<T>) -> bool {
+pub fn List__starts_with<T: Clone + PartialEq>(l: &List<T>, p: &List<T>) -> bool {
     l.items().starts_with(p.items())
 }
-pub fn List__ends_with<T: Clone + PartialEq>(l: List<T>, p: List<T>) -> bool {
+pub fn List__ends_with<T: Clone + PartialEq>(l: &List<T>, p: &List<T>) -> bool {
     l.items().ends_with(p.items())
 }
 
-pub fn List__is_empty<T: Clone>(l: List<T>) -> bool {
+pub fn List__is_empty<T: Clone>(l: &List<T>) -> bool {
     l.items().is_empty()
 }
-pub fn List__first<T: Clone>(l: List<T>) -> Result<T, ()> {
+pub fn List__first<T: Clone>(l: &List<T>) -> Result<T, ()> {
     l.items().first().cloned().ok_or(())
 }
 #[cfg_attr(roc2rust_count_allocs, track_caller)]
@@ -289,16 +289,16 @@ pub fn List__drop_at<T: Clone>(mut l: List<T>, i: u64) -> List<T> {
     }
     l
 }
-pub fn List__contains<T: Clone + PartialEq>(l: List<T>, x: T) -> bool {
+pub fn List__contains<T: Clone + PartialEq>(l: &List<T>, x: T) -> bool {
     l.items().contains(&x)
 }
-pub fn List__any<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> bool {
+pub fn List__any<T: Clone>(l: &List<T>, f: &dyn Fn(T) -> bool) -> bool {
     l.items().iter().cloned().any(|x| f(x))
 }
-pub fn List__all<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> bool {
+pub fn List__all<T: Clone>(l: &List<T>, f: &dyn Fn(T) -> bool) -> bool {
     l.items().iter().cloned().all(|x| f(x))
 }
-pub fn List__count_if<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> u64 {
+pub fn List__count_if<T: Clone>(l: &List<T>, f: &dyn Fn(T) -> bool) -> u64 {
     l.items().iter().cloned().filter(|x| f(x.clone())).count() as u64
 }
 #[cfg_attr(roc2rust_count_allocs, track_caller)]
@@ -317,22 +317,22 @@ pub fn List__drop_if<T: Clone>(mut l: List<T>, f: &dyn Fn(T) -> bool) -> List<T>
     l.edit().retain(|x| !f(x.clone()));
     l
 }
-pub fn List__find_first<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> Result<T, ()> {
+pub fn List__find_first<T: Clone>(l: &List<T>, f: &dyn Fn(T) -> bool) -> Result<T, ()> {
     l.items().iter().cloned().find(|x| f(x.clone())).ok_or(())
 }
-pub fn List__find_last<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> Result<T, ()> {
+pub fn List__find_last<T: Clone>(l: &List<T>, f: &dyn Fn(T) -> bool) -> Result<T, ()> {
     l.items().iter().rev().cloned().find(|x| f(x.clone())).ok_or(())
 }
-pub fn List__find_first_index<T: Clone>(l: List<T>, f: &dyn Fn(T) -> bool) -> Result<u64, ()> {
+pub fn List__find_first_index<T: Clone>(l: &List<T>, f: &dyn Fn(T) -> bool) -> Result<u64, ()> {
     l.items().iter().cloned().position(|x| f(x)).map(|i| i as u64).ok_or(())
 }
-pub fn List__map_with_index<T: Clone, U: Clone>(l: List<T>, f: &dyn Fn(T, u64) -> U) -> List<U> {
+pub fn List__map_with_index<T: Clone, U: Clone>(l: &List<T>, f: &dyn Fn(T, u64) -> U) -> List<U> {
     List::of(l.items().iter().cloned().enumerate().map(|(i, x)| f(x, i as u64)).collect())
 }
-pub fn List__join<T: Clone>(l: List<List<T>>) -> List<T> {
+pub fn List__join<T: Clone>(l: &List<List<T>>) -> List<T> {
     List::of(l.items().iter().flat_map(|x| x.items().iter().cloned()).collect())
 }
-pub fn List__join_map<T: Clone, U: Clone>(l: List<T>, f: &dyn Fn(T) -> List<U>) -> List<U> {
+pub fn List__join_map<T: Clone, U: Clone>(l: &List<T>, f: &dyn Fn(T) -> List<U>) -> List<U> {
     List::of(l.items().iter().cloned().flat_map(|x| f(x).items().iter().cloned().collect::<Vec<U>>()).collect())
 }
 /// `List.sort_with`: a stable sort, as Roc's is, by a comparison answering the
@@ -490,20 +490,20 @@ pub fn display_str(x: impl std::fmt::Display) -> Str {
     b.finish()
 }
 
-pub fn Str__concat(a: Str, b: Str) -> Str {
+pub fn Str__concat(a: &Str, b: &Str) -> Str {
     let mut t = StrBuf::new();
     t.push(&a);
     t.push(&b);
     t.finish()
 }
-pub fn Str__to_utf8(s: Str) -> List<u8> {
+pub fn Str__to_utf8(s: &Str) -> List<u8> {
     List::of(s.as_bytes().to_vec())
 }
-pub fn Str__from_utf8_lossy(l: List<u8>) -> Str {
+pub fn Str__from_utf8_lossy(l: &List<u8>) -> Str {
     Str::from(String::from_utf8_lossy(l.items()).into_owned())
 }
 
-pub fn Str__join_with(l: List<Str>, sep: Str) -> Str {
+pub fn Str__join_with(l: &List<Str>, sep: &Str) -> Str {
     let mut t = StrBuf::new();
     for (i, s) in l.items().iter().enumerate() {
         if i > 0 {

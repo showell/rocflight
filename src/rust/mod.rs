@@ -15,8 +15,10 @@
 //! holding one is an `Rc`. A nominal over a list or a scalar (`CceText ::
 //! List(U8)`) is a type alias: Roc erases it at run time, and so does this.
 //!
-//! **Values.** Every non-copy value is cloned where it is read; a `List` is an
-//! `Rc` that copies on write, so a clone is a count. A closure is an
+//! **Values.** A `List` is an `Rc` that copies on write, so a clone is a count;
+//! a `Str` holds up to 23 bytes in place, as roc's does. A non-copy value is
+//! moved at its last use, lent to a builtin that only reads it, and cloned at
+//! any other read. A closure is an
 //! `Rc<dyn Fn(..)>` with its captures cloned in. A `match` is a labeled block of
 //! nested `if let`s, one per arm, which takes nested patterns, guards and
 //! literals alike.
@@ -999,12 +1001,20 @@ impl<'a> Cx<'a> {
             Expr::Qualified { module, name, .. } => matches!(*module, "List" | "Str") && self.qualified(module, name).is_none(),
             _ => false,
         };
-        let xs: Result<Vec<String>, String> = args.iter().map(|a| if runtime { self.builtin_arg(a, scope) } else { self.expr(a, scope) }).collect();
+        let lent: &[usize] = match func {
+            Expr::Qualified { module, name, .. } if runtime => builtin_borrows(module, name),
+            _ => &[],
+        };
+        let xs: Result<Vec<String>, String> = args
+            .iter()
+            .enumerate()
+            .map(|(k, a)| if lent.contains(&k) { self.lent_arg(a, scope) } else if runtime { self.builtin_arg(a, scope) } else { self.expr(a, scope) })
+            .collect();
         let mut xs = xs?;
         // A variable handed over (its last use) is read after every other argument
         // is evaluated, as Roc evaluates them all before the call: the others go
         // into `let`s first, in order.
-        let moves_one = args.iter().any(|a| matches!(a, Expr::Ident(_, id) if self.moving.borrow().contains(id)));
+        let moves_one = args.iter().enumerate().any(|(k, a)| !lent.contains(&k) && matches!(a, Expr::Ident(_, id) if self.moving.borrow().contains(id)));
         let mut lets = String::new();
         if moves_one {
             for (k, a) in args.iter().enumerate() {
@@ -1063,6 +1073,15 @@ impl<'a> Cx<'a> {
             Expr::Lambda { params, body, .. } => self.lambda(params, body, a, scope, true),
             _ => Ok(format!("&*{}", self.place(a, scope)?.map_or_else(|| self.expr(a, scope), Ok)?)),
         }
+    }
+
+    /// An argument a runtime builtin only reads, lent to it: a local or a field of
+    /// one in place, anything else as a temporary.
+    fn lent_arg(&self, a: &Expr, scope: &Scope) -> Result<String, String> {
+        Ok(match self.place(a, scope)? {
+            Some(p) => format!("&{}", p),
+            None => format!("&({})", self.expr(a, scope)?),
+        })
     }
 
     /// `.map_err(..)` turning a builtin's `Err(())` into this call's `Err(tag)`.
@@ -1518,6 +1537,22 @@ impl<'a> Cx<'a> {
 }
 
 /// The tag a builtin's `Err` carries.
+/// The arguments a runtime builtin only reads, which it borrows (`runtime.rs`
+/// takes them as `&List`/`&Str`).
+fn builtin_borrows(module: &str, name: &str) -> &'static [usize] {
+    match (module, name) {
+        ("List", "starts_with" | "ends_with") | ("Str", "concat" | "join_with") => &[0, 1],
+        ("List", "concat") => &[1],
+        (
+            "List",
+            "len" | "get" | "first" | "last" | "is_empty" | "contains" | "any" | "all" | "count_if" | "find_first" | "find_last" | "find_first_index" | "map"
+            | "map_with_index" | "fold" | "join" | "join_map",
+        )
+        | ("Str", "to_utf8" | "from_utf8_lossy") => &[0],
+        _ => &[],
+    }
+}
+
 fn builtin_err_tag(module: &str, name: &str) -> Option<&'static str> {
     Some(match (module, name) {
         ("List", "get") => "OutOfBounds",
@@ -1682,7 +1717,7 @@ fn last_uses(e: &Expr, name: &str, later: bool, marks: &mut Vec<NodeId>) -> bool
         }
         Expr::Match { scrutinee, arms, .. } => {
             if let Some((_, args)) = set_or_same_parts(scrutinee, arms) {
-                return call_last_uses(args, name, later, marks);
+                return call_last_uses(args, &[], name, later, marks);
             }
             // Arms from the last: a guard that fails goes on to the arms after it.
             let mut after = false;
@@ -1711,13 +1746,20 @@ fn last_uses(e: &Expr, name: &str, later: bool, marks: &mut Vec<NodeId>) -> bool
             true
         }
         Expr::Call { func, args, .. } => {
-            let in_args = call_last_uses(args, name, later, marks);
+            let lent = match &**func {
+                Expr::Qualified { module, name: f, .. } => builtin_borrows(module, f),
+                _ => &[],
+            };
+            let in_args = call_last_uses(args, lent, name, later, marks);
             last_uses(func, name, later || in_args, marks) || in_args
         }
-        Expr::Dispatch { receiver, args, .. } => {
+        Expr::Dispatch { receiver, method, args, .. } => {
             let all: Vec<Expr> = std::iter::once((**receiver).clone()).chain(args.iter().cloned()).collect();
+            // The receiver's type picks the module; unknown here, a method any
+            // builtin lends is taken as lent.
+            let lent: Vec<usize> = builtin_borrows("List", method).iter().chain(builtin_borrows("Str", method)).copied().collect();
             // Marks are by node id, so the clones stand for the originals.
-            call_last_uses(&all, name, later, marks)
+            call_last_uses(&all, &lent, name, later, marks)
         }
         other => {
             let parts: Vec<&Expr> = other.children().into_iter().filter(|c| mentions(c, name)).collect();
@@ -1733,7 +1775,14 @@ fn last_uses(e: &Expr, name: &str, later: bool, marks: &mut Vec<NodeId>) -> bool
 /// A call's arguments: the ones that are not a bare variable first, left to right,
 /// then the bare variables, which `call` reads last. A variable passed twice is
 /// marked in neither place.
-fn call_last_uses(args: &[Expr], name: &str, later: bool, marks: &mut Vec<NodeId>) -> bool {
+/// `lent`: the arguments a builtin borrows (`builtin_borrows`). Borrowed for the
+/// whole call, they are read at the call, after every other argument: nothing
+/// else in the call can hand the variable over, and they never do.
+fn call_last_uses(args: &[Expr], lent: &[usize], name: &str, later: bool, marks: &mut Vec<NodeId>) -> bool {
+    let lent_reads = args.iter().enumerate().any(|(k, a)| lent.contains(&k) && mentions(a, name));
+    let later = later || lent_reads;
+    let args: Vec<Expr> = args.iter().enumerate().filter(|(k, _)| !lent.contains(k)).map(|(_, a)| a.clone()).collect();
+    let args = args.as_slice();
     let bare: Vec<&Expr> = args.iter().filter(|a| matches!(a, Expr::Ident(n, _) if *n == name)).collect();
     // A lambda passed straight to the call may be a borrowed closure the callee
     // runs while it works: its reads happen during the call, so the variable
@@ -1752,7 +1801,7 @@ fn call_last_uses(args: &[Expr], name: &str, later: bool, marks: &mut Vec<NodeId
             seen = true;
         }
     }
-    seen
+    seen || lent_reads
 }
 
 /// Can `{ ..x, fields }` take `x` over: the new values read `x` only as `x.f`,
