@@ -557,6 +557,9 @@ pub fn Str__concat(a: &Str, b: &Str) -> Str {
     t.push(&b);
     t.finish()
 }
+pub fn Str__is_empty(s: &Str) -> bool {
+    s.as_bytes().is_empty()
+}
 pub fn Str__to_utf8(s: &Str) -> List<u8> {
     List::of(s.as_bytes().to_vec())
 }
@@ -675,6 +678,7 @@ pub mod F64 {
     pub fn is_finite(a: f64) -> bool { a.is_finite() }
     pub fn abs(a: f64) -> f64 { a.abs() }
     pub fn sqrt(a: f64) -> f64 { a.sqrt() }
+    pub fn pow(a: f64, b: f64) -> f64 { a.powf(b) }
     pub fn to_f32_wrap(a: f64) -> f32 { a as f32 }
     pub fn to_str(a: f64) -> super::Str { super::display_str(format_args!("{:?}", a)) }
 }
@@ -690,6 +694,7 @@ pub mod F32 {
     pub fn is_finite(a: f32) -> bool { a.is_finite() }
     pub fn abs(a: f32) -> f32 { a.abs() }
     pub fn sqrt(a: f32) -> f32 { a.sqrt() }
+    pub fn pow(a: f32, b: f32) -> f32 { a.powf(b) }
     pub fn to_str(a: f32) -> super::Str { super::display_str(format_args!("{:?}", a)) }
 }
 

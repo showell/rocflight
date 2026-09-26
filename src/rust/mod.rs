@@ -1591,7 +1591,7 @@ fn builtin_borrows(module: &str, name: &str) -> &'static [usize] {
             "len" | "get" | "first" | "last" | "is_empty" | "contains" | "any" | "all" | "count_if" | "find_first" | "find_last" | "find_first_index" | "map"
             | "map_with_index" | "fold" | "join" | "join_map",
         )
-        | ("Str", "to_utf8" | "from_utf8_lossy") => &[0],
+        | ("Str", "is_empty" | "to_utf8" | "from_utf8_lossy") => &[0],
         _ => &[],
     }
 }
