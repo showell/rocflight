@@ -2569,8 +2569,8 @@ impl TypeChecker {
                     // A range yields its element type without being a list.
                     Type::Range(elem) => *elem,
                     // A nominal with an `iter` method — a custom iterable — is looped
-                    // over its `iter()`, whose element is what the loop binds. The
-                    // compiler inserts the `.iter()` for these nodes.
+                    // over its `iter()`, whose element is what the loop binds. The VM
+                    // calls the `iter` when the loop starts.
                     Type::Nominal { ref name, .. } if self.declared(name, "iter").is_some() => {
                         self.for_iter_calls.insert(*id);
                         let iter = self.declared(name, "iter").expect("just checked");

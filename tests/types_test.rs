@@ -993,3 +993,30 @@ main! = |_args| {
 "#;
     assert_eq!(run_program(src), Ok(()));
 }
+
+#[test]
+fn a_for_loop_walks_the_iterator_its_nominals_iter_gives() {
+    // `for x in bag` calls `Bag.iter`, and a list's `.iter()` is a lazy iterator, which
+    // the loop then walks. roc prints 6.
+    let src = r#"app [main!] {}
+
+Bag := [Bag(List(I64))].{
+    iter : Bag -> Iter(I64)
+    iter = |Bag(xs)| xs.iter()
+}
+
+total : Bag -> I64
+total = |bag| {
+    var $s = 0
+    for x in bag {
+        $s = $s + x
+    }
+    $s
+}
+
+main! = |_args| {
+    if total(Bag.Bag([1, 2, 3])) == 6 { Ok({}) } else { crash "wrong total" }
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}

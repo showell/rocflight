@@ -1779,6 +1779,14 @@ fn iter_step(
             return Err(EvalError { message: format!("vm: loop counter held {}", other) })
         }
     };
+    // A nominal iterable — a record or tag with an `iter` method — is turned into its
+    // iterator once, in place, then looped. First, because what `iter` gives may be
+    // the lazy iterator below.
+    if matches!(&regs[base + iter as usize], Value::Record(_) | Value::Tag(..)) {
+        if let Some(iterated) = call_iter_method(program, &regs[base + iter as usize])? {
+            regs[base + iter as usize] = iterated;
+        }
+    }
     // A lazy iterator carries its own state, not an index: step it, skipping past
     // `Skip`s, and write the rest back for next time.
     //
@@ -1811,13 +1819,6 @@ fn iter_step(
                 on_item
             }
         });
-    }
-    // A nominal iterable — a record or tag with an `iter` method — is turned into its
-    // iterator once, in place, then looped.
-    if matches!(&regs[base + iter as usize], Value::Record(_) | Value::Tag(..)) {
-        if let Some(iterated) = call_iter_method(program, &regs[base + iter as usize])? {
-            regs[base + iter as usize] = iterated;
-        }
     }
     let next = match &regs[base + iter as usize] {
         Value::Range { start, end, inclusive, step } => {
