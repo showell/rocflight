@@ -22,7 +22,7 @@ use crate::types::Type;
 
 /// Bumped whenever the FORMAT changes, so an artifact from an older tree is rejected by
 /// `build.rs` rather than decoded as nonsense.
-pub const MAGIC: &[u8; 8] = b"ROCFLT06";
+pub const MAGIC: &[u8; 8] = b"ROCFLT07";
 
 /// FNV-1a of the source an artifact was built from. `build.rs` computes the same thing
 /// over `src/roc/Builtin.roc` and refuses to build if they differ.
@@ -1044,7 +1044,7 @@ op_codec! {
     50 BinDispatch { dst: r, a: r, b: r, op: binop, },
     51 Expect { cond: r, },
     52 TestExpect { cond: r, },
-    53 Dbg { src: r, },
+    53 Dbg { src: r, shape: r, },
     54 Crash { src: r, },
     55 IterNext { dst: r, iter: r, idx: r, to: u32, },
     56 IterNextBack { dst: r, iter: r, idx: r, to: u32, },

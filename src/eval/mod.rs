@@ -32,6 +32,12 @@ thread_local! {
     /// does for the reason roc does it.
     static INSPECTING: std::cell::RefCell<Vec<&'static str>> =
         const { std::cell::RefCell::new(Vec::new()) };
+
+    /// The same for `inspect_as`, with the value each method is showing. There the
+    /// types say which method applies, so only showing the SAME value again is a
+    /// loop: a `Node.to_inspect` that inspects its child `Node`s is not one.
+    static INSPECTING_TYPED: std::cell::RefCell<Vec<(&'static str, Value)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A nominal's own `to_inspect`, if it defines one.
@@ -2796,12 +2802,16 @@ pub fn call_builtin_values(
             }
         }
         ("Str", "inspect") => {
-            if args.len() != 1 {
+            if args.is_empty() || args.len() > 2 {
                 return Err(EvalError {
                     message: format!("Str.inspect expects 1 argument, got {}", args.len()),
                 });
             }
             let val = args[0].clone();
+            // The compiler passes the argument's type, when the checker knew it.
+            if let Some(shape) = args.get(1) {
+                return Ok(str_value(inspect_as(&val, shape)));
+            }
             // A nominal may define `to_inspect` to control how it is shown.
             if let Some(custom) = custom_inspect(&val) {
                 return Ok(custom);
@@ -3326,16 +3336,31 @@ pub fn inspect(value: &Value) -> String {
     {
         return "<opaque>".to_string();
     }
+    render(value, &|_, v| inspect(v))
+}
+
+/// A part of a value that `render` shows by asking its caller.
+pub enum Part<'a> {
+    /// A list's or tuple's element, by position.
+    Item(usize),
+    /// A record's field.
+    Field(&'a str),
+    /// A tag's payload, by position.
+    Payload(usize),
+}
+
+/// A value as roc shows it, each part shown by `part`.
+fn render(value: &Value, part: &dyn Fn(Part, &Value) -> String) -> String {
     match value {
         Value::Str(s) => crate::eval::value::quoted(s),
         Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         Value::Unit => "{}".to_string(),
         Value::List(items) => {
-            let rendered: Vec<String> = items.iter().map(inspect).collect();
+            let rendered: Vec<String> = items.iter().enumerate().map(|(i, v)| part(Part::Item(i), v)).collect();
             format!("[{}]", rendered.join(", "))
         }
         Value::Tuple(items) => {
-            let rendered: Vec<String> = items.iter().map(inspect).collect();
+            let rendered: Vec<String> = items.iter().enumerate().map(|(i, v)| part(Part::Item(i), v)).collect();
             format!("({})", rendered.join(", "))
         }
         Value::Range { .. } => "<opaque>".to_string(),
@@ -3347,18 +3372,101 @@ pub fn inspect(value: &Value) -> String {
             sorted.sort_by(|a, b| a.0.cmp(b.0));
             let rendered: Vec<String> = sorted
                 .iter()
-                .map(|(name, v)| format!("{}: {}", name, inspect(v)))
+                .map(|(name, v)| format!("{}: {}", name, part(Part::Field(name), v)))
                 .collect();
             format!("{{ {} }}", rendered.join(", "))
         }
         Value::Tag(name, args) if args.is_empty() => name.to_string(),
         Value::Tag(name, args) => {
-            let rendered: Vec<String> = args.iter().map(inspect).collect();
+            let rendered: Vec<String> = args.iter().enumerate().map(|(i, v)| part(Part::Payload(i), v)).collect();
             format!("{}({})", name, rendered.join(", "))
         }
         // roc shows every function the same way, whatever its parameters.
         Value::Closure(_) | Value::Builtin(..) => "<function>".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// `inspect`, steered by the value's static TYPE: a nominal's `to_inspect` runs
+/// exactly where the type says that nominal, and nowhere else. roc erases nominals,
+/// so a value alone cannot say it is a `CreditCard :: Str` rather than a plain
+/// `Str`; `inspect` guesses from its shape, and a `Str` fits.
+///
+/// `shape` is the compiler's descriptor of the type (`vm::compile::inspect_shape`).
+/// Where it says nothing -- a type the checker left a variable, in a generic
+/// function -- or disagrees with the value, the value is shown by `inspect`.
+pub fn inspect_as(value: &Value, shape: &Value) -> String {
+    match shape {
+        Value::Tag(kind, parts) if &**kind == "Typed" => match &parts[..] {
+            [root, Value::List(table)] => shown_as(value, root, table),
+            _ => inspect(value),
+        },
+        _ => inspect(value),
+    }
+}
+
+/// `inspect_as` below the top: `table` holds what a `Ref` to a recursive nominal is.
+fn shown_as(value: &Value, shape: &Value, table: &[Value]) -> String {
+    let Value::Tag(kind, parts) = shape else { return inspect(value) };
+    match (&**kind, &parts[..], value) {
+        ("Ref", [Value::Str(name)], _) => {
+            let entry = table.iter().find_map(|e| match e {
+                Value::Tuple(pair) if matches!(&pair[0], Value::Str(n) if n == name) => Some(pair[1].clone()),
+                _ => None,
+            });
+            entry.map_or_else(|| inspect(value), |e| shown_as(value, &e, table))
+        }
+        ("Nominal", [Value::Str(name), Value::Bool(opaque), inner], _) => {
+            let found = crate::vm::method_of(name, "to_inspect").filter(|(qualified, _)| {
+                INSPECTING_TYPED.with(|r| !r.borrow().iter().any(|(q, v)| q == qualified && values_equal(v, value)))
+            });
+            if let Some((qualified, to_inspect)) = found {
+                INSPECTING_TYPED.with(|r| r.borrow_mut().push((qualified, value.clone())));
+                let shown = call_function(to_inspect, vec![value.clone()]);
+                INSPECTING_TYPED.with(|r| {
+                    r.borrow_mut().pop();
+                });
+                if let Ok(Value::Str(shown)) = shown {
+                    return shown.to_string();
+                }
+            }
+            if *opaque {
+                return "<opaque>".to_string();
+            }
+            shown_as(value, inner, table)
+        }
+        ("Plain", [], _) => render(value, &|_, v| inspect(v)),
+        ("List", [element], Value::List(_)) => render(value, &|_, v| shown_as(v, element, table)),
+        ("Tuple", [Value::List(items)], Value::Tuple(values)) if items.len() == values.len() => {
+            render(value, &|p, v| match p {
+                Part::Item(i) => shown_as(v, &items[i], table),
+                _ => inspect(v),
+            })
+        }
+        ("Record", [Value::List(fields)], Value::Record(_)) => render(value, &|p, v| {
+            let declared = match p {
+                Part::Field(name) => fields.iter().find_map(|f| match f {
+                    Value::Tuple(pair) if matches!(&pair[0], Value::Str(n) if &**n == name) => Some(&pair[1]),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            declared.map_or_else(|| inspect(v), |d| shown_as(v, d, table))
+        }),
+        ("Tags", [Value::List(tags)], Value::Tag(tag, _)) => {
+            let payload = tags.iter().find_map(|t| match t {
+                Value::Tuple(pair) if matches!(&pair[0], Value::Str(n) if **n == **tag) => match &pair[1] {
+                    Value::List(ds) => Some(ds.clone()),
+                    _ => None,
+                },
+                _ => None,
+            });
+            render(value, &|p, v| match (p, &payload) {
+                (Part::Payload(i), Some(ds)) if i < ds.len() => shown_as(v, &ds[i], table),
+                _ => inspect(v),
+            })
+        }
+        _ => inspect(value),
     }
 }
 
@@ -3401,8 +3509,8 @@ pub fn run_test_expect(value: &Value) -> Result<(), EvalError> {
 }
 
 /// `dbg value` — to stderr, so it never mixes into a program's output.
-pub fn run_dbg(value: &Value) {
-    report(Report::Dbg, &inspect(value));
+pub fn run_dbg(value: &Value, shape: &Value) {
+    report(Report::Dbg, &inspect_as(value, shape));
 }
 
 /// What a program has to say outside its output: a `dbg`, a failed inline `expect`.

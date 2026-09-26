@@ -126,6 +126,10 @@ pub struct TypeChecker {
     /// `parser_for` is what turns each number into a tag. Nothing at run time can
     /// recover that, so the checker has to say.
     parse_targets: std::collections::HashMap<crate::ast::NodeId, Type>,
+    /// What each `Str.inspect(x)` call and each `dbg x` shows: `x`'s type. A
+    /// nominal's `to_inspect` applies where the TYPE says that nominal, which
+    /// nothing at run time can tell -- a `CreditCard :: Str` is a plain `Str` there.
+    inspect_types: std::collections::HashMap<crate::ast::NodeId, Type>,
     /// The nominal whose method block is being checked, if any.
     ///
     /// Inside `Graph :: … .{ … }` a sibling method is in scope UNQUALIFIED — roc lets
@@ -487,6 +491,7 @@ impl TypeChecker {
             rigid_vars: std::collections::HashSet::new(),
             returns: Vec::new(),
             parse_targets: std::collections::HashMap::new(),
+            inspect_types: std::collections::HashMap::new(),
             next_var: 0,
             env: vec![Vec::new()],
         }
@@ -825,6 +830,13 @@ impl TypeChecker {
             // type variable to `Config` first, so the unit is checked against the
             // nominal rather than against a bare variable and left as a bare `{}`.
             // Qualified calls keep their own synth path, which types builtins.
+            // `Str.inspect(x)` records `x`'s type (`inspect_types`), which `synth` does.
+            Expr::Call { func, args, .. }
+                if matches!(&**func, Expr::Qualified { module: "Str", name: "inspect", .. }) && args.len() == 1 =>
+            {
+                let actual = self.synth(expr)?;
+                self.unify(&actual, &resolved)
+            }
             Expr::Call { func, args, .. } if !args.is_empty() => {
                 // A builtin or method is typed by its DECLARED signature rather than
                 // by synthesising the qualified name, which has no type of its own.
@@ -1728,6 +1740,11 @@ impl TypeChecker {
     /// integer or a float: `Dec` carries eighteen decimal places exactly, which is why
     /// roc prints `147.666666666666666666` where an f64 gives `147.66666666666666`.
     /// What each `Json.parse` call was expected to produce, resolved.
+    /// See `inspect_types`: each site's type as the program will see it.
+    pub fn inspect_types(&self) -> std::collections::HashMap<crate::ast::NodeId, Type> {
+        self.inspect_types.iter().map(|(id, ty)| (*id, self.defaulted(ty))).collect()
+    }
+
     pub fn json_parse_targets(
         &self,
     ) -> std::collections::HashMap<crate::ast::NodeId, Type> {
@@ -2624,9 +2641,17 @@ impl TypeChecker {
                 self.unify(&condition_type, &Type::Bool)?;
                 Ok(Type::Unit)
             }
-            Expr::Dbg(value, _) => {
-                self.synth(value)?;
+            Expr::Dbg(value, id) => {
+                let shown = self.synth(value)?;
+                self.inspect_types.insert(*id, shown);
                 Ok(Type::Unit)
+            }
+            Expr::Call { func, args, id }
+                if matches!(&**func, Expr::Qualified { module: "Str", name: "inspect", .. }) && args.len() == 1 =>
+            {
+                let shown = self.synth(&args[0])?;
+                self.inspect_types.insert(*id, shown);
+                Ok(Type::Str)
             }
             Expr::Dispatch { receiver, method, args, id } => {
                 let receiver_type = self.synth(receiver)?;

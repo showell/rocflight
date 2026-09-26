@@ -204,6 +204,9 @@ pub struct Unit<'a> {
     /// `collect()` call sites and the nominal whose `from_iter` builds the result,
     /// from `TypeChecker::collect_targets`.
     pub collect_targets: std::collections::HashMap<crate::ast::NodeId, String>,
+    /// `Str.inspect` calls and `dbg`s, and the type each shows, from
+    /// `TypeChecker::inspect_types`. Passed to the VM as a shape (`inspect_shape`).
+    pub inspect_types: std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
     /// Bare names the builtin module DECLARES but does not define — its low-level ops.
     ///
     /// They are calls into Rust, so a missing one is a runtime message naming the op
@@ -249,6 +252,7 @@ pub fn compile(ast: &Expr, entry: Option<&str>) -> Result<Program, String> {
         fractional_literals: std::collections::HashSet::new(),
         parse_targets: std::collections::HashMap::new(),
         collect_targets: std::collections::HashMap::new(),
+        inspect_types: std::collections::HashMap::new(),
         intrinsics: std::collections::HashSet::new(),
         enclosing_owners: std::collections::HashMap::new(),
         // The bare helper is what the unit tests and `vm::eval` use: run everything.
@@ -446,6 +450,9 @@ pub fn compile_reporting(
         fractional_literals: &unit.fractional_literals,
         parse_targets: &unit.parse_targets,
         collect_targets: &unit.collect_targets,
+        inspect_types: &unit.inspect_types,
+        opaque_nominals: &unit.opaque_nominals,
+        declared_nominals: &unit.nominals,
         capture_free_methods: Vec::new(),
         global_owner: None,
         intrinsics: &unit.intrinsics,
@@ -748,6 +755,12 @@ struct Compiler<'u> {
     parse_targets: &'u std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
     /// See `Unit::collect_targets`.
     collect_targets: &'u std::collections::HashMap<crate::ast::NodeId, String>,
+    /// See `Unit::inspect_types`.
+    inspect_types: &'u std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
+    /// See `Unit::opaque_nominals`.
+    opaque_nominals: &'u [&'static str],
+    /// See `Unit::nominals`: what a recursive reference in an inspect shape means.
+    declared_nominals: &'u [(&'static str, crate::types::Type)],
     /// Block-local nominal methods that captured nothing, added to the runtime
     /// dispatch tables. See `closure`.
     capture_free_methods: Vec<(&'static str, ChunkId)>,
@@ -1779,11 +1792,15 @@ impl<'u> Compiler<'u> {
             // `return f(x)` is still a tail call.
             Expr::Return(inner, _) if self.st().in_function => self.tail(inner),
 
-            Expr::Call { func, args, .. } => {
+            Expr::Call { func, args, id } => {
                 if let Some((chunk, arity)) = self.direct_callee(func) {
                     let (arg_base, argc) = self.arguments(args)?;
                     check_arity(func_name(func), arity, argc)?;
                     self.emit(Op::TailCall { func: 0, chunk: Some(chunk), base: arg_base, argc });
+                    return Ok(());
+                }
+                if let Some(src) = self.typed_inspect(func, args, *id)? {
+                    self.emit(Op::Ret { src });
                     return Ok(());
                 }
                 // A builtin is not a tail call: it returns a value, which this
@@ -2505,6 +2522,10 @@ impl<'u> Compiler<'u> {
             }
             Expr::Return(_, _) => Err("vm: `return` outside a function".to_string()),
 
+            Expr::Call { func, args, id } if is_str_inspect(func, args) && self.inspect_types.contains_key(id) => {
+                Ok(self.typed_inspect(func, args, *id)?.expect("guarded: a Str.inspect with its type"))
+            }
+
             // `Json.parse(text)` is given the TYPE it must produce as a second
             // argument: nothing at run time can recover it, and reading `[1,2,3]` back
             // into a `List(ItemKind)` is only possible knowing it.
@@ -2696,11 +2717,14 @@ impl<'u> Compiler<'u> {
                 self.literal(Value::Unit)
             }
 
-            Expr::Dbg(value, _) => {
+            Expr::Dbg(value, id) => {
                 let save = self.st().next_reg;
                 let src = self.expr(value)?;
+                let shape = self.inspect_types.get(id).map_or(Value::Unit, |ty| inspect_shape(ty, self.opaque_nominals, self.declared_nominals));
+                let shape_reg = self.alloc()?;
+                self.constant(shape_reg, shape)?;
                 self.st().next_reg = save;
-                self.emit(Op::Dbg { src });
+                self.emit(Op::Dbg { src, shape: shape_reg });
                 self.literal(Value::Unit)
             }
 
@@ -3185,6 +3209,24 @@ impl<'u> Compiler<'u> {
     ///
     /// `None` when the callee is none of those, and the caller falls back to calling a
     /// value in a register.
+    /// `Str.inspect(x)`, given `x`'s type as a second argument (`inspect_shape`):
+    /// which nominal's `to_inspect` applies is the type's to say, not the value's.
+    /// `None` for any other call, or one the checker has no type for.
+    fn typed_inspect(&mut self, func: &Expr, args: &[Expr], id: crate::ast::NodeId) -> Result<Option<Reg>, String> {
+        let Some(ty) = self.inspect_types.get(&id).filter(|_| is_str_inspect(func, args)) else { return Ok(None) };
+        let shape = inspect_shape(ty, self.opaque_nominals, self.declared_nominals);
+        let name = self.names_run(&["Str", "inspect"])?;
+        let arg_base = self.st().next_reg;
+        let (_, argc) = self.arguments(args)?;
+        self.st().next_reg = arg_base + argc as u16;
+        let slot = self.alloc()?;
+        self.constant(slot, shape)?;
+        self.st().next_reg = arg_base;
+        let dst = self.alloc()?;
+        self.emit(Op::CallBuiltin { dst, name, base: arg_base, argc: argc + 1 });
+        Ok(Some(dst))
+    }
+
     fn builtin_call(&mut self, func: &Expr, args: &[Expr]) -> Result<Option<Reg>, String> {
         match func {
             // `Str.concat(a, b)`, or `Point.show(p)` for a nominal's own method.
@@ -3806,6 +3848,87 @@ fn operator_method_name(op: crate::ast::BinOp) -> Option<&'static str> {
 /// Only the shape a JSON reader needs: a list of what, a nominal by name, and a
 /// stopping point for everything else — where the reader falls back to reading the
 /// document as it stands.
+fn is_str_inspect(func: &Expr, args: &[Expr]) -> bool {
+    matches!(func, Expr::Qualified { module: "Str", name: "inspect", .. }) && args.len() == 1
+}
+
+/// A type as `eval::inspect_as` reads it: what shows through, and where a nominal's
+/// own `to_inspect` or its opacity applies. `{}` where the checker left a variable.
+///
+/// `Typed(root, table)`. A recursive nominal's inner uses are placeholders, with
+/// no backing of their own (`Node := [Leaf, Branch(List(Node))]`'s inner `Node`);
+/// each is a `Ref` to the table's entry for that name, built from its declaration.
+fn inspect_shape(ty: &crate::types::Type, opaque: &[&'static str], declared: &[(&'static str, crate::types::Type)]) -> Value {
+    let mut cx = ShapeCx { opaque, declared, table: Vec::new(), pending: Vec::new() };
+    let root = cx.shape(ty);
+    let table = cx.table.into_iter().map(|(name, shape)| Value::tuple(vec![crate::eval::str_value(name), shape])).collect();
+    Value::tag("Typed", vec![root, Value::list(table)])
+}
+
+struct ShapeCx<'a> {
+    opaque: &'a [&'static str],
+    declared: &'a [(&'static str, crate::types::Type)],
+    /// Each referenced nominal's shape, from its declaration.
+    table: Vec<(&'static str, Value)>,
+    /// The names whose entries are being built, so a recursive one ends.
+    pending: Vec<&'static str>,
+}
+
+impl ShapeCx<'_> {
+    fn shape(&mut self, ty: &crate::types::Type) -> Value {
+        use crate::types::Type;
+        match ty {
+            Type::TypeVar(_) | Type::Optional(_) => Value::Unit,
+            Type::Nominal { name, .. } if ty.is_placeholder() => {
+                self.enter(name);
+                Value::tag("Ref", vec![crate::eval::str_value(*name)])
+            }
+            Type::Nominal { name, backing, .. } => self.nominal(name, backing),
+            Type::List(inner) => Value::tag("List", [self.shape(inner)]),
+            Type::Tuple(items) => {
+                let items = items.iter().map(|t| self.shape(t)).collect();
+                Value::tag("Tuple", vec![Value::list(items)])
+            }
+            Type::Record { fields, .. } => {
+                let fields = fields.iter().map(|(n, t)| Value::tuple(vec![crate::eval::str_value(*n), self.shape(t)])).collect();
+                Value::tag("Record", vec![Value::list(fields)])
+            }
+            Type::TagUnion { tags, .. } => {
+                let tags = tags
+                    .iter()
+                    .map(|(n, payload)| {
+                        let payload = payload.iter().map(|t| self.shape(t)).collect();
+                        Value::tuple(vec![crate::eval::str_value(*n), Value::list(payload)])
+                    })
+                    .collect();
+                Value::tag("Tags", vec![Value::list(tags)])
+            }
+            _ => Value::tag("Plain", Vec::new()),
+        }
+    }
+
+    fn nominal(&mut self, name: &'static str, backing: &crate::types::Type) -> Value {
+        let inner = self.shape(backing);
+        Value::tag("Nominal", vec![crate::eval::str_value(name), Value::Bool(self.opaque.contains(&name)), inner])
+    }
+
+    /// The table's entry for `name`, from its declaration, if it has none yet.
+    fn enter(&mut self, name: &'static str) {
+        if self.pending.contains(&name) || self.table.iter().any(|(n, _)| *n == name) {
+            return;
+        }
+        let bare = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+        let Some((_, backing)) = self.declared.iter().find(|(n, _)| bare(n) == bare(name)) else {
+            self.table.push((name, Value::tag("Nominal", vec![crate::eval::str_value(name), Value::Bool(self.opaque.contains(&name)), Value::Unit])));
+            return;
+        };
+        self.pending.push(name);
+        let shape = self.nominal(name, backing);
+        self.pending.pop();
+        self.table.push((name, shape));
+    }
+}
+
 fn type_descriptor(ty: &crate::types::Type) -> Value {
     use crate::types::Type;
     match ty {

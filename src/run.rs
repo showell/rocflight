@@ -491,6 +491,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         fractional_literals: type_checker.fractional_literals(),
         parse_targets: type_checker.json_parse_targets(),
         collect_targets: type_checker.collect_targets(),
+        inspect_types: type_checker.inspect_types(),
         // Every nominal in scope, the app's and each loaded builtin member's: the VM
         // needs their shapes to tell whose method a value can have meant.
         nominals: builtins
