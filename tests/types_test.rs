@@ -393,13 +393,29 @@ fn an_inferred_union_keeps_growing_past_a_builtins_open_union() {
 }
 
 #[test]
-fn an_annotations_open_union_is_a_row_of_its_own() {
-    // `keep`'s `..` is a row, fresh at each use, so what `keep` returns is the
-    // list's union and the `Blue` appended to it reaches `show`. roc rejects it.
-    let src = "keep : [Red, ..] -> [Red, ..]\nkeep = |c| c\nshow : [Red, Green] -> Str\nshow = |c| match c {\n    Red => \"red\"\n    Green => \"green\"\n}\n";
-    let err = type_error(&format!("{}List.map(List.append(List.map(List.repeat(Red, 2), keep), Blue), show)", src));
+fn an_annotations_named_extension_is_one_row() {
+    // `..others` is ONE row across `keep`'s signature, fresh at each use, so what
+    // `keep` returns is what it was given. roc rejects both programs that break it.
+    let keep = "keep : [Red, ..others] -> [Red, ..others]\nkeep = |c| c\n";
+    let show = "show : [Red, Green] -> Str\nshow = |c| match c {\n    Red => \"red\"\n    Green => \"green\"\n}\n";
+    let err = type_error(&format!("{}{}List.map(List.append(List.map(List.repeat(Red, 2), keep), Blue), show)", keep, show));
     assert!(err.contains("Blue"), "got {}", err);
-    assert!(accepts(&format!("{}List.map(List.append(List.map(List.repeat(Red, 2), keep), Green), show)", src)));
+    assert!(accepts(&format!("{}{}List.map(List.append(List.map(List.repeat(Red, 2), keep), Green), show)", keep, show)));
+
+    let only_red = "only_red : [Red] -> Str\nonly_red = |c| match c {\n    Red => \"red\"\n}\n";
+    let err = type_error(&format!("{}{}only_red(keep(Green))", keep, only_red));
+    assert!(err.contains("Green"), "got {}", err);
+    assert!(accepts(&format!("{}{}only_red(keep(Red))", keep, only_red)));
+}
+
+#[test]
+fn a_signature_naming_a_nominal_still_numbers_its_rows_apart() {
+    // `pick` is used before it is defined, so its signature's rows are minted
+    // early, while `a`'s id is still in range -- and `Node` in the signature brings
+    // the parser's placeholder id, `u32::MAX`, which is no variable to number above.
+    // Counting it made the row `a`, a `Str`, and the checker panicked. roc prints `s`.
+    let src = "app [main!] {}\n\nNode := [Leaf, Branch(Node, Node)]\n\nx : [A, ..]\nx = A\n\nmain! = |_args| {\n    t = pick(Leaf, \"s\")\n    echo!(match t { Tagged(s) => s, _ => \"other\" })\n    Ok({})\n}\n\npick : Node, a -> [Tagged(a), ..]\npick = |_n, v| Tagged(v)\n";
+    assert_eq!(run_program(src), Ok(()));
 }
 
 #[test]
