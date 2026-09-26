@@ -670,12 +670,13 @@ fn normalise(ty: &crate::types::Type) -> crate::types::Type {
             fields: fields.iter().map(|(f, t)| (*f, normalise(t))).collect(),
             open: *open,
         },
-        Type::TagUnion { tags, open } => Type::TagUnion {
+        Type::TagUnion { tags, open, row } => Type::TagUnion {
             tags: tags
                 .iter()
                 .map(|(t, args)| (*t, args.iter().map(normalise).collect()))
                 .collect(),
             open: *open,
+            row: *row,
         },
         other => other.clone(),
     }

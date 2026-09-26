@@ -159,7 +159,7 @@ mod tests {
     fn union_ty(tags: &[(&str, &[Type])]) -> Type {
         let mut tags: Vec<(&'static str, Vec<Type>)> = tags.iter().map(|(n, a)| (crate::memory::string_pool::intern(n), a.to_vec())).collect();
         tags.sort_by(|a, b| a.0.cmp(&b.0));
-        Type::TagUnion { tags, open: false }
+        Type::TagUnion { tags, open: false, row: None }
     }
 
     fn func(params: &[Type], ret: Type) -> Type {

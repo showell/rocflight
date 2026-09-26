@@ -287,7 +287,8 @@ fn put_type(w: &mut Writer, ty: &Type) {
             put_type(w, backing);
             w.seq(args, |w, t| put_type(w, t));
         }
-        Type::TagUnion { tags, open } => {
+        // A row variable is the checker's own, and never reaches an artifact.
+        Type::TagUnion { tags, open, .. } => {
             w.tag(24);
             w.seq(tags, |w, (n, payload)| {
                 w.s(n);
@@ -341,7 +342,7 @@ fn get_type(r: &mut Reader) -> Type {
         }
         24 => {
             let tags = r.seq(0, |r, _| (r.s(), r.seq(0, |r, _| get_type(r))));
-            Type::TagUnion { tags, open: r.bool() }
+            Type::TagUnion { tags, open: r.bool(), row: None }
         }
         other => unreachable_tag("Type", other),
     }

@@ -370,6 +370,58 @@ fn a_tag_pattern_on_a_nominal_binds_its_payload_types() {
 }
 
 #[test]
+fn an_inferred_union_grows_where_it_is_used() {
+    // `List.repeat(Red, 2)` and `Blue` are one union once `List.append` joins them,
+    // `[Blue, Red, ..]`, and `show` takes only `[Green, Red]`. roc rejects it ("This
+    // argument has the type: [Green, Red] -> Str"); without row variables the
+    // union never grew, and the program crashed at `match` on `Blue` instead.
+    let show = "show : [Red, Green] -> Str\nshow = |c| match c {\n    Red => \"red\"\n    Green => \"green\"\n}\n";
+    let err = type_error(&format!("{}List.map(List.append(List.repeat(Red, 2), Blue), show)", show));
+    assert!(err.contains("Blue"), "got {}", err);
+    assert!(accepts(&format!("{}List.map(List.append(List.repeat(Red, 2), Green), show)", show)));
+}
+
+#[test]
+fn an_inferred_union_keeps_growing_past_a_builtins_open_union() {
+    // `U8.from_str`'s error is an open union with no row of its own. The list's
+    // union meets it and stays open under a fresh row, so the `Blue` appended next
+    // still reaches `show`, which roc rejects.
+    let show = "show : Try(U8, [BadNumStr]) -> Str\nshow = |t| match t {\n    Ok(n) => U8.to_str(n)\n    Err(BadNumStr) => \"bad\"\n}\n";
+    let err = type_error(&format!("{}List.map(List.append(List.append(List.repeat(Ok(1), 1), U8.from_str(\"5\")), Blue), show)", show));
+    assert!(err.contains("Blue"), "got {}", err);
+    assert!(accepts(&format!("{}List.map(List.append(List.repeat(Ok(1), 1), U8.from_str(\"5\")), show)", show)));
+}
+
+#[test]
+fn an_annotations_open_union_is_a_row_of_its_own() {
+    // `keep`'s `..` is a row, fresh at each use, so what `keep` returns is the
+    // list's union and the `Blue` appended to it reaches `show`. roc rejects it.
+    let src = "keep : [Red, ..] -> [Red, ..]\nkeep = |c| c\nshow : [Red, Green] -> Str\nshow = |c| match c {\n    Red => \"red\"\n    Green => \"green\"\n}\n";
+    let err = type_error(&format!("{}List.map(List.append(List.map(List.repeat(Red, 2), keep), Blue), show)", src));
+    assert!(err.contains("Blue"), "got {}", err);
+    assert!(accepts(&format!("{}List.map(List.append(List.map(List.repeat(Red, 2), keep), Green), show)", src)));
+}
+
+#[test]
+fn a_lone_tag_passed_as_a_nominal_is_that_nominal() {
+    // Each `Empty` meets `Node` through `show`, and from then on it IS a `Node`:
+    // the `Blue` appended afterwards is not one of its tags, as roc says.
+    let node = "Node := [Empty, Leaf(U8)]\nshow : Node -> Str\nshow = |n| match n {\n    Empty => \"empty\"\n    Leaf(b) => U8.to_str(b)\n}\n";
+    let err = type_error(&format!("{}List.append(List.map(List.repeat(Empty, 2), |n| {{\n    _s = show(n)\n    n\n}}), Blue)", node));
+    assert!(err.contains("Blue"), "got {}", err);
+    assert!(accepts(&format!("{}List.append(List.map(List.repeat(Empty, 2), |n| {{\n    _s = show(n)\n    n\n}}), Leaf(7))", node)));
+
+    // And its recorded type says so: no node is left typed `[Empty, ..]`.
+    let ast = build(&format!("{}List.map(List.repeat(Empty, 2), show)", node));
+    let mut checker = TypeChecker::new();
+    checker.record_types();
+    checker.synth(&ast).unwrap();
+    let types: Vec<String> = checker.node_types().values().map(|t| t.to_string()).collect();
+    assert!(!types.iter().any(|t| t.starts_with("[Empty")), "{:?}", types);
+    assert!(types.iter().any(|t| t == "List(Node)"), "{:?}", types);
+}
+
+#[test]
 fn a_nominal_annotation_resolves_to_the_nominal() {
     assert_eq!(type_of("Point := { x: I64 }\np : Point\np = Point.{ x: 1 }\np"), "Point");
 }
