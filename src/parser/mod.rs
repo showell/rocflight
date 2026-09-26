@@ -937,7 +937,7 @@ impl Parser {
         }
 
         tags.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(Type::TagUnion { tags, open })
+        Ok(Type::TagUnion { tags, open, row: None })
     }
 
     /// Skip spaces and tabs but NOT newlines.
@@ -1605,8 +1605,8 @@ impl Parser {
     /// own name (`Maybe(a)`) is what `Maybe.Maybe` means.
     pub fn declare_imported(&mut self, types: &[(&'static str, Type)], params: &[(String, Vec<u32>)]) {
         for (name, ty) in types {
-            let empty = matches!(ty, Type::TagUnion { tags, open: false } if tags.is_empty())
-                || matches!(ty, Type::Nominal { backing, .. } if matches!(**backing, Type::TypeVar(_)) || matches!(&**backing, Type::TagUnion { tags, open: false } if tags.is_empty()));
+            let empty = matches!(ty, Type::TagUnion { tags, open: false, .. } if tags.is_empty())
+                || matches!(ty, Type::Nominal { backing, .. } if matches!(**backing, Type::TypeVar(_)) || matches!(&**backing, Type::TagUnion { tags, open: false, .. } if tags.is_empty()));
             if !empty {
                 self.imported_types.push((name, ty.clone()));
             }
@@ -5905,7 +5905,7 @@ fn substitute_type_vars(ty: &Type, pairs: &[(u32, Type)]) -> Type {
             Box::new(substitute_type_vars(a, pairs)),
             Box::new(substitute_type_vars(b, pairs)),
         ),
-        Type::TagUnion { tags, open } => Type::TagUnion {
+        Type::TagUnion { tags, open, row } => Type::TagUnion {
             tags: tags
                 .iter()
                 .map(|(n, ts)| {
@@ -5913,6 +5913,7 @@ fn substitute_type_vars(ty: &Type, pairs: &[(u32, Type)]) -> Type {
                 })
                 .collect(),
             open: *open,
+            row: *row,
         },
         other => other.clone(),
     }
@@ -5990,6 +5991,7 @@ fn builtin_type(name: &str, args: &mut Vec<Type>, mut fresh: impl FnMut() -> Typ
             Type::TagUnion {
                 tags: vec![("Err", vec![err]), ("Ok", vec![ok])],
                 open: false,
+                row: None,
             }
         }
         _ => return None,

@@ -327,7 +327,7 @@ impl<'a> Cx<'a> {
                 }
                 format!("{}<{}>", record_name(&names), args.join(", "))
             }
-            Type::TagUnion { tags, open: true } if self.declared_union(tags).is_some() => {
+            Type::TagUnion { tags, open: true, .. } if self.declared_union(tags).is_some() => {
                 return self.ty(&self.declared_union(tags).expect("guarded"));
             }
             Type::TagUnion { tags, .. } => {
@@ -432,10 +432,10 @@ impl<'a> Cx<'a> {
             return None;
         }
         let mut bound = HashMap::new();
-        bind(&decl, &Type::TagUnion { tags: tags.to_vec(), open: true }, &mut bound);
+        bind(&decl, &Type::TagUnion { tags: tags.to_vec(), open: true, row: None }, &mut bound);
         let decl = subst(&decl, &bound);
         let decl = match decl {
-            Type::TagUnion { tags, .. } => Type::TagUnion { tags, open: false },
+            Type::TagUnion { tags, .. } => Type::TagUnion { tags, open: false, row: None },
             other => other,
         };
         Some(match nominal {
@@ -1735,7 +1735,7 @@ fn subst(t: &Type, bound: &HashMap<u32, Type>) -> Type {
         Type::Function(a, b) => Type::Function(Box::new(subst(a, bound)), Box::new(subst(b, bound))),
         Type::Tuple(xs) => Type::Tuple(xs.iter().map(|x| subst(x, bound)).collect()),
         Type::Record { fields, open } => Type::Record { fields: fields.iter().map(|(n, x)| (*n, subst(x, bound))).collect(), open: *open },
-        Type::TagUnion { tags, open } => Type::TagUnion { tags: tags.iter().map(|(n, p)| (*n, p.iter().map(|x| subst(x, bound)).collect())).collect(), open: *open },
+        Type::TagUnion { tags, open, row } => Type::TagUnion { tags: tags.iter().map(|(n, p)| (*n, p.iter().map(|x| subst(x, bound)).collect())).collect(), open: *open, row: *row },
         Type::Nominal { name, backing, args } => Type::Nominal { name, backing: Box::new(subst(backing, bound)), args: args.iter().map(|x| subst(x, bound)).collect() },
         other => other.clone(),
     }

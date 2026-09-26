@@ -85,7 +85,17 @@ pub enum Type {
     /// * **open** (`open: true`) — inferred from a tag expression, or written with a
     ///   trailing `..`. More tags may be added by unification, and a `match` needs a
     ///   wildcard to be exhaustive.
-    TagUnion { tags: Vec<(&'static str, Vec<Type>)>, open: bool },
+    ///
+    /// `row` is an inferred open union's ROW VARIABLE: what the union turns out to
+    /// be beyond the tags it lists. A tag expression or a tag pattern gets a fresh
+    /// one, and unification binds it -- to the other side's extra tags, or, against
+    /// a nominal, to the nominal itself -- so every copy of the union learns the
+    /// same thing. `List.append(List.repeat(Red, 2), Blue)` is one union, grown to
+    /// `[Blue, Red, ..]`, and a lone `Empty` passed where a `Node` is expected IS a
+    /// `Node` once its row says so. An annotation's `..` gets one when the checker
+    /// takes the signature in. `None` on a closed union, and on an open one the
+    /// checker builds for a builtin's result, which unifies permissively.
+    TagUnion { tags: Vec<(&'static str, Vec<Type>)>, open: bool, row: Option<u32> },
 }
 
 impl Type {
@@ -137,7 +147,7 @@ impl fmt::Display for Type {
                 let rendered: Vec<String> = items.iter().map(|t| t.to_string()).collect();
                 write!(f, "({})", rendered.join(", "))
             }
-            Type::TagUnion { tags, open } => {
+            Type::TagUnion { tags, open, .. } => {
                 let rendered: Vec<String> = tags
                     .iter()
                     .map(|(name, payload)| {
@@ -270,14 +280,38 @@ impl Substitution {
                 fields: fields.iter().map(|(n, t)| (*n, self.apply(t))).collect(),
                 open: *open,
             },
-            Type::TagUnion { tags, open } => Type::TagUnion {
-                tags: tags
+            Type::TagUnion { tags, open, row } => {
+                let tags = tags
                     .iter()
                     .map(|(n, args)| (*n, args.iter().map(|t| self.apply(t)).collect()))
-                    .collect(),
-                open: *open,
-            },
+                    .collect();
+                match row {
+                    Some(r) => self.extend(tags, *r),
+                    None => Type::TagUnion { tags, open: *open, row: None },
+                }
+            }
             other => other.clone(),
+        }
+    }
+}
+
+impl Substitution {
+    /// An open union's tags followed by what its row has been bound to: more tags
+    /// (the row's own, then ITS row), a nominal the union turned out to be, or
+    /// nothing yet.
+    fn extend(&self, mut tags: Vec<(&'static str, Vec<Type>)>, row: u32) -> Type {
+        match self.apply(&Type::TypeVar(row)) {
+            Type::TypeVar(r) => {
+                tags.sort_by(|x, y| x.0.cmp(&y.0));
+                Type::TagUnion { tags, open: true, row: Some(r) }
+            }
+            Type::TagUnion { tags: more, open, row } => {
+                tags.extend(more);
+                tags.sort_by(|x, y| x.0.cmp(&y.0));
+                Type::TagUnion { tags, open, row }
+            }
+            nominal @ Type::Nominal { .. } => nominal,
+            other => unreachable!("a row is bound to tags or a nominal, not {}", other),
         }
     }
 }

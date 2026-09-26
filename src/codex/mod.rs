@@ -358,7 +358,7 @@ impl Cx<'_> {
                     return Err(format!("an anonymous union {}", t));
                 };
                 let mut bound = HashMap::new();
-                bind(&Type::TagUnion { tags: decl.clone(), open: false }, t, &mut bound);
+                bind(&Type::TagUnion { tags: decl.clone(), open: false, row: None }, t, &mut bound);
                 let mut out = type_name(name);
                 for p in params {
                     let arg = bound.get(p).cloned().unwrap_or(Type::TypeVar(*p));
