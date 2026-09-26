@@ -327,9 +327,6 @@ impl<'a> Cx<'a> {
                 }
                 format!("{}<{}>", record_name(&names), args.join(", "))
             }
-            Type::TagUnion { tags, open: true, .. } if self.declared_union(tags).is_some() => {
-                return self.ty(&self.declared_union(tags).expect("guarded"));
-            }
             Type::TagUnion { tags, .. } => {
                 let names: Vec<String> = sorted_names(tags.iter().map(|(n, _)| *n));
                 if names == ["Err", "Ok"] || names == ["Ok"] || names == ["Err"] {
@@ -391,57 +388,6 @@ impl<'a> Cx<'a> {
                 vars_of(t, &mut vs);
                 vs.is_empty()
             })
-    }
-
-    /// An open union (`[MBReady, ..]`, a lone tag's type) as the one declared
-    /// structural union holding all its tags, with the declaration's other tags:
-    /// a Rust enum is its whole set of tags.
-    fn declared_union(&self, tags: &[(&'static str, Vec<Type>)]) -> Option<Type> {
-        // An open union's tags are what one expression used; the declared type
-        // that has them all is its type -- a structural union, or a nominal's
-        // (`Node := [Empty, ..]`): rocflight's checker unifies a tag with a
-        // declared union without widening the tag's own type.
-        //
-        // WORKAROUND for a checker gap, a guess from the declarations: the checker's
-        // tag unions have no row variables, so a lone `Empty` never learns it is a
-        // `Node`. The fix belongs in rocflight's checker (row variables, stacked on
-        // PR #25); once a lone tag's recorded type is its full type, delete this
-        // search -- at least its nominal half.
-        //
-        // `Ok` and `Err` alone are roc's `Try`, whatever else declares them.
-        if tags.iter().all(|(n, _)| matches!(*n, "Ok" | "Err")) {
-            return None;
-        }
-        let has_all = |d: &[(&'static str, Vec<Type>)]| tags.iter().all(|(n, _)| d.iter().any(|(m, _)| m == n)) && d.len() > tags.len();
-        let mut found = self
-            .input
-            .modules
-            .iter()
-            .flat_map(|m| m.types.iter())
-            .chain(self.input.app_types.iter())
-            .filter_map(|(name, t)| match t {
-                Type::TagUnion { tags: d, .. } if has_all(d) => Some((t.clone(), None)),
-                Type::Nominal { backing, .. } => match &**backing {
-                    Type::TagUnion { tags: d, .. } if has_all(d) && self.nominals.contains_key(bare(name)) => Some(((**backing).clone(), Some(name.clone()))),
-                    _ => None,
-                },
-                _ => None,
-            });
-        let (decl, nominal) = found.next()?;
-        if found.any(|(other, _)| sorted_names(tag_names(&other).into_iter()) != sorted_names(tag_names(&decl).into_iter())) {
-            return None;
-        }
-        let mut bound = HashMap::new();
-        bind(&decl, &Type::TagUnion { tags: tags.to_vec(), open: true, row: None }, &mut bound);
-        let decl = subst(&decl, &bound);
-        let decl = match decl {
-            Type::TagUnion { tags, .. } => Type::TagUnion { tags, open: false, row: None },
-            other => other,
-        };
-        Some(match nominal {
-            Some(name) => Type::Nominal { name, backing: Box::new(decl), args: Vec::new() },
-            None => decl,
-        })
     }
 
     /// A nominal's backing with the use's arguments put in.
@@ -1698,13 +1644,6 @@ fn sorted_names<'x>(names: impl Iterator<Item = &'x str>) -> Vec<String> {
     let mut v: Vec<String> = names.map(|s| s.to_string()).collect();
     v.sort();
     v
-}
-
-fn tag_names(t: &Type) -> Vec<&'static str> {
-    match t {
-        Type::TagUnion { tags, .. } => tags.iter().map(|(n, _)| *n).collect(),
-        _ => Vec::new(),
-    }
 }
 
 fn record_name(names: &[String]) -> String {
