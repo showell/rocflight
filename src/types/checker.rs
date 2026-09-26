@@ -1613,7 +1613,8 @@ impl TypeChecker {
     fn with_rows(&mut self, ty: &Type) -> Type {
         let mut vars = Vec::new();
         Self::type_vars_in(ty, &mut vars);
-        if let Some(highest) = vars.iter().max() {
+        // Not the parser's placeholder backing, `$u32::MAX`, which is no variable.
+        if let Some(highest) = vars.iter().filter(|v| **v != u32::MAX).max() {
             self.next_var = self.next_var.max(highest + 1);
         }
         self.add_rows(ty)
@@ -4611,5 +4612,20 @@ mod tests {
         let Type::Function(_, result) = checker.with_rows(&signature) else { panic!("a function") };
         let Type::TagUnion { row: Some(row), .. } = *result else { panic!("a row: {}", result) };
         assert_ne!(row, 0);
+    }
+
+    #[test]
+    fn a_nominals_placeholder_is_not_a_variable_to_number_above() {
+        // `Node`'s placeholder backing is the parser's `$u32::MAX`; counting it
+        // overflowed, and in a release build wrapped, leaving the row at `$0`.
+        let mut checker = TypeChecker::new();
+        let node = Type::Nominal { name: "Node", backing: Box::new(Type::TypeVar(u32::MAX)), args: Vec::new() };
+        let signature = Type::Function(
+            Box::new(Type::Tuple(vec![node, Type::TypeVar(0)])),
+            Box::new(Type::TagUnion { tags: vec![("X", vec![])], open: true, row: None }),
+        );
+        let Type::Function(_, result) = checker.with_rows(&signature) else { panic!("a function") };
+        let Type::TagUnion { row: Some(row), .. } = *result else { panic!("a row: {}", result) };
+        assert_eq!(row, 1);
     }
 }

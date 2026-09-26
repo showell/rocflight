@@ -852,6 +852,9 @@ impl Parser {
         self.pos += 1; // Skip '['
         let mut tags: Vec<(&'static str, Vec<Type>)> = Vec::new();
         let mut open = false;
+        // A NAMED extension, `..others`, is the union's row: every `..others` in the
+        // signature is the same one.
+        let mut row = None;
 
         loop {
             self.skip_whitespace();
@@ -876,6 +879,7 @@ impl Parser {
                         self.pos += rest.len() - remaining.len();
                         let id = self.annotation_var(name);
                         self.pending_extension = Some((id, false));
+                        row = Some(id);
                         self.skip_whitespace();
                         if self.input[self.pos..].starts_with(',') {
                             self.pos += 1;
@@ -937,7 +941,7 @@ impl Parser {
         }
 
         tags.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(Type::TagUnion { tags, open, row: None })
+        Ok(Type::TagUnion { tags, open, row })
     }
 
     /// Skip spaces and tabs but NOT newlines.
@@ -5905,16 +5909,25 @@ fn substitute_type_vars(ty: &Type, pairs: &[(u32, Type)]) -> Type {
             Box::new(substitute_type_vars(a, pairs)),
             Box::new(substitute_type_vars(b, pairs)),
         ),
-        Type::TagUnion { tags, open, row } => Type::TagUnion {
-            tags: tags
+        Type::TagUnion { tags, open, row } => {
+            let mut tags: Vec<(&'static str, Vec<Type>)> = tags
                 .iter()
                 .map(|(n, ts)| {
                     (*n, ts.iter().map(|t| substitute_type_vars(t, pairs)).collect())
                 })
-                .collect(),
-            open: *open,
-            row: *row,
-        },
+                .collect();
+            // An extension parameter, `T(x) : [A, ..x]`, applied: its argument's tags
+            // join the union, and its row or its closedness is the union's.
+            match row.and_then(|r| pairs.iter().find(|(p, _)| *p == r)).map(|(_, t)| t) {
+                Some(Type::TagUnion { tags: more, open, row }) => {
+                    tags.extend(more.iter().filter(|(n, _)| !tags.iter().any(|(m, _)| m == n)).cloned().collect::<Vec<_>>());
+                    tags.sort_by(|a, b| a.0.cmp(&b.0));
+                    Type::TagUnion { tags, open: *open, row: *row }
+                }
+                Some(Type::TypeVar(v)) => Type::TagUnion { tags, open: true, row: Some(*v) },
+                _ => Type::TagUnion { tags, open: *open, row: *row },
+            }
+        }
         other => other.clone(),
     }
 }
