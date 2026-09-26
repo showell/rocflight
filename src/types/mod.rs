@@ -106,6 +106,21 @@ impl Type {
         matches!(self, Type::Nominal { backing, .. } if matches!(**backing, Type::TypeVar(_)))
     }
 
+    /// `Builtin.roc`'s `Iter(item)`. It is declared `::`, so its record is not the
+    /// program's to see: the nominal carries its element as its one argument, over the
+    /// parser's stand-in backing.
+    pub fn iter(item: Type) -> Type {
+        Type::Nominal { name: "Iter", backing: Box::new(Type::TypeVar(u32::MAX)), args: vec![item] }
+    }
+
+    /// The element of a builtin `Iter(item)`.
+    pub fn iter_element(&self) -> Option<&Type> {
+        match self {
+            Type::Nominal { name: "Iter", args, .. } if args.len() == 1 => args.first(),
+            _ => None,
+        }
+    }
+
     /// A record whose fields are exactly these. The common case — an open record only
     /// comes from an annotation that writes `..`.
     pub fn closed_record(fields: Vec<(&'static str, Type)>) -> Type {

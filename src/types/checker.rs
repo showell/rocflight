@@ -1509,7 +1509,7 @@ impl TypeChecker {
                     return Some(Type::Function(Box::new(config), Box::new(range)));
                 }
                 "iter" | "iter_rev" => {
-                    return Some(Type::Function(Box::new(range), Box::new(Type::List(Box::new(num)))));
+                    return Some(Type::Function(Box::new(range), Box::new(Type::iter(num))));
                 }
                 "size_hint" => {
                     return Some(Type::Function(Box::new(range), Box::new(len_hint)));
@@ -1517,10 +1517,9 @@ impl TypeChecker {
                 _ => {}
             }
         }
-        // An `Iter` is the list it walks, so `Iter.fold(it, 0, f)` is checked against
-        // `List.fold`'s signature — which is what tells `f` its element type. Unless
-        // the program declares an `Iter` of its own, whose methods are its own.
-        let module = if matches!(module, "Iter" | "Range") && !self.declared_types.contains_key(module) {
+        // A range answers the List methods as the list of its element. An `Iter` has
+        // its own block in `Builtin.roc`.
+        let module = if module == "Range" && !self.declared_types.contains_key(module) {
             "List"
         } else {
             module
@@ -2512,8 +2511,12 @@ impl TypeChecker {
             Expr::For { name, iterable, body, id } => {
                 let iterable_type = self.synth(iterable)?;
                 let element = match self.apply(&iterable_type) {
-                    // A range yields its element type without being a list.
+                    // A range yields its element type without being a list, and so does
+                    // an iterator.
                     Type::Range(elem) => *elem,
+                    ref iter if iter.iter_element().is_some() && !self.declared_types.contains_key("Iter") => {
+                        iter.iter_element().cloned().expect("just checked")
+                    }
                     // A nominal with an `iter` method — a custom iterable — is looped
                     // over its `iter()`, whose element is what the loop binds. The VM
                     // calls the `iter` when the loop starts.
@@ -2522,6 +2525,7 @@ impl TypeChecker {
                         let iter = self.declared(name, "iter").expect("just checked");
                         match Self::peel_params(&iter, 1).map(|(_, result)| self.apply(&result)) {
                             Some(Type::Range(elem)) | Some(Type::List(elem)) => *elem,
+                            Some(iter) if iter.iter_element().is_some() => iter.iter_element().cloned().expect("just checked"),
                             _ => self.fresh_var(),
                         }
                     }
@@ -2774,6 +2778,20 @@ impl TypeChecker {
                             }
                         }
                     }
+                }
+                // `Builtin.roc`'s `Iter` block is the whole of what an iterator answers:
+                // roc reports `it.len()` as a missing method, having no `Iter.len`.
+                if resolved.iter_element().is_some() && !self.declared_types.contains_key("Iter") {
+                    return Err(TypeError {
+                        message: format!(
+                            "This `{}` method is being called on a value whose type does not have it",
+                            method
+                        ),
+                        expected: format!("a type with a `{}` method", method),
+                        actual: resolved.to_string(),
+                        line: 0,
+                        col: 0,
+                    });
                 }
                 // A method roc has NO declaration for, on a builtin container: not a
                 // gap in this interpreter, a name that does not exist. roc reports
@@ -3627,11 +3645,11 @@ impl TypeChecker {
             "fold" => args.first().cloned().unwrap_or_else(|| self.fresh_var()),
             // `map` keeps the receiver's shape with a new element type.
             "map" => Type::List(Box::new(self.fresh_var())),
-            // An iterator is walked with the List methods here, so it is typed as the
-            // List it behaves like — KEEPING the element type, so `(1..=n).iter()`
-            // carries the range's element to whatever consumes it, and a later
-            // `.map(f)` or annotation can still pin it rather than letting it default.
-            "iter" | "iter_rev" | "rev" | "clear" => Type::List(Box::new(self.element_of(receiver))),
+            // An iterator KEEPS the element type, so `(1..=n).iter()` carries the range's
+            // element to whatever consumes it, and a later `.map(f)` or annotation can
+            // still pin it rather than letting it default.
+            "iter" | "iter_rev" => Type::iter(self.element_of(receiver)),
+            "rev" | "clear" => Type::List(Box::new(self.element_of(receiver))),
             // These give back what they were handed.
             "reverse" | "sort_with" | "drop_first" | "drop_last" | "append" | "prepend" => {
                 receiver.cloned().unwrap_or_else(|| self.fresh_var())
@@ -3757,6 +3775,7 @@ impl TypeChecker {
     fn element_of(&mut self, receiver: Option<&Type>) -> Type {
         match receiver.map(|t| self.apply(t)) {
             Some(Type::List(inner)) | Some(Type::Range(inner)) => *inner,
+            Some(iter) if iter.iter_element().is_some() => iter.iter_element().cloned().expect("just checked"),
             _ => self.fresh_var(),
         }
     }
@@ -4241,6 +4260,19 @@ impl TypeChecker {
                 let (nominal, backing, r) = (nominal.clone(), (**backing).clone(), *r);
                 self.unify(&backing, &Type::TagUnion { tags: tags.clone(), open: true, row: None })?;
                 self.bind_row(r, nominal)
+            }
+            // `Builtin.roc`'s `Iter` is opaque: nothing but another `Iter` is one, and a
+            // `List` in particular is not.
+            (iter @ Type::Nominal { name: "Iter", .. }, other) | (other, iter @ Type::Nominal { name: "Iter", .. })
+                if !self.declared_types.contains_key("Iter") =>
+            {
+                Err(TypeError {
+                    message: format!("{} is not an iterator", other),
+                    expected: iter.to_string(),
+                    actual: other.to_string(),
+                    line: 0,
+                    col: 0,
+                })
             }
             // Nominal against anything else: compare the backing type. roc accepts a
             // plain record where a `:=` nominal is expected, so this is deliberate

@@ -1006,3 +1006,32 @@ main! = |_args| {
 "#;
     assert_eq!(run_program(src), Ok(()));
 }
+
+// --- an iterator is its own type -------------------------------------------
+
+#[test]
+fn an_iterator_is_not_a_list() {
+    // `Builtin.roc` declares `List.iter : List(item) -> Iter(item)`. An `Iter` has the
+    // `Iter` block's methods, a lazy `map` among them, and is not a `List`. roc rejects
+    // each of these.
+    assert!(!accepts("xs : List(I64)\nxs = [1, 2].iter()\nxs"));
+    assert!(!accepts("xs : Iter(Str)\nxs = [1.I64].iter()\nxs"));
+    assert!(!accepts("f : Iter(I64) -> U64\nf = |xs| xs.len()\nf([1].iter())"));
+    // And accepts these, printing what is asserted here: an `Iter` method's argument
+    // is typed by the `Iter` signature (`prepended`'s `1` is an `I64`, not a `Dec`),
+    // and an iterator's `map` stays lazy.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+main! = |_args| {
+    check(Str.inspect(Iter.fold([2.I64, 3].iter().prepended(1), [], |acc, x| acc.append(x))), "[1, 2, 3]")
+    check(Str.inspect([1.I64, 2].iter().map(|x| x + 1)), "<opaque>")
+    check(Str.inspect(List.from_iter([1.I64, 2].iter().map(|x| x + 1))), "[2, 3]")
+    check(Str.inspect(List.from_iter([1, 2].iter().map(|x| x * 2))), "[2.0, 4.0]")
+    check(Str.inspect(Iter.fold([1, 2].iter(), 0, |acc, x| acc + x)), "3.0")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
