@@ -950,3 +950,62 @@ main! = |_args| {
 "#;
     assert_eq!(run_program(src), Ok(()));
 }
+
+// --- a list is not an iterator ---------------------------------------------
+
+#[test]
+fn a_lists_keep_if_is_a_list_and_an_iterators_is_an_iterator() {
+    // `Builtin.roc` declares `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`,
+    // the second lazy. `.iter()` gives the iterator, so the two stay apart at run time:
+    // a list's `keep_if` can be concatenated, and an iterator is `<opaque>` until it is
+    // collected. roc prints each as asserted here.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+main! = |_args| {
+    check(Str.inspect(["B"].concat(["C"].keep_if(|n| n != "A"))), "[\"B\", \"C\"]")
+    check(Str.inspect([1.I64, 2, 3].keep_if(|n| n > 1)), "[2, 3]")
+    check(Str.inspect([1.I64, 2, 3].drop_if(|n| n > 1)), "[1]")
+    check(Str.inspect([1.I64, 2, 3].iter()), "<opaque>")
+    check(Str.inspect([1.I64, 2, 3].iter().keep_if(|n| n > 1)), "<opaque>")
+    check(Str.inspect((1.I64..=3).iter().keep_if(|n| n > 1)), "<opaque>")
+    check(Str.inspect(List.from_iter([1.I64, 2, 3].iter().keep_if(|n| n > 1))), "[2, 3]")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
+
+#[test]
+fn every_iter_method_answers_on_a_lists_iterator() {
+    // `.iter()` gives a `Value::Iter`, so each of `Builtin.roc`'s `Iter` methods has
+    // to answer on one, and the ones that build an iterator give one. The examples
+    // are `Builtin.roc`'s own; roc prints each as asserted here.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+main! = |_args| {
+    check(Str.inspect(Iter.fold([7.I64, 8].iter().drop_first(1), [], |acc, x| acc.append(x))), "[8]")
+    check(Str.inspect([7.I64].iter().drop_first(1).size_hint()), "Known(0)")
+    check(Str.inspect(Iter.fold([2.I64, 3].iter().prepended(1.I64), [], |acc, x| acc.append(x))), "[1, 2, 3]")
+    check(Str.inspect(Iter.fold([1.I64, 2].iter().append(3), [], |acc, x| acc.append(x))), "[1, 2, 3]")
+    check(Str.inspect([3.I64, 1, 2].iter().min()), "Ok(1)")
+    check(Str.inspect([3.I64, 1, 2].iter().max()), "Ok(3)")
+    check(Str.inspect([7.I64].iter().drop_first(1).min()), "Err(IterWasEmpty)")
+    check(Str.inspect([2.I64, 3].iter().product()), "Ok(6)")
+    check(Str.inspect([7.I64].iter().drop_first(1).product()), "Err(IterWasEmpty)")
+    check(Str.inspect((1.I64..=4).iter().product()), "Ok(24)")
+    check(Str.inspect([1.I64, 2].iter_rev().keep_if(|n| n > 1)), "<opaque>")
+    check(Str.inspect(Iter.single(42.I64).keep_if(|_| Bool.True)), "<opaque>")
+    check(Str.inspect(List.single(3.I64)), "[3]")
+    empty : List(I64)
+    empty = []
+    check(Str.inspect(empty.min()), "Err(ListWasEmpty)")
+    check(Str.inspect(empty.max()), "Err(ListWasEmpty)")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
