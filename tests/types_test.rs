@@ -393,6 +393,16 @@ fn an_inferred_union_keeps_growing_past_a_builtins_open_union() {
 }
 
 #[test]
+fn an_annotations_open_union_is_a_row_of_its_own() {
+    // `keep`'s `..` is a row, fresh at each use, so what `keep` returns is the
+    // list's union and the `Blue` appended to it reaches `show`. roc rejects it.
+    let src = "keep : [Red, ..] -> [Red, ..]\nkeep = |c| c\nshow : [Red, Green] -> Str\nshow = |c| match c {\n    Red => \"red\"\n    Green => \"green\"\n}\n";
+    let err = type_error(&format!("{}List.map(List.append(List.map(List.repeat(Red, 2), keep), Blue), show)", src));
+    assert!(err.contains("Blue"), "got {}", err);
+    assert!(accepts(&format!("{}List.map(List.append(List.map(List.repeat(Red, 2), keep), Green), show)", src)));
+}
+
+#[test]
 fn a_lone_tag_passed_as_a_nominal_is_that_nominal() {
     // Each `Empty` meets `Node` through `show`, and from then on it IS a `Node`:
     // the `Blue` appended afterwards is not one of its tags, as roc says.

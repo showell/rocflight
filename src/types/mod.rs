@@ -92,9 +92,9 @@ pub enum Type {
     /// a nominal, to the nominal itself -- so every copy of the union learns the
     /// same thing. `List.append(List.repeat(Red, 2), Blue)` is one union, grown to
     /// `[Blue, Red, ..]`, and a lone `Empty` passed where a `Node` is expected IS a
-    /// `Node` once its row says so. `None` on a closed union, and on an open one
-    /// written in an annotation or built into a builtin: those have no row yet, so
-    /// what they meet is not passed back through them.
+    /// `Node` once its row says so. An annotation's `..` gets one when the checker
+    /// takes the signature in. `None` on a closed union, and on an open one the
+    /// checker builds for a builtin's result, which unifies permissively.
     TagUnion { tags: Vec<(&'static str, Vec<Type>)>, open: bool, row: Option<u32> },
 }
 

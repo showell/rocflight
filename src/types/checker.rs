@@ -197,11 +197,12 @@ impl TypeChecker {
                 self.predeclare(value);
             }
             if let Some(declared) = annotation {
+                let declared = self.with_rows(declared);
                 let mut generics = Vec::new();
-                Self::type_vars_in(declared, &mut generics);
+                Self::type_vars_in(&declared, &mut generics);
                 generics.sort_unstable();
                 generics.dedup();
-                self.bind_poly(name, declared.clone(), generics);
+                self.bind_poly(name, declared, generics);
             }
             cursor = body;
         }
@@ -1527,6 +1528,7 @@ impl TypeChecker {
                 .find(|(name, _)| *name == qualified)
                 .map(|(_, ty)| ty.clone())?,
         };
+        let ty = self.with_rows(&ty);
         let mut generics = Vec::new();
         Self::type_vars_in(&ty, &mut generics);
         generics.sort_unstable();
@@ -1561,6 +1563,50 @@ impl TypeChecker {
     fn fresh_row(&mut self) -> u32 {
         self.next_var += 1;
         self.next_var - 1
+    }
+
+    /// A signature as the checker uses it: each `..` in it, `[Red, ..]`, is a row
+    /// of its own, which a use instantiates like any of the signature's variables.
+    ///
+    /// The rows are numbered above every variable the signature already has. The
+    /// parser numbers an annotation's variables from the same space as the
+    /// checker's, so a row that happened to share one's id would be instantiated
+    /// as that variable, and a row became an `I64`.
+    fn with_rows(&mut self, ty: &Type) -> Type {
+        let mut vars = Vec::new();
+        Self::type_vars_in(ty, &mut vars);
+        if let Some(highest) = vars.iter().max() {
+            self.next_var = self.next_var.max(highest + 1);
+        }
+        self.add_rows(ty)
+    }
+
+    fn add_rows(&mut self, ty: &Type) -> Type {
+        match ty {
+            Type::TagUnion { tags, open, row } => {
+                let tags = tags
+                    .iter()
+                    .map(|(n, payload)| (*n, payload.iter().map(|t| self.add_rows(t)).collect()))
+                    .collect();
+                let row = if *open && row.is_none() { Some(self.fresh_row()) } else { *row };
+                Type::TagUnion { tags, open: *open, row }
+            }
+            Type::List(inner) => Type::List(Box::new(self.add_rows(inner))),
+            Type::Range(inner) => Type::Range(Box::new(self.add_rows(inner))),
+            Type::Optional(inner) => Type::Optional(Box::new(self.add_rows(inner))),
+            Type::Function(a, b) => Type::Function(Box::new(self.add_rows(a)), Box::new(self.add_rows(b))),
+            Type::Tuple(items) => Type::Tuple(items.iter().map(|t| self.add_rows(t)).collect()),
+            Type::Record { fields, open } => Type::Record {
+                fields: fields.iter().map(|(n, t)| (*n, self.add_rows(t))).collect(),
+                open: *open,
+            },
+            Type::Nominal { name, backing, args } => Type::Nominal {
+                name: *name,
+                backing: backing.clone(),
+                args: args.iter().map(|t| self.add_rows(t)).collect(),
+            },
+            other => other.clone(),
+        }
     }
 
     /// Synthesize (infer) type of expression
@@ -3316,6 +3362,7 @@ impl TypeChecker {
                     // CHECKED against it rather than merely inferred. That is what
                     // rejects `c : [Red, Green]` with `c = Blue`.
                     Some(declared) => {
+                        let declared = &self.with_rows(declared);
                         let mut generics = Vec::new();
                         Self::type_vars_in(declared, &mut generics);
 
@@ -4469,4 +4516,24 @@ fn width_sensitive(expr: &Expr) -> bool {
         return true;
     }
     expr.children().into_iter().any(width_sensitive)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_signatures_rows_are_numbered_above_its_own_variables() {
+        // The parser numbers `a` from the checker's own space, so a fresh checker
+        // would otherwise mint the `..`'s row as `$0` too, and instantiating the
+        // signature would make the row and `a` one variable.
+        let mut checker = TypeChecker::new();
+        let signature = Type::Function(
+            Box::new(Type::TypeVar(0)),
+            Box::new(Type::TagUnion { tags: vec![("X", vec![])], open: true, row: None }),
+        );
+        let Type::Function(_, result) = checker.with_rows(&signature) else { panic!("a function") };
+        let Type::TagUnion { row: Some(row), .. } = *result else { panic!("a row: {}", result) };
+        assert_ne!(row, 0);
+    }
 }
