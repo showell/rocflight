@@ -228,8 +228,11 @@ fn reads(op: &Op, out: &mut Vec<Reg>) {
         | Op::StoreGlob { src, .. }
         | Op::MakeCell { src, .. }
         | Op::Ret { src }
-        | Op::Dbg { src }
         | Op::Crash { src } => out.push(src),
+        Op::Dbg { src, shape } => {
+            out.push(src);
+            out.push(shape);
+        }
 
         Op::CellGet { cell, .. } => out.push(cell),
         Op::CellSet { cell, src } => {

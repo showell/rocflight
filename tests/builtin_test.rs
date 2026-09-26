@@ -280,6 +280,7 @@ fn run_with(src: &str, builtins: &[&str]) -> Result<String, String> {
         fractional_literals: checker.fractional_literals(),
         parse_targets: checker.json_parse_targets(),
         collect_targets: checker.collect_targets(),
+        inspect_types: checker.inspect_types(),
         f32_literals: checker.f32_literals(),
         u128_literals: checker.u128_literals(),
         default_sites: checker.default_sites(),

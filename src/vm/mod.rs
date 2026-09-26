@@ -368,7 +368,8 @@ pub enum Op {
     /// there; a normal run does not compile it at all.
     TestExpect { cond: Reg },
     /// `dbg value`, to stderr.
-    Dbg { src: Reg },
+    /// `shape`: the value's type as `eval::inspect_as` reads it, `{}` if unknown.
+    Dbg { src: Reg, shape: Reg },
     /// `crash message`. Always an error.
     Crash { src: Reg },
 
@@ -588,6 +589,20 @@ pub fn method_by_name(module: &str, method: &str) -> Option<Value> {
     with_running(|program| {
         let chunk = *program.methods.get(&(module, method))?;
         Some(Value::Closure(Rc::clone(&program.chunks[chunk as usize].bare)))
+    })
+    .flatten()
+}
+
+/// A nominal's own method by its owner's name, `Color.to_inspect`: for a caller that
+/// knows from the TYPE which nominal a value is, where `methods_named` guesses from
+/// its shape.
+/// Answers the method's qualified name with it.
+pub fn method_of(owner: &str, method: &str) -> Option<(&'static str, Value)> {
+    with_running(|program| {
+        program.methods_by_name.get(method)?.iter().find_map(|(qualified, chunk)| {
+            let of = qualified.strip_suffix(method)?.strip_suffix('.')?;
+            (of == owner).then(|| (*qualified, Value::Closure(Rc::clone(&program.chunks[*chunk as usize].bare))))
+        })
     })
     .flatten()
 }
@@ -1641,7 +1656,7 @@ impl Vm {
                 Op::TestExpect { cond } => {
                     crate::eval::run_test_expect(&regs[base + cond as usize]).map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                 }
-                Op::Dbg { src } => crate::eval::run_dbg(&regs[base + src as usize]),
+                Op::Dbg { src, shape } => crate::eval::run_dbg(&regs[base + src as usize], &regs[base + shape as usize]),
                 Op::Crash { src } => {
                     return Err(locate_error(
                         &program,

@@ -881,3 +881,56 @@ fn a_checked_node_keeps_the_type_it_was_checked_against() {
     let rocflight::ast::Expr::Let { name: "x", value, .. } = &**body else { panic!("x: {}", body) };
     assert_eq!(types.get(&value.id()).map(|t| t.to_string()).as_deref(), Some("U8"));
 }
+
+// --- inspect follows the static type ---------------------------------------
+
+#[test]
+fn a_to_inspect_applies_where_the_type_says_so() {
+    // `CreditCard :: Str` is a plain `Str` at run time, so a value alone cannot say
+    // which it is. The type can: the `Str` `Color.to_inspect` returns is shown as a
+    // `Str`, not given to `CreditCard.to_inspect`, and a `Color` inside a list or a
+    // record is shown by its own method, and so is a recursive nominal's inner
+    // one, with or without a `to_inspect`. roc prints each as asserted here.
+    let src = r#"app [main!] {}
+
+Color := [Red, Green].{
+    to_inspect : Color -> Str
+    to_inspect = |c| match c {
+        Red => "_RED_"
+        Green => "_GREEN_"
+    }
+}
+
+CreditCard :: Str.{
+    to_inspect = |CreditCard.(nb)| "**** ${nb}"
+}
+
+Node := [Leaf, Branch(List(Node))].{
+    to_inspect : Node -> Str
+    to_inspect = |n| match n {
+        Leaf => "L"
+        Branch(kids) => "B${Str.inspect(kids)}"
+    }
+}
+
+Holder := [H(List(Holder)), S(Str)]
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+main! = |_args| {
+    check(Str.inspect(Str.inspect(Color.(Red))), "\"_RED_\"")
+    check(Str.inspect("1234"), "\"1234\"")
+    check(Str.inspect(CreditCard.("1234")), "**** 1234")
+    check(Str.inspect([Color.(Red), Color.(Green)]), "[_RED_, _GREEN_]")
+    check(Str.inspect({ c: Color.(Green), s: "x" }), "{ c: _GREEN_, s: \"x\" }")
+    n : Node
+    n = Branch([Leaf, Branch([Leaf])])
+    check(Str.inspect(n), "B[L, B[L]]")
+    h : Holder
+    h = H([S("x"), H([S("y")])])
+    check(Str.inspect(h), "H([S(\"x\"), H([S(\"y\")])])")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
