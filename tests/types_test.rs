@@ -1017,6 +1017,11 @@ fn an_iterator_is_not_a_list() {
     assert!(!accepts("xs : List(I64)\nxs = [1, 2].iter()\nxs"));
     assert!(!accepts("xs : Iter(Str)\nxs = [1.I64].iter()\nxs"));
     assert!(!accepts("f : Iter(I64) -> U64\nf = |xs| xs.len()\nf([1].iter())"));
+    // No literal is an iterator, and `Iter.len` is missing however it is spelled.
+    let count = "f : Iter(I64) -> U64\nf = |it| it.fold(0, |a, _| a + 1)\n";
+    assert!(!accepts(&format!("{}f([1, 2])", count)));
+    assert!(!accepts(&format!("{}f(Ok(3))", count)));
+    assert!(!accepts("Iter.len([1.I64].iter())"));
     // And accepts these, printing what is asserted here: an `Iter` method's argument
     // is typed by the `Iter` signature (`prepended`'s `1` is an `I64`, not a `Dec`),
     // and an iterator's `map` stays lazy.

@@ -1025,8 +1025,9 @@ impl TypeChecker {
             }
 
             // A nominal wraps its backing, so checking against one checks against that.
+            // `Builtin.roc`'s `Iter` is opaque: no literal is one, which `unify` says.
             Expr::Record(..) | Expr::Tag { .. } | Expr::List(..)
-                if matches!(resolved, Type::Nominal { .. }) =>
+                if matches!(resolved, Type::Nominal { .. }) && self.builtin_iter_element(&resolved).is_none() =>
             {
                 let Type::Nominal { backing, .. } = &resolved else { unreachable!("matched") };
                 let backing = (**backing).clone();
@@ -1462,6 +1463,30 @@ impl TypeChecker {
 
     pub fn declare_nominal_literals(&mut self, literals: &[(crate::ast::NodeId, Type)]) {
         self.nominal_literals.extend(literals.iter().cloned());
+    }
+
+    /// The element of `Builtin.roc`'s `Iter`, where `ty` is one. A program that declares
+    /// its own `Iter` means that one by the name instead.
+    fn builtin_iter_element(&self, ty: &Type) -> Option<Type> {
+        if self.declared_types.contains_key("Iter") {
+            return None;
+        }
+        ty.iter_element().cloned()
+    }
+
+    /// `Iter.len(it)` names a member `Builtin.roc`'s `Iter` does not have, as `it.len()`
+    /// does; roc reports both.
+    fn missing_iter_member(&mut self, module: &str, name: &str) -> Result<(), TypeError> {
+        if module != "Iter" || self.declared_types.contains_key("Iter") || self.declared(module, name).is_some() {
+            return Ok(());
+        }
+        Err(TypeError {
+            message: format!("`Iter.{}` does not exist", name),
+            expected: "a member of `Iter`".to_string(),
+            actual: format!("Iter.{}", name),
+            line: 0,
+            col: 0,
+        })
     }
 
     /// The declared type of `Module.method`, from the program or from `Builtin.roc`.
@@ -2514,8 +2539,8 @@ impl TypeChecker {
                     // A range yields its element type without being a list, and so does
                     // an iterator.
                     Type::Range(elem) => *elem,
-                    ref iter if iter.iter_element().is_some() && !self.declared_types.contains_key("Iter") => {
-                        iter.iter_element().cloned().expect("just checked")
+                    ref iter if self.builtin_iter_element(iter).is_some() => {
+                        self.builtin_iter_element(iter).expect("just checked")
                     }
                     // A nominal with an `iter` method — a custom iterable — is looped
                     // over its `iter()`, whose element is what the loop binds. The VM
@@ -2525,7 +2550,7 @@ impl TypeChecker {
                         let iter = self.declared(name, "iter").expect("just checked");
                         match Self::peel_params(&iter, 1).map(|(_, result)| self.apply(&result)) {
                             Some(Type::Range(elem)) | Some(Type::List(elem)) => *elem,
-                            Some(iter) if iter.iter_element().is_some() => iter.iter_element().cloned().expect("just checked"),
+                            Some(iter) if self.builtin_iter_element(&iter).is_some() => self.builtin_iter_element(&iter).expect("just checked"),
                             _ => self.fresh_var(),
                         }
                     }
@@ -2781,7 +2806,7 @@ impl TypeChecker {
                 }
                 // `Builtin.roc`'s `Iter` block is the whole of what an iterator answers:
                 // roc reports `it.len()` as a missing method, having no `Iter.len`.
-                if resolved.iter_element().is_some() && !self.declared_types.contains_key("Iter") {
+                if self.builtin_iter_element(&resolved).is_some() {
                     return Err(TypeError {
                         message: format!(
                             "This `{}` method is being called on a value whose type does not have it",
@@ -3047,6 +3072,7 @@ impl TypeChecker {
             // qualified reference resolves from the environment before falling back to
             // "some function" — `Counter.start` is a Counter, not a function.
             Expr::Qualified { module, name, .. } => {
+                self.missing_iter_member(module, name)?;
                 if let Some(declared) = self.declared(module, name) {
                     return Ok(declared);
                 }
@@ -3171,6 +3197,7 @@ impl TypeChecker {
             // way `xs.len()` does, so the two spellings behave alike when chained.
             Expr::Call { func, args, .. } if matches!(**func, Expr::Qualified { .. }) => {
                 if let Expr::Qualified { module, name, .. } = &**func {
+                    self.missing_iter_member(module, name)?;
                     // The synthetic crypto modules the parser produces for
                     // `Crypto.SHA256.*` / `Crypto.BLAKE3.*` — typed here, since they
                     // are not in any signature table.
@@ -3775,7 +3802,7 @@ impl TypeChecker {
     fn element_of(&mut self, receiver: Option<&Type>) -> Type {
         match receiver.map(|t| self.apply(t)) {
             Some(Type::List(inner)) | Some(Type::Range(inner)) => *inner,
-            Some(iter) if iter.iter_element().is_some() => iter.iter_element().cloned().expect("just checked"),
+            Some(iter) if self.builtin_iter_element(&iter).is_some() => self.builtin_iter_element(&iter).expect("just checked"),
             _ => self.fresh_var(),
         }
     }
