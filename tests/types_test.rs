@@ -409,6 +409,26 @@ fn an_annotations_named_extension_is_one_row() {
 }
 
 #[test]
+fn a_named_row_used_as_a_type_takes_only_tags() {
+    // `x` is `[A, ..x]`'s row and also a parameter's type. A list of tags may be
+    // it; a `Str` or a number may not -- roc rejects both, and binding the row to
+    // a `Str` used to panic the checker.
+    let f = "f : [A, ..x], x -> [A, ..x]\nf = |t, _v| t\n";
+    assert!(type_error(&format!("{}f(A, \"hello\")", f)).contains("Str"));
+    let _ = type_error(&format!("{}f(A, 42)", f));
+    let h = "h : [A, ..x], List(x) -> [A, ..x]\nh = |t, _v| t\n";
+    assert!(accepts(&format!("{}h(A, [B])", h)));
+}
+
+#[test]
+fn an_extension_alias_puts_its_argument_in_for_the_row() {
+    // `T([B, C])` is `[A, B, C]`, so `show` covers it with three arms. roc agrees.
+    let src = "T(x) : [A, ..x]\nshow : T([B, C]) -> Str\nshow = |t| match t {\n    A => \"a\"\n    B => \"b\"\n    C => \"c\"\n}\n";
+    assert_eq!(as_str(&format!("{}show(B)", src)), "b");
+    assert!(type_error(&format!("{}show(D)", src)).contains("D"));
+}
+
+#[test]
 fn a_signature_naming_a_nominal_still_numbers_its_rows_apart() {
     // `pick` is used before it is defined, so its signature's rows are minted
     // early, while `a`'s id is still in range -- and `Node` in the signature brings
