@@ -94,6 +94,10 @@ pub struct TypeChecker {
     /// Variables standing for a string literal, which may still become a nominal
     /// with `from_quote`; see `numeral_vars`.
     quote_vars: std::collections::HashSet<u32>,
+    /// The ids that are tag unions' ROWS. A row stands for more tags, or for the
+    /// nominal its union turned out to be, so binding one to anything else is a
+    /// type error -- `f : [A, ..x], x -> _` may not take a `Str` for `x`.
+    row_vars: std::collections::HashSet<u32>,
     /// String literal nodes and their variables, plain and interpolated.
     str_literals: Vec<(crate::ast::NodeId, Type)>,
     interp_literals: Vec<(crate::ast::NodeId, Type)>,
@@ -466,6 +470,7 @@ impl TypeChecker {
             quotable: false,
             conversion_nominals: std::collections::HashSet::new(),
             quote_vars: std::collections::HashSet::new(),
+            row_vars: std::collections::HashSet::new(),
             str_literals: Vec::new(),
             interp_literals: Vec::new(),
             suffixed_nominals: std::collections::HashMap::new(),
@@ -586,7 +591,9 @@ impl TypeChecker {
                 }
             }
         }
-        Self::substitute_vars(ty, &mapping)
+        let instance = Self::substitute_vars(ty, &mapping);
+        self.note_rows(&instance);
+        instance
     }
 
     /// Structural substitution of type variables by id.
@@ -1600,7 +1607,29 @@ impl TypeChecker {
     /// variables share one number space and one substitution.
     fn fresh_row(&mut self) -> u32 {
         self.next_var += 1;
+        self.row_vars.insert(self.next_var - 1);
         self.next_var - 1
+    }
+
+    /// Note every row in `ty` as one: a signature's, or a copy of one.
+    fn note_rows(&mut self, ty: &Type) {
+        match ty {
+            Type::TagUnion { tags, row, .. } => {
+                if let Some(r) = row {
+                    self.row_vars.insert(*r);
+                }
+                tags.iter().flat_map(|(_, payload)| payload).for_each(|t| self.note_rows(t));
+            }
+            Type::List(inner) | Type::Range(inner) | Type::Optional(inner) => self.note_rows(inner),
+            Type::Function(a, b) => {
+                self.note_rows(a);
+                self.note_rows(b);
+            }
+            Type::Tuple(items) => items.iter().for_each(|t| self.note_rows(t)),
+            Type::Record { fields, .. } => fields.iter().for_each(|(_, t)| self.note_rows(t)),
+            Type::Nominal { args, .. } => args.iter().for_each(|t| self.note_rows(t)),
+            _ => {}
+        }
     }
 
     /// A signature as the checker uses it: each `..` in it, `[Red, ..]`, is a row
@@ -1617,7 +1646,9 @@ impl TypeChecker {
         if let Some(highest) = vars.iter().filter(|v| **v != u32::MAX).max() {
             self.next_var = self.next_var.max(highest + 1);
         }
-        self.add_rows(ty)
+        let with = self.add_rows(ty);
+        self.note_rows(&with);
+        with
     }
 
     fn add_rows(&mut self, ty: &Type) -> Type {
@@ -4098,6 +4129,20 @@ impl TypeChecker {
                     } else if self.quote_vars.contains(w) {
                         self.quote_vars.insert(*v);
                     }
+                    // So does being a ROW, and a row is never a number or a string.
+                    if self.row_vars.contains(v) || self.row_vars.contains(w) {
+                        self.row_vars.insert(*v);
+                        self.row_vars.insert(*w);
+                        if [v, w].iter().any(|x| self.numeral_vars.contains(x) || self.quote_vars.contains(x)) {
+                            return Err(TypeError {
+                                message: "A number or a string cannot extend a tag union".to_string(),
+                                expected: "a tag union".to_string(),
+                                actual: t1.to_string(),
+                                line: 0,
+                                col: 0,
+                            });
+                        }
+                    }
                 }
                 // A RIGID variable is the CALLER's choice, not the body's: in
                 // `get_err : [Ok(a), Err(e)] -> e` the result is whatever `e` the
@@ -4138,6 +4183,19 @@ impl TypeChecker {
                         message: format!("A number cannot be used as {}", t),
                         expected: t.to_string(),
                         actual: "a number".to_string(),
+                        line: 0,
+                        col: 0,
+                    });
+                }
+                // A ROW takes tags, or the nominal its union turned out to be.
+                if self.row_vars.contains(v)
+                    && !matches!(t, Type::TypeVar(_) | Type::TagUnion { .. })
+                    && !matches!(t, Type::Nominal { backing, .. } if matches!(**backing, Type::TagUnion { .. }))
+                {
+                    return Err(TypeError {
+                        message: format!("{} is not a tag union, so it cannot extend one", t),
+                        expected: "a tag union".to_string(),
+                        actual: t.to_string(),
                         line: 0,
                         col: 0,
                     });
