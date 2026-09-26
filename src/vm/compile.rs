@@ -1939,13 +1939,12 @@ impl<'u> Compiler<'u> {
         //
         // `keep_if`/`drop_if` in METHOD syntax are not here, and were tried: `Builtin.roc`
         // declares both `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, the
-        // second lazy, so a compiled loop may only stand in for the List one. For a method
-        // call there is no sound way to tell them apart here. `dispatch_modules` is not it — the checker calls
-        // `(1..=5).iter()` a `List`, so lowering on that made
+        // second lazy, so a compiled loop may only stand in for the List one.
+        // `dispatch_modules` cannot say which — the checker calls `(1..=5).iter()` a
+        // `List`, so lowering on that made
         // `Str.inspect((1..=5).iter().keep_if(p))` answer `[4.0, 5.0]` where roc answers
-        // `<opaque>`; and nothing syntactic is it either, because `xs = (1..=n).iter()`
-        // then `xs.keep_if(p)` has a bare name as its receiver. See `dispatch_builtin`,
-        // which answers the lazy one for both and says what is still divergent.
+        // `<opaque>`. Left to `dispatch_builtin`, the receiver decides: `.iter()` gives
+        // a `Value::Iter`, whose `keep_if` is lazy.
         let _ = module;
 
         // The accumulator, the list being built, or the answer. Allocated first, so it

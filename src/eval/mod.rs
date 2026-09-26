@@ -178,6 +178,23 @@ fn elements(value: Value, name: &str) -> Result<Elements, EvalError> {
     }
 }
 
+/// `min` or `max` of some items, or `Err(empty)`: `List`'s and `Iter`'s differ only
+/// in what they call nothing.
+pub(crate) fn extreme(name: &str, mut items: impl Iterator<Item = Value>, empty: &'static str) -> Value {
+    let Some(mut best) = items.next() else {
+        return Value::tag("Err", [Value::bare(empty)]);
+    };
+    for item in items {
+        let ordering = order_values(&item, &best);
+        if (name == "min" && ordering == Some(std::cmp::Ordering::Less))
+            || (name == "max" && ordering == Some(std::cmp::Ordering::Greater))
+        {
+            best = item;
+        }
+    }
+    Value::tag("Ok", [best])
+}
+
 fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError> {
     let expect = |wanted: usize, got: usize| -> Result<(), EvalError> {
         if wanted == got {
@@ -264,8 +281,14 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             let capacity = if zero_sized { 0 } else if let Value::List(rc) = &args[0] { rc.capacity() } else { 0 };
             Ok(Value::Int(capacity as i128))
         }
-        // `.iter()` and `.collect()` are the identity on what is already a list.
-        "iter" | "collect" => {
+        // `.iter()` gives the iterator, which is `<opaque>` and whose `keep_if` is lazy;
+        // `.collect()` is the identity on what is already a list.
+        "iter" => {
+            expect(1, args.len())?;
+            let list = std::mem::replace(&mut args[0], Value::Unit);
+            Ok(lazy::of(list).map(Value::Iter).expect("a list is iterable"))
+        }
+        "collect" => {
             expect(1, args.len())?;
             Ok(std::mem::replace(&mut args[0], Value::Unit))
         }
@@ -273,7 +296,7 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             expect(1, args.len())?;
             let mut items = as_list(&mut args[0])?;
             items.reverse();
-            Ok(Value::list(items))
+            Ok(lazy::of(Value::list(items)).map(Value::Iter).expect("a list is iterable"))
         }
         "size_hint" => {
             expect(1, args.len())?;
@@ -447,19 +470,7 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
         }
         "min" | "max" => {
             expect(1, args.len())?;
-            let mut items = elements(args[0].clone(), name)?;
-            let Some(mut best) = items.next() else {
-                return Ok(Value::tag("Err", [Value::bare("IterWasEmpty")]));
-            };
-            for item in items {
-                let ordering = order_values(&item, &best);
-                if (name == "min" && ordering == Some(std::cmp::Ordering::Less))
-                    || (name == "max" && ordering == Some(std::cmp::Ordering::Greater))
-                {
-                    best = item;
-                }
-            }
-            Ok(Value::tag("Ok", [best]))
+            Ok(extreme(name, elements(args[0].clone(), name)?, "ListWasEmpty"))
         }
         "sort" | "sort_reversed" | "sort_by" | "sort_by_reversed" | "sort_with" | "sort_with_reversed" => {
             let has_fn = name != "sort" && name != "sort_reversed";
@@ -2725,26 +2736,22 @@ pub fn call_builtin_values(
             // `Iter(a) -> Iter((U64, a))` and nowhere else — so it always produces a
             // lazy iterator, even off a list.
             //
-            // `keep_if`/`drop_if` are here for a worse reason: `Builtin.roc` declares
-            // BOTH `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, and roc
-            // inspects `[1, 2, 3].keep_if(p)` as `[2, 3]` but
-            // `[1, 2, 3].iter().keep_if(p)` as `<opaque>`. Nothing here can tell those
-            // apart, because `.iter()` on a list IS the list at run time — so this path
-            // answers the lazy one for both. A call WRITTEN `List.keep_if(xs, p)` (or
-            // piped into it) cannot be `Iter.keep_if`, and the compiler answers the eager
-            // one for it (`Compiler::list_loop`). What is left divergent is method syntax
-            // on a list, `[1, 2, 3].keep_if(p)`, and `List.keep_if` passed as a function
-            // value: roc gives a list there and this gives an iterator. Fixing those needs
-            // an `Iter` that is its own value.
-            || matches!(name, "keep_if" | "drop_if" | "with_index")
-            // `concat` and `size_hint` are shared with `List`: lazy only for a range
-            // or an iterator, so `List.concat` of two lists stays an eager list.
-            || (matches!(name, "concat" | "size_hint") && on_lazy_source)
+            || name == "with_index"
+            // The rest are shared with `List`: `Builtin.roc` declares both
+            // `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, the second lazy.
+            // `.iter()` gives a `Value::Iter`, so the receiver says which is meant: a
+            // list's stays an eager list, and a range's or an iterator's is lazy.
+            || (matches!(name, "keep_if" | "drop_if" | "concat" | "size_hint") && on_lazy_source)
             || (name == "from_iter" && on_iter);
         if lazy_method {
             if let Some(result) = lazy::call(name, args) {
                 return result;
             }
+        }
+        // `Iter.single` and `List.single` share a name and nothing else.
+        if module == "Iter" && name == "single" && args.len() == 1 {
+            let item = std::mem::replace(&mut args[0], Value::Unit);
+            return Ok(lazy::of(Value::list(vec![item])).map(Value::Iter).expect("a list is iterable"));
         }
         return call_list_builtin(name, args);
     }
@@ -3619,17 +3626,19 @@ pub fn dispatch_builtin(method: &str, values: &mut [Value]) -> Result<Value, Eva
         message: format!("`{}` was dispatched on nothing", method),
     })?;
     let receiver = receiver.clone();
-    // `.iter()` on something already iterable is the identity. A range STAYS a range:
-    // building the list of its elements cost 190 MB on a two-million-element range, and
-    // every builtin that only walks the elements can walk a range instead. It also
-    // matches roc, which inspects a range as `<opaque>` rather than as a list.
+    // `.iter()` on a list is the iterator over it, which is what keeps `List.keep_if`
+    // and `Iter.keep_if` apart at run time. A range STAYS a range: building the list of
+    // its elements cost 190 MB on a two-million-element range, and every builtin that
+    // only walks the elements can walk a range instead. roc inspects both as `<opaque>`.
     //
     // ponytail: still eager in the sense that `map` over a range builds its output
     // list. Fusing `map` into the consumer needs a real lazy iterator; this removes the
     // ceiling without one.
     if method == "iter" && args.is_empty() {
-        if matches!(receiver, Value::List(_) | Value::Range { .. }) {
-            return Ok(receiver);
+        match receiver {
+            Value::List(_) => return Ok(lazy::of(receiver).map(Value::Iter).expect("a list is iterable")),
+            Value::Range { .. } => return Ok(receiver),
+            _ => {}
         }
     }
 
