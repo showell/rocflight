@@ -1076,7 +1076,33 @@ main! = |_args| {
 }
 "#;
     assert_eq!(run_program(src), Ok(()));
-    // And a type without the method is refused where it meets the constraint.
-    let err = run_program("app [main!] {}\n\ndouble_all = |it| it.map(|x| x * 2)\n\nmain! = |_args| {\n    _s = double_all(\"hello\")\n    Ok({})\n}\n").unwrap_err();
-    assert!(err.contains("map"), "got {}", err);
+}
+
+#[test]
+fn a_generic_functions_constraints_stay_its_own() {
+    // A generic function's constraints belong to it: an unrelated call with variables
+    // numbered alike does not take them on (`List.len(["a"])` beside an unused
+    // `doubled`), a bare number is a receiver like any other (`f(5)` is a `Str`), and a
+    // `let` inside a generic body stays tied to it. roc prints each as asserted.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+doubled = |xs| xs.map(|x| x * 2)
+f = |v| v.to_str()
+via_let = |xs| {
+    ys = xs.map(|x| x * 2)
+    ys.map(|y| y + 1)
+}
+
+main! = |_args| {
+    check(Str.inspect(List.len(["a"])), "1")
+    check(f(5).concat("x"), "5.0x")
+    check(Str.inspect(via_let([1.I64, 2])), "[3, 5]")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+    assert!(accepts("doubled = |xs| xs.map(|x| x * 2)\nList.len([\"a\"])"));
+    assert!(accepts("f = |v| v.to_str()\nf(5).concat(\"x\")"));
 }

@@ -177,6 +177,8 @@ pub struct TypeChecker {
     /// How deep `unify` is, and whether the queues above are being drained.
     unify_depth: u32,
     draining: bool,
+    /// The variable copies the last `instantiate` made, for `instantiate_scheme`.
+    last_mapping: Vec<(u32, Type)>,
     /// How deep synthesis is inside an UNANNOTATED lambda body.
     ///
     /// Such a body is checked before any call site is seen, so its parameters are still
@@ -197,8 +199,16 @@ pub struct TypeChecker {
     /// meant the checker could not know a value's declared type — and so could not
     /// reject a tag outside a closed union, check a `match` for exhaustiveness, or
     /// give `x.field` a real type. Annotations reaching the AST are what fill it.
-    env: Vec<Vec<(String, Type, Vec<u32>)>>,
+    env: Vec<Vec<(String, Type, Vec<u32>, Vec<(u32, MethodConstraint)>)>>,
 }
+
+/// Where the checker's own type variables start numbering. Every parser numbers an
+/// annotation's variables from 1 (`Builtin.roc`'s members each with a parser of their
+/// own), and an annotation's variables reach unification under those numbers — a
+/// rigid one inside the body it annotates, for one. Numbered from the same place, a
+/// variable the checker made and one a parser made were the SAME variable wherever
+/// their numbers met, and whatever one was bound to or asked to do, so was the other.
+const FIRST_CHECKER_VAR: u32 = 1 << 24;
 
 /// One use of a method on a value whose type was not known yet: `method`, called with
 /// the shape `receiver -> arg1 -> ... -> result` (`arity` counts the receiver).
@@ -475,6 +485,7 @@ impl TypeChecker {
             pending_pairs: Vec::new(),
             unify_depth: 0,
             draining: false,
+            last_mapping: Vec::new(),
             committed_vars: std::collections::HashSet::new(),
             nominal_literals: std::collections::HashMap::new(),
             suffixed: std::collections::HashMap::new(),
@@ -502,7 +513,7 @@ impl TypeChecker {
             returns: Vec::new(),
             parse_targets: std::collections::HashMap::new(),
             inspect_types: std::collections::HashMap::new(),
-            next_var: 0,
+            next_var: FIRST_CHECKER_VAR,
             env: vec![Vec::new()],
         }
     }
@@ -522,7 +533,7 @@ impl TypeChecker {
     /// Record a monomorphic name's type in the innermost scope.
     fn bind(&mut self, name: &str, ty: Type) {
         if let Some(scope) = self.env.last_mut() {
-            scope.push((name.to_string(), ty, Vec::new()));
+            scope.push((name.to_string(), ty, Vec::new(), Vec::new()));
         }
     }
 
@@ -533,18 +544,26 @@ impl TypeChecker {
         for name in names {
             let qualified = format!("{}.{}", type_name, name);
             let found = self.env.iter().rev().find_map(|scope| {
-                scope.iter().rev().find(|(n, _, _)| *n == qualified).cloned()
+                scope.iter().rev().find(|(n, ..)| *n == qualified).cloned()
             });
-            if let Some((_, ty, generics)) = found {
-                self.bind_poly(name, ty, generics);
+            if let Some((_, ty, generics, constraints)) = found {
+                self.bind_scheme(name, ty, generics, constraints);
             }
         }
     }
 
     /// Record a name whose type variables are universally quantified.
     fn bind_poly(&mut self, name: &str, ty: Type, generics: Vec<u32>) {
+        self.bind_scheme(name, ty, generics, Vec::new());
+    }
+
+    /// Record a quantified name together with the constraints its quantified variables
+    /// carry — its inferred `where` clause. They belong to the scheme, not to the
+    /// variable numbers: an annotation's and a builtin signature's variables are
+    /// numbered in the same space, and must not pick them up.
+    fn bind_scheme(&mut self, name: &str, ty: Type, generics: Vec<u32>, constraints: Vec<(u32, MethodConstraint)>) {
         if let Some(scope) = self.env.last_mut() {
-            scope.push((name.to_string(), ty, generics));
+            scope.push((name.to_string(), ty, generics, constraints));
         }
     }
 
@@ -556,12 +575,14 @@ impl TypeChecker {
     fn env_type_vars(&self) -> Vec<u32> {
         let mut out = Vec::new();
         for scope in &self.env {
-            for (_, ty, generics) in scope {
+            for (_, ty, generics, _) in scope {
                 let mut vars = Vec::new();
                 Self::type_vars_in(&self.apply(ty), &mut vars);
                 out.extend(vars.into_iter().filter(|v| !generics.contains(v)));
             }
         }
+        // What those variables are still asked to do is still being inferred too.
+        self.add_constraint_vars(&mut out);
         out
     }
 
@@ -574,11 +595,11 @@ impl TypeChecker {
             scope
                 .iter()
                 .rev()
-                .find(|(n, _, _)| n == name)
-                .map(|(_, t, g)| (t.clone(), g.clone()))
+                .find(|(n, ..)| n == name)
+                .map(|(_, t, g, c)| (t.clone(), g.clone(), c.clone()))
         })?;
-        let (ty, generics) = found;
-        Some(if generics.is_empty() { ty } else { self.instantiate(&ty, &generics) })
+        let (ty, generics, constraints) = found;
+        Some(if generics.is_empty() { ty } else { self.instantiate_scheme(&ty, &generics, &constraints) })
     }
 
     /// Replace each quantified variable with a fresh one, consistently.
@@ -608,13 +629,22 @@ impl TypeChecker {
         }
         let instance = Self::substitute_vars(ty, &mapping);
         self.note_rows(&instance);
-        // Each copy of a constrained variable is constrained alike, over copies.
-        for (id, fresh) in &mapping {
-            let (Some(constraints), Type::TypeVar(fv)) = (self.method_constraints.get(id).cloned(), fresh) else { continue };
-            for constraint in constraints {
-                let shape = Self::substitute_vars(&self.apply(&constraint.shape), &mapping);
-                self.add_constraint(*fv, MethodConstraint { shape, ..constraint });
-            }
+        self.last_mapping = mapping;
+        instance
+    }
+
+    /// `instantiate`, with the scheme's constraints put on the fresh copies of their
+    /// variables, over the same copies.
+    fn instantiate_scheme(&mut self, ty: &Type, generics: &[u32], constraints: &[(u32, MethodConstraint)]) -> Type {
+        let instance = self.instantiate(ty, generics);
+        if constraints.is_empty() {
+            return instance;
+        }
+        let mapping = std::mem::take(&mut self.last_mapping);
+        for (id, constraint) in constraints {
+            let Some((_, Type::TypeVar(fresh))) = mapping.iter().find(|(from, _)| from == id) else { continue };
+            let shape = Self::substitute_vars(&constraint.shape, &mapping);
+            self.add_constraint(*fresh, MethodConstraint { shape, ..constraint.clone() });
         }
         instance
     }
@@ -2039,7 +2069,7 @@ impl TypeChecker {
     /// after the program is synthesised, so its methods are in scope.
     pub fn method_problems(&self) -> Option<String> {
         for scope in &self.env {
-            for (name, ty, _) in scope {
+            for (name, ty, ..) in scope {
                 if !name.ends_with(".to_inspect") {
                     continue;
                 }
@@ -2062,7 +2092,7 @@ impl TypeChecker {
             .env
             .iter()
             .flatten()
-            .map(|(n, t, _)| (n, t))
+            .map(|(n, t, ..)| (n, t))
             .chain(self.declared_signatures.iter())
         {
             if !qualified.ends_with(".map2") {
@@ -3606,7 +3636,16 @@ impl TypeChecker {
 
                         self.generalized_numerals
                             .extend(generics.iter().filter(|v| self.numeral_vars.contains(v)));
-                        self.bind_poly(name, inferred, generics);
+                        // The quantified variables' constraints leave the table for the
+                        // scheme, applied, so each use copies them from there.
+                        let mut constraints = Vec::new();
+                        for v in &generics {
+                            for constraint in self.method_constraints.remove(v).unwrap_or_default() {
+                                let shape = self.apply(&constraint.shape);
+                                constraints.push((*v, MethodConstraint { shape, ..constraint }));
+                            }
+                        }
+                        self.bind_scheme(name, inferred, generics, constraints);
                     }
                 }
                 Ok(())
@@ -4134,14 +4173,10 @@ impl TypeChecker {
         if self.unify_depth > 0 || self.draining {
             return result;
         }
-        match result {
-            Ok(()) => self.drain_dispatch(),
-            Err(e) => {
-                self.pending_dispatch.clear();
-                self.pending_pairs.clear();
-                Err(e)
-            }
-        }
+        // What this unification queued is checked even if it failed partway: a caller
+        // may go on past the error, and the constraints have already left the table.
+        let drained = self.drain_dispatch();
+        result.and(drained)
     }
 
     /// Check what unification queued: each constraint whose variable met a concrete
@@ -4158,10 +4193,6 @@ impl TypeChecker {
                 break;
             }
         }
-        if result.is_err() {
-            self.pending_dispatch.clear();
-            self.pending_pairs.clear();
-        }
         self.draining = false;
         result
     }
@@ -4171,6 +4202,10 @@ impl TypeChecker {
     /// constraint (`double_all = |it| it.map(|x| x * 2)` is `a -> b` with `x` inside
     /// `a.map`'s shape), and each use needs its own copy of it.
     fn add_constraint_vars(&self, vars: &mut Vec<u32>) {
+        if self.method_constraints.is_empty() {
+            return;
+        }
+        let mut seen: std::collections::HashSet<u32> = vars.iter().copied().collect();
         let mut i = 0;
         while i < vars.len() {
             if let Some(constraints) = self.method_constraints.get(&vars[i]) {
@@ -4178,7 +4213,7 @@ impl TypeChecker {
                     let mut found = Vec::new();
                     Self::type_vars_in(&self.apply(&constraint.shape), &mut found);
                     for v in found {
-                        if !vars.contains(&v) {
+                        if seen.insert(v) {
                             vars.push(v);
                         }
                     }
@@ -4191,6 +4226,13 @@ impl TypeChecker {
     /// Promise that variable `v`'s type has `method` of this shape. The same method
     /// asked twice of one variable is one method: the two shapes agree.
     fn add_constraint(&mut self, v: u32, constraint: MethodConstraint) {
+        // A number whose width is not fixed yet answers as a number does now: it
+        // defaults without meeting `unify`, so a constraint left on it would never be
+        // checked.
+        if self.numeral_vars.contains(&v) || self.quote_vars.contains(&v) {
+            self.pending_dispatch.push((constraint, Type::TypeVar(v)));
+            return;
+        }
         let list = self.method_constraints.entry(v).or_default();
         if let Some(existing) = list.iter().find(|c| c.method == constraint.method && c.arity == constraint.arity) {
             self.pending_pairs.push((existing.shape.clone(), constraint.shape));
@@ -4219,6 +4261,15 @@ impl TypeChecker {
         let ty = self.apply(ty);
         let MethodConstraint { method, shape, arity } = constraint.clone();
         match &ty {
+            Type::TypeVar(w) if self.numeral_vars.contains(w) || self.quote_vars.contains(w) => {
+                let Some((shape_params, shape_result)) = Self::peel_params(&shape, arity) else { return Ok(()) };
+                let answered = match Self::conversion_type(method) {
+                    Some(target) if self.numeral_vars.contains(w) => target,
+                    _ => self.builtin_result(method, Some(&ty), &shape_params[1..]),
+                };
+                let _ = self.unify(&answered, &shape_result);
+                return Ok(());
+            }
             Type::TypeVar(w) => {
                 self.add_constraint(*w, constraint);
                 return Ok(());
@@ -4311,7 +4362,6 @@ impl TypeChecker {
                 if self.nominal_params.values().any(|params| params.contains(v)) {
                     if let Type::TypeVar(w) = t {
                         if !self.nominal_params.values().any(|params| params.contains(w)) {
-                            self.move_constraints(*w, &Type::TypeVar(*v));
                             self.subst.insert(*w, Type::TypeVar(*v));
                         }
                     }
@@ -4335,6 +4385,15 @@ impl TypeChecker {
                         self.quote_vars.insert(*w);
                     } else if self.quote_vars.contains(w) {
                         self.quote_vars.insert(*v);
+                    }
+                    // A constrained variable that just became a number answers as one
+                    // now: numbers default without meeting `unify` again.
+                    for x in [*v, *w] {
+                        if self.numeral_vars.contains(&x) || self.quote_vars.contains(&x) {
+                            for constraint in self.method_constraints.remove(&x).unwrap_or_default() {
+                                self.pending_dispatch.push((constraint, Type::TypeVar(x)));
+                            }
+                        }
                     }
                     // So does being a ROW, and a row is never a number or a string.
                     if self.row_vars.contains(v) || self.row_vars.contains(w) {
@@ -4870,9 +4929,8 @@ mod tests {
 
     #[test]
     fn a_signatures_rows_are_numbered_above_its_own_variables() {
-        // The parser numbers `a` from the checker's own space, so a fresh checker
-        // would otherwise mint the `..`'s row as `$0` too, and instantiating the
-        // signature would make the row and `a` one variable.
+        // The row is numbered above the signature's own variables, so instantiating the
+        // signature cannot make the row and `a` one variable.
         let mut checker = TypeChecker::new();
         let signature = Type::Function(
             Box::new(Type::TypeVar(0)),
@@ -4886,7 +4944,8 @@ mod tests {
     #[test]
     fn a_nominals_placeholder_is_not_a_variable_to_number_above() {
         // `Node`'s placeholder backing is the parser's `$u32::MAX`; counting it
-        // overflowed, and in a release build wrapped, leaving the row at `$0`.
+        // overflowed, and in a release build wrapped, leaving the row at `$0`. Not
+        // counted, the row is the checker's first variable.
         let mut checker = TypeChecker::new();
         let node = Type::Nominal { name: "Node", backing: Box::new(Type::TypeVar(u32::MAX)), args: Vec::new() };
         let signature = Type::Function(
@@ -4895,6 +4954,6 @@ mod tests {
         );
         let Type::Function(_, result) = checker.with_rows(&signature) else { panic!("a function") };
         let Type::TagUnion { row: Some(row), .. } = *result else { panic!("a row: {}", result) };
-        assert_eq!(row, 1);
+        assert_eq!(row, FIRST_CHECKER_VAR);
     }
 }
