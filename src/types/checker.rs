@@ -163,6 +163,20 @@ pub struct TypeChecker {
     /// Methods a `where` clause promised, which may be dispatched on a type variable
     /// inference has not resolved. Set from the parser before checking.
     where_methods: Vec<String>,
+    /// STATIC DISPATCH: what each type variable has been asked to do. `it.map(f)` on
+    /// an `it` whose type is not known yet is a promise that its type has a `map` of
+    /// the shape the call used, checked when the variable is resolved against the
+    /// method its type declares, as roc checks it. The constraints travel with the
+    /// variable through unification, generalisation and instantiation.
+    method_constraints: std::collections::HashMap<u32, Vec<MethodConstraint>>,
+    /// Constraints whose variable met a concrete type, waiting for the outermost
+    /// `unify` to finish so that no check runs in the middle of one.
+    pending_dispatch: Vec<(MethodConstraint, Type)>,
+    /// Two same-named constraints met on one variable: their shapes must agree.
+    pending_pairs: Vec<(Type, Type)>,
+    /// How deep `unify` is, and whether the queues above are being drained.
+    unify_depth: u32,
+    draining: bool,
     /// How deep synthesis is inside an UNANNOTATED lambda body.
     ///
     /// Such a body is checked before any call site is seen, so its parameters are still
@@ -184,6 +198,15 @@ pub struct TypeChecker {
     /// reject a tag outside a closed union, check a `match` for exhaustiveness, or
     /// give `x.field` a real type. Annotations reaching the AST are what fill it.
     env: Vec<Vec<(String, Type, Vec<u32>)>>,
+}
+
+/// One use of a method on a value whose type was not known yet: `method`, called with
+/// the shape `receiver -> arg1 -> ... -> result` (`arity` counts the receiver).
+#[derive(Clone, Debug)]
+struct MethodConstraint {
+    method: &'static str,
+    shape: Type,
+    arity: usize,
 }
 
 impl TypeChecker {
@@ -447,6 +470,11 @@ impl TypeChecker {
             numeral_vars: std::collections::HashSet::new(),
             generalized_numerals: std::collections::HashSet::new(),
             numeral_copies: std::collections::HashMap::new(),
+            method_constraints: std::collections::HashMap::new(),
+            pending_dispatch: Vec::new(),
+            pending_pairs: Vec::new(),
+            unify_depth: 0,
+            draining: false,
             committed_vars: std::collections::HashSet::new(),
             nominal_literals: std::collections::HashMap::new(),
             suffixed: std::collections::HashMap::new(),
@@ -580,6 +608,14 @@ impl TypeChecker {
         }
         let instance = Self::substitute_vars(ty, &mapping);
         self.note_rows(&instance);
+        // Each copy of a constrained variable is constrained alike, over copies.
+        for (id, fresh) in &mapping {
+            let (Some(constraints), Type::TypeVar(fv)) = (self.method_constraints.get(id).cloned(), fresh) else { continue };
+            for constraint in constraints {
+                let shape = Self::substitute_vars(&self.apply(&constraint.shape), &mapping);
+                self.add_constraint(*fv, MethodConstraint { shape, ..constraint });
+            }
+        }
         instance
     }
 
@@ -2560,9 +2596,13 @@ impl TypeChecker {
                     // link, `total([1, 2, 3])` could never tell its literals that
                     // `$sum` is an I64. A range satisfies `List` in `unify`, so this
                     // does not shut one out.
-                    Type::TypeVar(_) => {
+                    // Not known yet: `for x in xs` is `xs.iter()`, a constraint on `xs`
+                    // like any method call, and the loop binds the iterator's element.
+                    Type::TypeVar(v) => {
                         let element = self.fresh_var();
-                        self.unify(&iterable_type, &Type::List(Box::new(element.clone())))?;
+                        let shape = Type::Function(Box::new(Type::TypeVar(v)), Box::new(Type::iter(element.clone())));
+                        self.add_constraint(v, MethodConstraint { method: "iter", shape, arity: 1 });
+                        self.drain_dispatch()?;
                         element
                     }
                     _ => {
@@ -2679,6 +2719,26 @@ impl TypeChecker {
                         self.synth(arg)?;
                     }
                     return Ok(self.fresh_var());
+                }
+                // A receiver whose type is not known yet: the call is a constraint on
+                // it, checked where the variable is resolved. A lambda argument's
+                // parameters stay open until then, and learn their types from the
+                // method the receiver turns out to have.
+                if let (Type::TypeVar(v), false) = (&resolved, numeral) {
+                    let v = *v;
+                    let mut arg_types = Vec::with_capacity(args.len());
+                    for arg in args {
+                        arg_types.push(self.synth(arg)?);
+                    }
+                    let result = self.fresh_var();
+                    let shape = arg_types
+                        .iter()
+                        .rev()
+                        .fold(result.clone(), |acc, arg| Type::Function(Box::new(arg.clone()), Box::new(acc)));
+                    let shape = Type::Function(Box::new(resolved.clone()), Box::new(shape));
+                    self.add_constraint(v, MethodConstraint { method, shape, arity: args.len() + 1 });
+                    self.drain_dispatch()?;
+                    return Ok(result);
                 }
 
                 // A TAG UNION has no method block of its own, so only the handful this
@@ -3509,6 +3569,7 @@ impl TypeChecker {
 
                         let mut generics = Vec::new();
                         Self::type_vars_in(&inferred, &mut generics);
+                        self.add_constraint_vars(&mut generics);
                         // A numeral's type must not be quantified — `birds = 3` has
                         // ONE type, and `I64.to_str(birds)` is what fixes it.
                         // Generalising would give every use a fresh copy, so nothing
@@ -4067,6 +4128,146 @@ impl TypeChecker {
     }
 
     pub fn unify(&mut self, t1: &Type, t2: &Type) -> Result<(), TypeError> {
+        self.unify_depth += 1;
+        let result = self.unify_types(t1, t2);
+        self.unify_depth -= 1;
+        if self.unify_depth > 0 || self.draining {
+            return result;
+        }
+        match result {
+            Ok(()) => self.drain_dispatch(),
+            Err(e) => {
+                self.pending_dispatch.clear();
+                self.pending_pairs.clear();
+                Err(e)
+            }
+        }
+    }
+
+    /// Check what unification queued: each constraint whose variable met a concrete
+    /// type, against the method that type declares. A check may queue more.
+    fn drain_dispatch(&mut self) -> Result<(), TypeError> {
+        self.draining = true;
+        let mut result = Ok(());
+        while result.is_ok() {
+            if let Some((a, b)) = self.pending_pairs.pop() {
+                result = self.unify(&a, &b);
+            } else if let Some((constraint, ty)) = self.pending_dispatch.pop() {
+                result = self.resolve_dispatch(constraint, &ty);
+            } else {
+                break;
+            }
+        }
+        if result.is_err() {
+            self.pending_dispatch.clear();
+            self.pending_pairs.clear();
+        }
+        self.draining = false;
+        result
+    }
+
+    /// The variables a constraint on one of `vars` mentions, added to `vars`: a
+    /// generic function's lambda parameter may appear nowhere in its type but in a
+    /// constraint (`double_all = |it| it.map(|x| x * 2)` is `a -> b` with `x` inside
+    /// `a.map`'s shape), and each use needs its own copy of it.
+    fn add_constraint_vars(&self, vars: &mut Vec<u32>) {
+        let mut i = 0;
+        while i < vars.len() {
+            if let Some(constraints) = self.method_constraints.get(&vars[i]) {
+                for constraint in constraints {
+                    let mut found = Vec::new();
+                    Self::type_vars_in(&self.apply(&constraint.shape), &mut found);
+                    for v in found {
+                        if !vars.contains(&v) {
+                            vars.push(v);
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// Promise that variable `v`'s type has `method` of this shape. The same method
+    /// asked twice of one variable is one method: the two shapes agree.
+    fn add_constraint(&mut self, v: u32, constraint: MethodConstraint) {
+        let list = self.method_constraints.entry(v).or_default();
+        if let Some(existing) = list.iter().find(|c| c.method == constraint.method && c.arity == constraint.arity) {
+            self.pending_pairs.push((existing.shape.clone(), constraint.shape));
+        } else {
+            list.push(constraint);
+        }
+    }
+
+    /// `v` is being bound to `t`: its constraints go with it, to another variable or
+    /// to be checked against the concrete type.
+    fn move_constraints(&mut self, v: u32, t: &Type) {
+        let Some(constraints) = self.method_constraints.remove(&v) else { return };
+        for constraint in constraints {
+            match t {
+                Type::TypeVar(w) => self.add_constraint(*w, constraint),
+                _ => self.pending_dispatch.push((constraint, t.clone())),
+            }
+        }
+    }
+
+    /// A constraint meets the type its variable turned out to be: check it against
+    /// the method that type declares, which is what types the call's arguments and
+    /// result. With no declaration to go by, the call is answered as it would be had
+    /// the receiver's type been known where it was written.
+    fn resolve_dispatch(&mut self, constraint: MethodConstraint, ty: &Type) -> Result<(), TypeError> {
+        let ty = self.apply(ty);
+        let MethodConstraint { method, shape, arity } = constraint.clone();
+        match &ty {
+            Type::TypeVar(w) => {
+                self.add_constraint(*w, constraint);
+                return Ok(());
+            }
+            // roc derives only a few methods for these (`is_eq`, hashing, codecs, a
+            // tag union's `map`); what is left unchecked here is only those.
+            Type::Record { .. } | Type::TagUnion { .. } | Type::Tuple(_) | Type::Function(..) | Type::Unit => {
+                return Ok(());
+            }
+            _ => {}
+        }
+        let Some((shape_params, shape_result)) = Self::peel_params(&shape, arity) else { return Ok(()) };
+        let Some(module) = self.module_named(&ty) else { return Ok(()) };
+        if let Some(signature) = self.declared(module, method) {
+            if let Some((params, result)) = Self::peel_params(&signature, arity) {
+                match &ty {
+                    // A range answers the List methods as the list of its element.
+                    Type::Range(elem) => {
+                        let _ = self.unify(&params[0], &Type::List(elem.clone()));
+                    }
+                    _ => self.unify(&params[0], &ty)?,
+                }
+                for (declared, used) in params.iter().zip(shape_params.iter()).skip(1) {
+                    self.unify(declared, used)?;
+                }
+                return self.unify(&result, &shape_result);
+            }
+        }
+        if self.builtin_iter_element(&ty).is_some()
+            || (matches!(module, "List" | "Str" | "Dict" | "Set") || crate::eval::is_numeric_module(module))
+                && !crate::builtin::declared_names().contains(method)
+        {
+            return Err(TypeError {
+                message: format!(
+                    "This `{}` method is being called on a value whose type does not have it",
+                    method
+                ),
+                expected: format!("a type with a `{}` method", method),
+                actual: ty.to_string(),
+                line: 0,
+                col: 0,
+            });
+        }
+        let answered = self.builtin_result(method, Some(&ty), &shape_params[1..]);
+        let _ = self.unify(&answered, &shape_result);
+        Ok(())
+    }
+
+    fn unify_types(&mut self, t1: &Type, t2: &Type) -> Result<(), TypeError> {
         let t1 = self.apply(t1);
         let t2 = self.apply(t2);
 
@@ -4110,6 +4311,7 @@ impl TypeChecker {
                 if self.nominal_params.values().any(|params| params.contains(v)) {
                     if let Type::TypeVar(w) = t {
                         if !self.nominal_params.values().any(|params| params.contains(w)) {
+                            self.move_constraints(*w, &Type::TypeVar(*v));
                             self.subst.insert(*w, Type::TypeVar(*v));
                         }
                     }
@@ -4214,6 +4416,7 @@ impl TypeChecker {
                         col: 0,
                     })
                 } else {
+                    self.move_constraints(*v, t);
                     self.subst.insert(*v, t.clone());
                     Ok(())
                 }
