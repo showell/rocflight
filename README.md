@@ -54,7 +54,7 @@ If you find this project useful, the people to thank are theirs, not ours.
 
 > Roc is still pre-1.0. Its own README opens with *"Work in progress! Roc is not ready
 > for a 0.1 release yet."* This interpreter chases a moving target on purpose, and is
-> pinned to `nightly-2026-09-03-62fcb65`.
+> pinned to `nightly-2026-09-27-a3ce7f1`.
 
 ---
 
