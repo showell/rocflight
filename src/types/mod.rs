@@ -7,6 +7,7 @@ use std::fmt;
 use std::collections::HashMap;
 
 pub mod checker;
+pub mod order;
 
 pub use checker::TypeChecker;
 

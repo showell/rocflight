@@ -274,13 +274,13 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         type_checker.declare_signatures(loaded.signatures.iter().cloned());
         type_checker.declare_nominal_literals(&loaded.nominal_literals);
         for module in &loaded.modules {
-            type_checker.predeclare(&module.ast);
+            type_checker.predeclare(&module.ast)?;
             type_checker.synth(&module.ast)?;
         }
     }
     for (module_ast, type_name, exposed) in &module_asts {
         // Checked first so the app sees the module's names with their real types.
-        type_checker.predeclare(module_ast);
+        type_checker.predeclare(module_ast)?;
         type_checker.synth(module_ast)?;
         // `import Foo exposing [bar]` — the bare name is `Foo.bar`, as the compiler
         // already treats it.
@@ -303,7 +303,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     if let Some(problem) = type_checker.declaration_problems() {
         return Err(format!("Type error: {}", problem).into());
     }
-    type_checker.predeclare(&ast);
+    type_checker.predeclare(&ast)?;
     let inferred = type_checker.synth(&ast)?;
     // A literal that does not fit the type it was given: refused, as roc refuses it.
     if let Some(problem) = type_checker.method_problems() {
@@ -318,7 +318,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     // The platform's entry references the app's `main!`, so it comes after the app.
     for loaded in &platform_loaded {
         if let Some((module, _)) = &loaded.entry {
-            type_checker.predeclare(&module.ast);
+            type_checker.predeclare(&module.ast)?;
             type_checker.synth(&module.ast)?;
         }
     }
