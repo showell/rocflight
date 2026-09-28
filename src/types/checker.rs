@@ -3722,8 +3722,11 @@ impl TypeChecker {
                         // site, so `add_one = |x| x + 1` is a `Dec` where nothing
                         // constrains it and a `U8` where an annotation does, in the
                         // same block. Its copies stay numerals (see `instantiate`).
+                        // Nor is an open union's row: roc gives a value ONE row that
+                        // every use shares (`design.md`, "Polarity"), and quantifying it
+                        // made every `r = parse(s)` walk the whole environment below.
                         if !matches!(value, Expr::Lambda { .. }) {
-                            generics.retain(|v| !self.numeral_vars.contains(v));
+                            generics.retain(|v| !self.numeral_vars.contains(v) && !self.row_vars.contains(v));
                         }
                         // A body that asks a parameter whether an operation OVERFLOWS
                         // is asking about a WIDTH: `a.plus_overflows(b)` is a different
