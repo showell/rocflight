@@ -1918,7 +1918,8 @@ impl<'u> Compiler<'u> {
             ("keep_if", 1) if names_list => Shape::Filter(true),
             ("drop_if", 1) if names_list => Shape::Filter(false),
             ("fold", 2) => Shape::Fold,
-            ("map", 1) => Shape::Map,
+            // `Iter.map` is lazy: only `List.map` builds its list here.
+            ("map", 1) if module == "List" => Shape::Map,
             // `keep` vs `drop`, and `any` vs `all`, differ only in which answer from the
             // predicate is the interesting one.
             //
@@ -1933,19 +1934,13 @@ impl<'u> Compiler<'u> {
             _ => return Ok(None),
         };
         // Every shape above but `Filter` answers a plain VALUE — a list of results, an
-        // accumulator, a `Bool`, a count, a `Try`. That is what makes them safe to compile
-        // whatever the checker thinks the receiver's module is. `Filter` is safe because
-        // the call named `List`.
+        // accumulator, a `Bool`, a count, a `Try` — the same for a list and an iterator,
+        // except `map`, which is a list's only. `Filter` is safe because the call named
+        // `List`.
         //
-        // `keep_if`/`drop_if` in METHOD syntax are not here, and were tried: `Builtin.roc`
-        // declares both `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, the
-        // second lazy, so a compiled loop may only stand in for the List one.
-        // `dispatch_modules` cannot say which — the checker calls `(1..=5).iter()` a
-        // `List`, so lowering on that made
-        // `Str.inspect((1..=5).iter().keep_if(p))` answer `[4.0, 5.0]` where roc answers
-        // `<opaque>`. Left to `dispatch_builtin`, the receiver decides: `.iter()` gives
-        // a `Value::Iter`, whose `keep_if` is lazy.
-        let _ = module;
+        // `keep_if`/`drop_if` in METHOD syntax are left to `dispatch_builtin`, where the
+        // receiver decides: `.iter()` gives a `Value::Iter`, whose `keep_if` is lazy, and
+        // a list's is eager.
 
         // The accumulator, the list being built, or the answer. Allocated first, so it
         // sits below everything the loop uses and survives the temporaries being freed.

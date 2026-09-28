@@ -437,8 +437,9 @@ fn reachable(source: &str, selected: &[&str]) -> String {
 ///
 /// All ten parsing members are verified to seed cleanly, with the golden pairs and the
 /// examples green on any combination of them, so widening this is one edit whenever the
-/// long tail beyond these four is worth its parse.
-const TYPED_MEMBERS: &[&str] = &["Dict", "Set", "Str", "List", "Try"];
+/// long tail beyond these is worth its parse. `Iter` is here because an iterator is
+/// its own type: its methods are its block's, not `List`'s.
+const TYPED_MEMBERS: &[&str] = &["Dict", "Set", "Str", "List", "Iter", "Try"];
 
 /// The member a module's signatures are declared in: its own, but for `Try`, whose
 /// method block is inside `Box`'s.

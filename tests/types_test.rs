@@ -1036,3 +1036,127 @@ main! = |_args| {
 "#;
     assert_eq!(run_program(src), Ok(()));
 }
+
+// --- an iterator is its own type -------------------------------------------
+
+#[test]
+fn an_iterator_is_not_a_list() {
+    // `Builtin.roc` declares `List.iter : List(item) -> Iter(item)`. An `Iter` has the
+    // `Iter` block's methods, a lazy `map` among them, and is not a `List`. roc rejects
+    // each of these.
+    assert!(!accepts("xs : List(I64)\nxs = [1, 2].iter()\nxs"));
+    assert!(!accepts("xs : Iter(Str)\nxs = [1.I64].iter()\nxs"));
+    assert!(!accepts("f : Iter(I64) -> U64\nf = |xs| xs.len()\nf([1].iter())"));
+    // No literal is an iterator, and `Iter.len` is missing however it is spelled.
+    let count = "f : Iter(I64) -> U64\nf = |it| it.fold(0, |a, _| a + 1)\n";
+    assert!(!accepts(&format!("{}f([1, 2])", count)));
+    assert!(!accepts(&format!("{}f(Ok(3))", count)));
+    assert!(!accepts("Iter.len([1.I64].iter())"));
+    // And accepts these, printing what is asserted here: an `Iter` method's argument
+    // is typed by the `Iter` signature (`prepended`'s `1` is an `I64`, not a `Dec`),
+    // and an iterator's `map` stays lazy.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+main! = |_args| {
+    check(Str.inspect(Iter.fold([2.I64, 3].iter().prepended(1), [], |acc, x| acc.append(x))), "[1, 2, 3]")
+    check(Str.inspect([1.I64, 2].iter().map(|x| x + 1)), "<opaque>")
+    check(Str.inspect(List.from_iter([1.I64, 2].iter().map(|x| x + 1))), "[2, 3]")
+    check(Str.inspect(List.from_iter([1, 2].iter().map(|x| x * 2))), "[2.0, 4.0]")
+    check(Str.inspect(Iter.fold([1, 2].iter(), 0, |acc, x| acc + x)), "3.0")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
+
+// --- static dispatch ---------------------------------------------------------
+
+#[test]
+fn a_method_on_a_type_variable_is_checked_where_the_variable_is_resolved() {
+    // `it.map(f)` on a parameter of unknown type is a constraint on that type,
+    // checked at each call against the method the argument's type declares — as roc
+    // does it. So one generic function serves a list and an iterator, its lambda
+    // learns its element type from the call (`x * 2` over `I64`s is `I64`), and a
+    // `for` over an unknown type is a call to its `iter`. roc prints each as asserted.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+double_all = |it| it.map(|x| x * 2)
+keep_big = |xs| xs.keep_if(|n| n > 1)
+total = |xs| {
+    var $s = 0.I64
+    for x in xs {
+        $s = $s + x
+    }
+    $s
+}
+
+main! = |_args| {
+    check(Str.inspect(double_all([1.I64, 2])), "[2, 4]")
+    check(Str.inspect(List.from_iter(double_all([1.I64, 2].iter()))), "[2, 4]")
+    check(Str.inspect(double_all([1, 2])), "[2.0, 4.0]")
+    check(Str.inspect(keep_big([1.I64, 2, 3])), "[2, 3]")
+    check(Str.inspect(keep_big([1.I64, 2, 3].iter())), "<opaque>")
+    check(Str.inspect(total([1.I64, 2])), "3")
+    check(Str.inspect(total([1.I64, 2].iter())), "3")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
+
+#[test]
+fn a_generic_functions_constraints_stay_its_own() {
+    // A generic function's constraints belong to it: an unrelated call with variables
+    // numbered alike does not take them on (`List.len(["a"])` beside an unused
+    // `doubled`), a bare number is a receiver like any other (`f(5)` is a `Str`), and a
+    // `let` inside a generic body stays tied to it. roc prints each as asserted.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+doubled = |xs| xs.map(|x| x * 2)
+f = |v| v.to_str()
+via_let = |xs| {
+    ys = xs.map(|x| x * 2)
+    ys.map(|y| y + 1)
+}
+
+main! = |_args| {
+    check(Str.inspect(List.len(["a"])), "1")
+    check(f(5).concat("x"), "5.0x")
+    check(Str.inspect(via_let([1.I64, 2])), "[3, 5]")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+    assert!(accepts("doubled = |xs| xs.map(|x| x * 2)\nList.len([\"a\"])"));
+    assert!(accepts("f = |v| v.to_str()\nf(5).concat(\"x\")"));
+}
+
+#[test]
+fn a_deferred_method_check_is_the_check_a_known_receiver_gets() {
+    // Checked late, a call still types its numerals by the receiver's width
+    // (`inc_m(5.U8)` is a `U8`), and a method the receiver's type lacks is still
+    // refused however the unification that found it was used. roc prints and refuses
+    // each as asserted.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+inc_m = |v| v.plus(1)
+bump = |xs| xs.map(|x| x.plus(1))
+
+main! = |_args| {
+    check(Str.inspect(inc_m(5.U8)), "6")
+    check(Str.inspect(bump([5.U8])), "[6]")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+    assert!(type_error("f = |x| {\n    _a = x.frob()\n    U8.to_str(x)\n}\nList.len([\"a\"])").contains("frob"));
+    assert!(!accepts("f = |x| {\n    _a = x.frob()\n    _b = x.blarg()\n    U8.to_str(x)\n}\nList.len([\"a\"])"));
+}
