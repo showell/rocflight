@@ -27,7 +27,7 @@ Two corollaries that have caused more bugs here than anything else:
   construct. There is no second engine to take over, because a program that silently
   runs through a different path is a program whose parity you no longer know.
 
-The pinned compiler is `nightly-2026-09-03-62fcb65`, checked out at `roc-compiler/`
+The pinned compiler is `nightly-2026-09-27-a3ce7f1`, checked out at `roc-compiler/`
 (untracked — a working copy of roc's own repo, not part of this one).
 
 ---
@@ -496,6 +496,7 @@ read for the names they promise, which the checker then permits on an unresolved
 
 ```bash
 cp roc-compiler/src/build/roc/Builtin.roc src/roc/Builtin.roc
+rm src/roc/Builtin.artifact              # a stale one fails the build, gen-artifact's included
 cargo run --release --bin gen-artifact   # rebuild the parsed+compiled blob
 tests/check_builtin.sh --strict
 tests/check_artifact.sh
@@ -503,7 +504,7 @@ tests/check_artifact.sh
 
 `build.rs` records an FNV-1a hash of the source in the artifact and **fails the build** if
 they drift, with the regeneration command in the message. It also computes the member
-byte-offset index so finding a member is a table lookup rather than a scan of 23,555
+byte-offset index so finding a member is a table lookup rather than a scan of 24,743
 lines; a skewed offset shows up as a member failing to parse, which is what
 `check_builtin.sh --strict` catches. A *missing* artifact is not an error: `build.rs`
 leaves an empty one and `load` falls back to parsing, correct and slow.
