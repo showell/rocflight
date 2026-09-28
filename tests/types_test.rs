@@ -1235,7 +1235,8 @@ fn a_numeric_function_is_checked_against_its_builtin_signature() {
     // `U16.from_le_bytes : List(U8), U64 -> Try(U16, …)`, from `Num` in `Builtin.roc`.
     // Typed by its name alone it took anything, and a `Str` reached the run time.
     assert!(type_error("U16.from_le_bytes(\"ab\", 0)").contains("List(U8)"));
-    assert_eq!(type_of("U8.range_len_if_known(1, 5, 1, Exclusive)"), "[Known(U64), Unknown]");
+    // Its result's union is in an output position, so it is open to the caller.
+    assert_eq!(type_of("U8.range_len_if_known(1, 5, 1, Exclusive)"), "[Known(U64), Unknown, ..]");
 }
 
 #[test]
@@ -1243,4 +1244,40 @@ fn negating_a_numeral_leaves_it_for_its_use_to_pin() {
     // `-n` is `n.negate()`. `Dec`'s signature, which an unpinned numeral answers to
     // only by default, must not make `n` a `Dec` before `I64.to_str` sees it.
     assert_eq!(defaulted_type_of("n = 5\nm = -n\nI64.to_str(m)\nn"), "I64");
+}
+
+#[test]
+fn a_tag_union_a_function_returns_is_open_to_its_callers() {
+    // roc: a tag union written without `..` in an output position is open, so `?` can
+    // carry `parse`'s `[Bad]` into `both`'s `[Bad, Empty]`. roc prints `Ok(1)` then
+    // `Err(Bad)`.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+parse : Str -> Try(U8, [Bad])
+parse = |s| if s == "" { Err(Bad) } else { Ok(1) }
+
+both : Str -> Try(U8, [Bad, Empty])
+both = |s| {
+    n = parse(s)?
+    if n == 0 { Err(Empty) } else { Ok(n) }
+}
+
+main! = |_args| {
+    check(Str.inspect(both("x")), "Ok(1)")
+    check(Str.inspect(both("")), "Err(Bad)")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
+
+#[test]
+fn a_function_still_cannot_return_a_tag_its_annotation_leaves_out() {
+    // Open to callers, but the body is checked against the union as written: roc
+    // reports "This definition can produce the tag Other but the annotated tag union
+    // does not list it."
+    let src = "parse : Str -> Try(U8, [Bad])\nparse = |s| if s == \"\" { Err(Other) } else { Ok(1) }\nparse(\"\")";
+    assert!(type_error(src).contains("Other"));
 }
