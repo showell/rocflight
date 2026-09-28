@@ -2,7 +2,7 @@
 # Parse gate for the vendored builtin module.
 #
 # `src/roc/Builtin.roc` is a VERBATIM copy of the roc compiler's own
-# `src/build/roc/Builtin.roc` — the 23,555 lines of Roc that define Str, List, Dict,
+# `src/build/roc/Builtin.roc` — the 24,743 lines of Roc that define Str, List, Dict,
 # Set, Num, Iter and the Json encoding. rocflight loads it and binds the
 # annotation-only members to Rust, the way `canonicalize/BuiltinLowLevel.zig` binds
 # them to low-level ops. That only works if rocflight can parse the file.
@@ -11,7 +11,8 @@
 # one place — the same code the loader will use. This script is the gate around it.
 #
 # Re-sync when the pinned nightly moves:
-#     cp roc-compiler/src/build/roc/Builtin.roc src/roc/Builtin.roc && tests/check_builtin.sh
+#     cp roc-compiler/src/build/roc/Builtin.roc src/roc/Builtin.roc && rm src/roc/Builtin.artifact \
+#       && cargo run --release --bin gen-artifact && tests/check_builtin.sh
 #
 # `--builtins` is a development flag, so this needs the DEBUG binary: `cargo build`.
 #
