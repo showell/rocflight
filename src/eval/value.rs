@@ -231,19 +231,17 @@ impl fmt::Display for Value {
             Value::Int(n) => write!(f, "{}", n),
             Value::U128(n) => write!(f, "{}", n),
             Value::Simd { kind, bits } => write!(f, "{}", crate::eval::simd_inspect(*kind, *bits)),
-            Value::Float(n) => {
-                // roc prints a whole float WITHOUT a trailing `.0` — `1500.0` shows as
-                // `1500` and `0.0` as `0`. Rust's own `{}` already does that.
-                //
-                // (An unconstrained integer literal still differs: roc defaults it to a
-                // fractional type and shows `42.0`, while this interpreter keeps it an
-                // integer. That is the documented numeric-default divergence, not this.)
-                // roc spells it `nan`; Rust would say `NaN`.
-                if n.is_nan() { write!(f, "nan") } else { write!(f, "{}", n) }
-            }
+            // roc prints a whole float WITHOUT a trailing `.0` — `1500.0` shows as
+            // `1500` and `0.0` as `0` — and switches to exponent form far from 1; see
+            // `float_text`.
+            //
+            // (An unconstrained integer literal still differs: roc defaults it to a
+            // fractional type and shows `42.0`, while this interpreter keeps it an
+            // integer. That is the documented numeric-default divergence, not this.)
+            Value::Float(n) => float_text(f, *n),
             // The shortest digits that read back as the same f32, which is what roc
             // prints for an `F32`: `0.1.F32` is `0.1`, not its f64 expansion.
-            Value::F32(n) => if n.is_nan() { write!(f, "nan") } else { write!(f, "{}", n) },
+            Value::F32(n) => float_text(f, *n),
             Value::Dec(n) => write!(f, "{}", crate::eval::dec_to_string(*n)),
             Value::Builtin(name, arity) => write!(f, "<builtin {}/{}>", name, arity),
             Value::Closure(c) => write!(f, "<lambda |{}|>", c.params.join(", ")),
@@ -301,5 +299,56 @@ mod tests {
             48,
             "Value grew — box the new variant's payload instead"
         );
+    }
+}
+
+/// A float as roc writes it (`formatFloatDecimal`, compiler_rt_128.zig): the shortest
+/// digits that read back as the same value of ITS width, then exponent form (`1e-5`,
+/// `1.2345678901234568e16`) when the decimal point is more than 16 places right of the
+/// first digit or 4 or more places left of it, and plain decimal (`0.0001`,
+/// `9999999999999998`) otherwise. Those are Python's `repr` thresholds.
+///
+/// Rust's `{:e}` and `{}` already give the same shortest digits in exactly those two
+/// layouts, so only the choice between them is roc's. `nan` is roc's spelling.
+fn float_text<T: std::fmt::Display + std::fmt::LowerExp + Copy>(f: &mut fmt::Formatter<'_>, n: T) -> fmt::Result
+where
+    f64: From<T>,
+{
+    let x = f64::from(n);
+    if x.is_nan() {
+        return write!(f, "nan");
+    }
+    // Well inside both thresholds the answer is plain decimal whatever the digits, so
+    // the common case formats once. Only near or past them does the layout depend on
+    // where the shortest digits put the point.
+    if x == 0.0 || x.is_infinite() || (1e-3..1e15).contains(&x.abs()) {
+        return write!(f, "{}", n);
+    }
+    // On the stack: the longest `{:e}` of an f64 is 24 bytes (`-2.2250738585072014e-308`).
+    let mut buffer = StackText { bytes: [0; 32], len: 0 };
+    fmt::Write::write_fmt(&mut buffer, format_args!("{:e}", n))?;
+    let scientific = std::str::from_utf8(&buffer.bytes[..buffer.len]).map_err(|_| fmt::Error)?;
+    // `d.ddde<exp>`: the first digit sits at 10^exp, so the point is exp + 1 digits in.
+    let exponent: i32 = scientific.rsplit('e').next().and_then(|e| e.parse().ok()).unwrap_or(0);
+    let point = exponent + 1;
+    if point > 16 || point <= -4 {
+        f.write_str(scientific)
+    } else {
+        write!(f, "{}", n)
+    }
+}
+
+/// A fixed buffer to format into without allocating; see `float_text`.
+struct StackText {
+    bytes: [u8; 32],
+    len: usize,
+}
+
+impl fmt::Write for StackText {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
     }
 }
