@@ -690,7 +690,7 @@ impl FnState {
         // they reason about the whole chunk's control flow — and `fuse` runs first so
         // that `liveness` sees the opcodes that will actually run.
         super::peephole::fuse(&mut self.code);
-        super::liveness::mark_takes(&mut self.code, self.max_reg);
+        let drops = super::liveness::mark_takes(&mut self.code, self.max_reg, &self.names);
         Chunk {
             code: self.code,
             spans: self.spans,
@@ -698,6 +698,7 @@ impl FnState {
             n_regs: self.max_reg,
             arity,
             names: self.names,
+            drops,
             pats: self.pats,
             bare: Rc::new(super::Closure {
                 chunk,
@@ -805,6 +806,9 @@ fn branches(op: &Op) -> bool {
             | Op::TestList { .. }
             | Op::TestBool { .. }
             | Op::GetFieldOr { .. }
+            | Op::TestTagDrop { .. }
+            | Op::JumpFalseDrop { .. }
+            | Op::TakeFieldOr { .. }
             | Op::IterNext { .. }
             | Op::NoMatch { .. }
             | Op::Ret { .. }
