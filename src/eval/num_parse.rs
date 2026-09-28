@@ -754,8 +754,8 @@ mod tests {
     /// Review finding F2: long hex F64 literals round correctly here. roc 09-27 does
     /// not: its vendored `parse.zig` stops collecting digits once the mantissa passes
     /// 10^15, a decimal cutoff applied in base 16, and answers 1, 1.0000000000000002
-    /// and 2.098829547942064e19 for these three. The expected values are Python's
-    /// `float.fromhex`. When the roc issue is filed, it belongs here.
+    /// and 2.098829547942064e19 for these three: roc-lang/roc#11807. The expected
+    /// values are Python's `float.fromhex`.
     #[test]
     fn long_hex_f64_literals_round_correctly_where_roc_does_not() {
         let f64_whole = |t: &str| match parse_whole(Kind::F64, t.as_bytes()) {
