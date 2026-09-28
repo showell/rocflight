@@ -1106,3 +1106,27 @@ main! = |_args| {
     assert!(accepts("doubled = |xs| xs.map(|x| x * 2)\nList.len([\"a\"])"));
     assert!(accepts("f = |v| v.to_str()\nf(5).concat(\"x\")"));
 }
+
+#[test]
+fn a_deferred_method_check_is_the_check_a_known_receiver_gets() {
+    // Checked late, a call still types its numerals by the receiver's width
+    // (`inc_m(5.U8)` is a `U8`), and a method the receiver's type lacks is still
+    // refused however the unification that found it was used. roc prints and refuses
+    // each as asserted.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+inc_m = |v| v.plus(1)
+bump = |xs| xs.map(|x| x.plus(1))
+
+main! = |_args| {
+    check(Str.inspect(inc_m(5.U8)), "6")
+    check(Str.inspect(bump([5.U8])), "[6]")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+    assert!(type_error("f = |x| {\n    _a = x.frob()\n    U8.to_str(x)\n}\nList.len([\"a\"])").contains("frob"));
+    assert!(!accepts("f = |x| {\n    _a = x.frob()\n    _b = x.blarg()\n    U8.to_str(x)\n}\nList.len([\"a\"])"));
+}

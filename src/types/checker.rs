@@ -174,9 +174,13 @@ pub struct TypeChecker {
     pending_dispatch: Vec<(MethodConstraint, Type)>,
     /// Two same-named constraints met on one variable: their shapes must agree.
     pending_pairs: Vec<(Type, Type)>,
-    /// How deep `unify` is, and whether the queues above are being drained.
-    unify_depth: u32,
+    /// Whether the queues above are being drained.
     draining: bool,
+    /// Constraints that failed their check. Kept here rather than only returned,
+    /// because some unifications are tried and their answer set aside; the outermost
+    /// `synth` reports the first.
+    dispatch_errors: Vec<TypeError>,
+    synth_depth: u32,
     /// The variable copies the last `instantiate` made, for `instantiate_scheme`.
     last_mapping: Vec<(u32, Type)>,
     /// How deep synthesis is inside an UNANNOTATED lambda body.
@@ -483,8 +487,9 @@ impl TypeChecker {
             method_constraints: std::collections::HashMap::new(),
             pending_dispatch: Vec::new(),
             pending_pairs: Vec::new(),
-            unify_depth: 0,
             draining: false,
+            dispatch_errors: Vec::new(),
+            synth_depth: 0,
             last_mapping: Vec::new(),
             committed_vars: std::collections::HashSet::new(),
             nominal_literals: std::collections::HashMap::new(),
@@ -640,10 +645,10 @@ impl TypeChecker {
         if constraints.is_empty() {
             return instance;
         }
-        let mapping = std::mem::take(&mut self.last_mapping);
+        let mapping: std::collections::HashMap<u32, Type> = std::mem::take(&mut self.last_mapping).into_iter().collect();
         for (id, constraint) in constraints {
-            let Some((_, Type::TypeVar(fresh))) = mapping.iter().find(|(from, _)| from == id) else { continue };
-            let shape = Self::substitute_vars(&constraint.shape, &mapping);
+            let Some(Type::TypeVar(fresh)) = mapping.get(id) else { continue };
+            let shape = Self::substitute_vars_by(&constraint.shape, &|v| mapping.get(&v).cloned());
             self.add_constraint(*fresh, MethodConstraint { shape, ..constraint.clone() });
         }
         instance
@@ -651,22 +656,24 @@ impl TypeChecker {
 
     /// Structural substitution of type variables by id.
     fn substitute_vars(ty: &Type, mapping: &[(u32, Type)]) -> Type {
+        Self::substitute_vars_by(ty, &|id| mapping.iter().find(|(from, _)| *from == id).map(|(_, to)| to.clone()))
+    }
+
+    /// `substitute_vars`, looking each variable up however the caller keeps them: a
+    /// scheme's many constraints are copied through a map, not a list scan per variable.
+    fn substitute_vars_by(ty: &Type, mapping: &dyn Fn(u32) -> Option<Type>) -> Type {
         match ty {
-            Type::TypeVar(id) => mapping
-                .iter()
-                .find(|(from, _)| from == id)
-                .map(|(_, to)| to.clone())
-                .unwrap_or_else(|| ty.clone()),
+            Type::TypeVar(id) => mapping(*id).unwrap_or_else(|| ty.clone()),
             Type::List(inner) => {
-                Type::List(Box::new(Self::substitute_vars(inner, mapping)))
+                Type::List(Box::new(Self::substitute_vars_by(inner, mapping)))
             }
-            Type::Range(inner) => Type::Range(Box::new(Self::substitute_vars(inner, mapping))),
+            Type::Range(inner) => Type::Range(Box::new(Self::substitute_vars_by(inner, mapping))),
             Type::Function(param, result) => Type::Function(
-                Box::new(Self::substitute_vars(param, mapping)),
-                Box::new(Self::substitute_vars(result, mapping)),
+                Box::new(Self::substitute_vars_by(param, mapping)),
+                Box::new(Self::substitute_vars_by(result, mapping)),
             ),
             Type::Tuple(items) => Type::Tuple(
-                items.iter().map(|t| Self::substitute_vars(t, mapping)).collect(),
+                items.iter().map(|t| Self::substitute_vars_by(t, mapping)).collect(),
             ),
             // `open` is carried: closing it here made every instantiation of a
             // generalised `|c| c.help` demand a record with EXACTLY `help`, so
@@ -674,12 +681,12 @@ impl TypeChecker {
             Type::Record { fields, open } => Type::Record {
                 fields: fields
                     .iter()
-                    .map(|(n, t)| (*n, Self::substitute_vars(t, mapping)))
+                    .map(|(n, t)| (*n, Self::substitute_vars_by(t, mapping)))
                     .collect(),
                 open: *open,
             },
             Type::Optional(inner) => {
-                Type::Optional(Box::new(Self::substitute_vars(inner, mapping)))
+                Type::Optional(Box::new(Self::substitute_vars_by(inner, mapping)))
             }
             // The row is a variable like any other, so a generalised union's copies
             // grow apart.
@@ -689,20 +696,20 @@ impl TypeChecker {
                     .map(|(n, payload)| {
                         (
                             *n,
-                            payload.iter().map(|t| Self::substitute_vars(t, mapping)).collect(),
+                            payload.iter().map(|t| Self::substitute_vars_by(t, mapping)).collect(),
                         )
                     })
                     .collect(),
                 open: *open,
-                row: row.map(|r| match mapping.iter().find(|(from, _)| *from == r) {
-                    Some((_, Type::TypeVar(to))) => *to,
+                row: row.map(|r| match mapping(r) {
+                    Some(Type::TypeVar(to)) => to,
                     _ => r,
                 }),
             },
             Type::Nominal { name, backing, args } => Type::Nominal {
                 name: *name,
-                backing: Box::new(Self::substitute_vars(backing, mapping)),
-                args: args.iter().map(|t| Self::substitute_vars(t, mapping)).collect(),
+                backing: Box::new(Self::substitute_vars_by(backing, mapping)),
+                args: args.iter().map(|t| Self::substitute_vars_by(t, mapping)).collect(),
             },
             other => other.clone(),
         }
@@ -758,6 +765,7 @@ impl TypeChecker {
     /// Everything else falls back to synthesising and unifying, which is equivalent.
     pub fn check(&mut self, expr: &Expr, expected: &Type) -> Result<(), TypeError> {
         self.check_node(expr, expected)?;
+        self.settle_dispatch()?;
         if let Some(types) = self.recorded_types.as_mut() {
             types.push((expr.id(), expected.clone()));
         }
@@ -2283,7 +2291,16 @@ impl TypeChecker {
     }
 
     pub fn synth(&mut self, expr: &Expr) -> Result<Type, TypeError> {
-        let ty = self.synth_node(expr)?;
+        self.synth_depth += 1;
+        let result = self.synth_node(expr).and_then(|ty| self.settle_dispatch().map(|()| ty));
+        self.synth_depth -= 1;
+        // A constraint that failed its check is an error of the program's, whatever the
+        // unification that queued it made of the answer.
+        let failed = if self.synth_depth == 0 { self.dispatch_errors.drain(..).next() } else { None };
+        let ty = result?;
+        if let Some(error) = failed {
+            return Err(error);
+        }
         if let Some(types) = self.recorded_types.as_mut() {
             types.push((expr.id(), ty.clone()));
         }
@@ -2632,7 +2649,6 @@ impl TypeChecker {
                         let element = self.fresh_var();
                         let shape = Type::Function(Box::new(Type::TypeVar(v)), Box::new(Type::iter(element.clone())));
                         self.add_constraint(v, MethodConstraint { method: "iter", shape, arity: 1 });
-                        self.drain_dispatch()?;
                         element
                     }
                     _ => {
@@ -2767,7 +2783,6 @@ impl TypeChecker {
                         .fold(result.clone(), |acc, arg| Type::Function(Box::new(arg.clone()), Box::new(acc)));
                     let shape = Type::Function(Box::new(resolved.clone()), Box::new(shape));
                     self.add_constraint(v, MethodConstraint { method, shape, arity: args.len() + 1 });
-                    self.drain_dispatch()?;
                     return Ok(result);
                 }
 
@@ -4166,35 +4181,42 @@ impl TypeChecker {
         Ok(a)
     }
 
+    /// Constraints this queues are checked when the expression being checked is done
+    /// (`synth`, `check`), not here: a call's arguments are all unified before any of
+    /// the constraints its parameters carry is checked, so `add_m(5.U8, 1)` checks
+    /// `plus` with the `1` already in hand, as roc's queue does.
     pub fn unify(&mut self, t1: &Type, t2: &Type) -> Result<(), TypeError> {
-        self.unify_depth += 1;
-        let result = self.unify_types(t1, t2);
-        self.unify_depth -= 1;
-        if self.unify_depth > 0 || self.draining {
-            return result;
+        self.unify_types(t1, t2)
+    }
+
+    /// Check the queued constraints, unless this is already doing so.
+    fn settle_dispatch(&mut self) -> Result<(), TypeError> {
+        if self.draining || (self.pending_dispatch.is_empty() && self.pending_pairs.is_empty()) {
+            return Ok(());
         }
-        // What this unification queued is checked even if it failed partway: a caller
-        // may go on past the error, and the constraints have already left the table.
-        let drained = self.drain_dispatch();
-        result.and(drained)
+        self.drain_dispatch()
     }
 
     /// Check what unification queued: each constraint whose variable met a concrete
     /// type, against the method that type declares. A check may queue more.
     fn drain_dispatch(&mut self) -> Result<(), TypeError> {
         self.draining = true;
-        let mut result = Ok(());
-        while result.is_ok() {
-            if let Some((a, b)) = self.pending_pairs.pop() {
-                result = self.unify(&a, &b);
+        let mut first = None;
+        loop {
+            let result = if let Some((a, b)) = self.pending_pairs.pop() {
+                self.unify(&a, &b)
             } else if let Some((constraint, ty)) = self.pending_dispatch.pop() {
-                result = self.resolve_dispatch(constraint, &ty);
+                self.resolve_dispatch(constraint, &ty)
             } else {
                 break;
+            };
+            if let Err(error) = result {
+                self.dispatch_errors.push(error.clone());
+                first.get_or_insert(error);
             }
         }
         self.draining = false;
-        result
+        first.map_or(Ok(()), Err)
     }
 
     /// The variables a constraint on one of `vars` mentions, added to `vars`: a
@@ -4313,7 +4335,18 @@ impl TypeChecker {
                 col: 0,
             });
         }
-        let answered = self.builtin_result(method, Some(&ty), &shape_params[1..]);
+        // The numerals a call passes take the receiver's width, and a count is a `U64`,
+        // exactly as where the receiver was known when the call was written.
+        let args = &shape_params[1..];
+        if ty.is_integer() || ty.is_fractional() {
+            self.pin_numerals_to(&ty, args);
+        }
+        if matches!(method, "step_by" | "take_first" | "take_last" | "drop_first" | "drop_last") {
+            let element = self.element_of(Some(&ty));
+            let count = if method == "step_by" && self.apply(&element).is_fractional() { element } else { Type::U64 };
+            self.pin_numerals_to(&count, args);
+        }
+        let answered = self.builtin_result(method, Some(&ty), args);
         let _ = self.unify(&answered, &shape_result);
         Ok(())
     }
