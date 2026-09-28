@@ -176,9 +176,12 @@ fn coerce_value(value: Value, quote: &Value, numeral: &Value, interp: &Value) ->
             })?;
             unwrap_ok(call_function(numeral.clone(), vec![literal])?)
         }
-        Value::List(items)
-            if items.iter().any(|v| matches!(v, Value::Str(_) | Value::Int(_) | Value::Float(_) | Value::F32(_) | Value::Dec(_))) =>
-        {
+        // A Roc list is homogeneous, so its first element says whether any element is a
+        // literal a converter applies to. When none is, the list is handed back as it
+        // came: rebuilding it anyway copied the whole list at every coerced boundary,
+        // and a nominal over `List(U8)` that only declares `from_quote` paid that on
+        // every write (B-Teague/rocflight#6).
+        Value::List(items) if items.first().is_some_and(|first| converts(first, quote, numeral, interp)) => {
             let converted: Result<Vec<Value>, EvalError> = items
                 .iter()
                 .cloned()
@@ -191,6 +194,16 @@ fn coerce_value(value: Value, quote: &Value, numeral: &Value, interp: &Value) ->
             Ok(Value::tag("Ok", [inner]))
         }
         other => Ok(other),
+    }
+}
+
+/// Does `coerce_value` change this scalar? A string when a quote or interpolation
+/// converter exists, a number when `from_numeral` does; nothing else.
+fn converts(value: &Value, quote: &Value, numeral: &Value, interp: &Value) -> bool {
+    match value {
+        Value::Str(_) => callable(quote) || callable(interp),
+        Value::Int(_) | Value::Float(_) | Value::F32(_) | Value::Dec(_) => callable(numeral),
+        _ => false,
     }
 }
 
@@ -208,4 +221,24 @@ pub fn from_interpolation(args: &[Value]) -> Option<Value> {
         }
     }
     Some(str_value(text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B-Teague/rocflight#6. A `List(U8)` behind a nominal that declares only
+    /// `from_quote` has nothing a converter applies to, so the list must come back as
+    /// the SAME allocation: a copy here, on every coerced call boundary, made each
+    /// write through the nominal cost the whole list.
+    #[test]
+    fn a_list_nothing_converts_is_returned_as_is() {
+        let bytes = Value::list((0..1024).map(|b| Value::Int(b % 256)).collect());
+        let Value::List(before) = &bytes else { unreachable!() };
+        let before = std::rc::Rc::clone(before);
+        let from_quote = Value::Builtin("Str.to_utf8", 1);
+        let mut args = [bytes, from_quote, Value::Unit, Value::Unit];
+        let Value::List(after) = coerce(&mut args).unwrap() else { panic!("not a list") };
+        assert!(std::rc::Rc::ptr_eq(&before, &after), "the list was copied");
+    }
 }
