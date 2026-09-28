@@ -22,20 +22,28 @@
 //! and `kills` below match on every opcode by name with no wildcard arm: a new opcode
 //! does not compile until someone has said what it reads.
 
-use super::{Op, Reg};
+use super::{CondKind, Op, Reg};
 
 /// Rewrite the reads this analysis proves are final into taking forms.
 ///
 /// Only `Move` and `UpdateRecord` are rewritten. They are where the measurement said
 /// the copies are; every other read is left alone rather than widened on a guess.
-pub fn mark_takes(code: &mut [Op], n_regs: u16) {
+///
+/// Also answers the registers to clear on leaving a branch (`Chunk::drops`): one that
+/// only the OTHER edge still needs. Clearing a dead register is always sound, since
+/// nothing reads it before writing it; not clearing it kept a value shared that the
+/// taken branch wanted to change in place. `Set.insert`'s `Found(_) => set` arm keeps
+/// `set` live, and without this the `Missing` arm's insert copied the whole table.
+pub fn mark_takes(code: &mut [Op], n_regs: u16, names: &[&str]) -> Vec<(Vec<Reg>, Vec<Reg>)> {
+    let mut drops = Vec::new();
     // ponytail: skip the analysis for a chunk big enough that the bitsets would
     // matter. Nothing in `Builtin.roc` or any program in the test suite comes close;
     // if one ever does it loses the takes, not its correctness.
     if code.is_empty() || n_regs == 0 || code.len() > 4096 || n_regs > 1024 {
-        return;
+        return drops;
     }
     let live = solve(code, n_regs);
+    let targets = jump_targets(code);
     let words = words_for(n_regs);
     let mut buf = Vec::new();
     for ip in 0..code.len() {
@@ -43,6 +51,33 @@ pub fn mark_takes(code: &mut [Op], n_regs: u16) {
         match code[ip] {
             Op::Move { dst, src } if dst != src && !get(&out, src) => {
                 code[ip] = Op::MoveTake { dst, src };
+            }
+            // A field or payload read out of a value whose OTHER parts may still be
+            // wanted: the register stays live, so this is per component, not the
+            // register-level question above. See `component_dead_after`.
+            Op::GetField { dst, obj, name } if field_dead_after(code, ip, obj, names, name) => {
+                code[ip] = Op::TakeField { dst, obj, name };
+            }
+            Op::GetFieldOr { dst, obj, name, to } if field_dead_after(code, ip, obj, names, name) => {
+                code[ip] = Op::TakeFieldOr { dst, obj, name, to };
+            }
+            Op::GetPayload { dst, obj, i }
+                if component_dead_after(code, ip, obj, names, Component::Payload(i), proven_tag(code, &targets, ip, obj)) =>
+            {
+                code[ip] = Op::TakePayload { dst, obj, i };
+            }
+            Op::TestTag { obj, name, n, to } => {
+                if let Some(drop) = branch_drops(&live, words, n_regs, ip, to as usize, code.len(), &mut drops) {
+                    code[ip] = Op::TestTagDrop { obj, name, n, to, drop };
+                }
+            }
+            // Not a `while` condition, which runs every time round a loop, nor an
+            // `&&`/`||` operand: the branches of an `if` and a guard are what can hold
+            // a value only the other side wants.
+            Op::JumpFalse { cond, to, kind: kind @ (CondKind::If | CondKind::Guard) } => {
+                if let Some(drop) = branch_drops(&live, words, n_regs, ip, to as usize, code.len(), &mut drops) {
+                    code[ip] = Op::JumpFalseDrop { cond, to, kind, drop };
+                }
             }
             Op::UpdateRecord { dst, obj, name, base, n, take: false } => {
                 // The op reads `obj` twice if the record is also one of the field
@@ -57,6 +92,170 @@ pub fn mark_takes(code: &mut [Op], n_regs: u16) {
         }
         reads(&code[ip], &mut buf);
     }
+    drops
+}
+
+/// For the branch at `ip`: the registers live into one successor and dead into the
+/// other, as (falling through, jumping), appended to `drops`. The op's `drop` value is
+/// its index plus one; `None` when neither edge has any, or the table is full.
+fn branch_drops(live: &[u64], words: usize, n_regs: u16, ip: usize, to: usize, len: usize, drops: &mut Vec<(Vec<Reg>, Vec<Reg>)>) -> Option<u16> {
+    let fall = ip + 1;
+    if fall >= len || to >= len || to == fall {
+        return None;
+    }
+    let live_in = |at: usize| &live[at * words..(at + 1) * words];
+    let only = |mine: &[u64], other: &[u64]| -> Vec<Reg> {
+        (0..n_regs).filter(|r| get(other, *r) && !get(mine, *r)).collect()
+    };
+    let on_fall = only(live_in(fall), live_in(to));
+    let on_jump = only(live_in(to), live_in(fall));
+    if on_fall.is_empty() && on_jump.is_empty() {
+        return None;
+    }
+    let index = u16::try_from(drops.len() + 1).ok()?;
+    drops.push((on_fall, on_jump));
+    Some(index)
+}
+
+/// A part of a value that a take can move out on its own.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Component<'a> {
+    Field(&'a str),
+    Payload(u16),
+}
+
+fn field_dead_after(code: &[Op], ip: usize, obj: Reg, names: &[&str], name: u16) -> bool {
+    names
+        .get(name as usize)
+        .is_some_and(|field| component_dead_after(code, ip, obj, names, Component::Field(field), None))
+}
+
+/// The tag a `GetPayload` at `ip` is known to be reading: the `TestTag` on the same
+/// register that falls straight into it, possibly through the payload reads before it.
+/// Only claimed when no jump lands anywhere in between, so every way into `ip` passed
+/// that test.
+fn proven_tag(code: &[Op], targets: &[bool], ip: usize, obj: Reg) -> Option<u16> {
+    let mut at = ip;
+    loop {
+        at = at.checked_sub(1)?;
+        match code[at] {
+            Op::GetPayload { obj: o, dst, .. } | Op::TakePayload { obj: o, dst, .. } if o == obj && dst != obj => continue,
+            Op::TestTag { obj: o, name, .. } | Op::TestTagDrop { obj: o, name, .. } if o == obj => {
+                let entered = targets[at + 1..=ip].iter().any(|t| *t);
+                return (!entered).then_some(name);
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Which instructions some other instruction jumps to (rather than falls into).
+fn jump_targets(code: &[Op]) -> Vec<bool> {
+    let mut targets = vec![false; code.len()];
+    for (ip, op) in code.iter().enumerate() {
+        successors(op, ip, code.len(), |s| {
+            if s != ip + 1 {
+                targets[s] = true;
+            }
+        });
+    }
+    targets
+}
+
+/// Is `part` of the value in `obj` never read again after `ip`, on any path, before
+/// `obj` is overwritten? Then the read at `ip` may move it out (when the value is not
+/// shared at run time, which the machine checks).
+///
+/// A forward search rather than the backward bitset pass above, because the question
+/// is about part of a register while the rest of it stays live, and because one
+/// refinement needs the path: after `TestTag` proved the tag (`tag`), a later
+/// `TestTag` on the same register naming a DIFFERENT tag cannot succeed, so only its
+/// failure edge is followed. That is what lets `match` take a payload even though
+/// every arm's failure edge leads to the next arm's test of the same value.
+///
+/// Same soundness rule as the rest of this file: anything not recognised as reading
+/// another part of the value is a read of all of it. `TestTag` and `TestRecord` read
+/// only the shape, which a take leaves alone. `NoMatch` is let through too: it reads
+/// the value only to print it in the error it is about to raise, and it is reached
+/// after a payload take only when a later part of the same pattern fails, which a
+/// well-typed program cannot do.
+fn component_dead_after(code: &[Op], ip: usize, obj: Reg, names: &[&str], part: Component, tag: Option<u16>) -> bool {
+    // The instruction itself overwrites the register: nothing can read the rest.
+    if matches!(code[ip], Op::GetField { dst, .. } | Op::GetPayload { dst, .. } | Op::TakeField { dst, .. } | Op::TakePayload { dst, .. } if dst == obj) {
+        return true;
+    }
+    let name = |i: u16| names.get(i as usize).copied();
+    let mut seen = vec![false; code.len()];
+    let mut stack = Vec::new();
+    let mut buf = Vec::new();
+    let push_edges = |at: usize, stack: &mut Vec<usize>, buf: &mut Vec<Reg>| {
+        let op = &code[at];
+        kills(op, buf);
+        let killed = buf.contains(&obj);
+        let fall_kills = matches!(*op, Op::GetFieldOr { dst, .. } | Op::TakeFieldOr { dst, .. } if dst == obj);
+        let only_failure = match (*op, tag) {
+            (Op::TestTag { obj: o, name: m, .. } | Op::TestTagDrop { obj: o, name: m, .. }, Some(proven)) if o == obj => {
+                name(m) != name(proven)
+            }
+            _ => false,
+        };
+        let failure = match *op {
+            Op::GetFieldOr { to, .. } | Op::TakeFieldOr { to, .. } | Op::TestTag { to, .. } | Op::TestTagDrop { to, .. } => {
+                Some(to as usize)
+            }
+            _ => None,
+        };
+        successors(op, at, code.len(), |s| {
+            let is_failure = failure == Some(s) && s != at + 1;
+            if killed || (fall_kills && !is_failure) || (only_failure && !is_failure) {
+                return;
+            }
+            stack.push(s);
+        });
+    };
+    push_edges(ip, &mut stack, &mut buf);
+    let mut budget = 20_000usize;
+    while let Some(at) = stack.pop() {
+        if std::mem::replace(&mut seen[at], true) {
+            continue;
+        }
+        budget = match budget.checked_sub(1) {
+            Some(b) => b,
+            None => return false,
+        };
+        let conflict = match code[at] {
+            Op::GetField { obj: o, name: n, .. }
+            | Op::GetFieldOr { obj: o, name: n, .. }
+            | Op::TakeField { obj: o, name: n, .. }
+            | Op::TakeFieldOr { obj: o, name: n, .. }
+            | Op::GetOptField { obj: o, name: n, .. }
+                if o == obj =>
+            {
+                !matches!(part, Component::Field(f) if Some(f) != name(n))
+            }
+            Op::GetPayload { obj: o, i, .. } | Op::TakePayload { obj: o, i, .. } if o == obj => {
+                part == Component::Payload(i)
+            }
+            Op::GetRest { obj: o, name: n, n: count, .. } if o == obj => match part {
+                Component::Field(f) => !(n..n.saturating_add(count)).any(|k| name(k) == Some(f)),
+                Component::Payload(_) => true,
+            },
+            Op::TestTag { obj: o, .. } | Op::TestTagDrop { obj: o, .. } | Op::TestRecord { obj: o, .. } | Op::NoMatch { obj: o }
+                if o == obj =>
+            {
+                false
+            }
+            ref op => {
+                reads(op, &mut buf);
+                buf.contains(&obj)
+            }
+        };
+        if conflict {
+            return false;
+        }
+        push_edges(at, &mut stack, &mut buf);
+    }
+    true
 }
 
 fn words_for(n_regs: u16) -> usize {
@@ -95,6 +294,24 @@ fn solve(code: &[Op], n_regs: u16) -> Vec<u64> {
         let mut changed = false;
         for ip in (0..code.len()).rev() {
             scratch.copy_from_slice(&live_out(&live, code, words, ip));
+            // `GetFieldOr` writes `dst` on its fall-through edge only, so `dst` is dead
+            // coming in on that edge and alive on the jump only if the target reads it.
+            // `kills` cannot say "on one edge", so it is done here.
+            if let Op::GetFieldOr { dst, to, .. } | Op::TakeFieldOr { dst, to, .. } = code[ip] {
+                scratch.fill(0);
+                if ip + 1 < code.len() {
+                    for (o, w) in scratch.iter_mut().zip(&live[(ip + 1) * words..(ip + 2) * words]) {
+                        *o |= *w;
+                    }
+                }
+                clear(&mut scratch, dst);
+                let to = to as usize;
+                if to < code.len() {
+                    for (o, w) in scratch.iter_mut().zip(&live[to * words..(to + 1) * words]) {
+                        *o |= *w;
+                    }
+                }
+            }
             kills(&code[ip], &mut buf);
             for r in &buf {
                 clear(&mut scratch, *r);
@@ -144,6 +361,9 @@ pub(super) fn successors(op: &Op, ip: usize, len: usize, mut f: impl FnMut(usize
         Op::Jump { to } => f(to as usize),
         Op::TailCall { .. } => f(0),
         Op::JumpFalse { to, .. }
+        | Op::JumpFalseDrop { to, .. }
+        | Op::TestTagDrop { to, .. }
+        | Op::TakeFieldOr { to, .. }
         | Op::TestLit { to, .. }
         | Op::TestLitDyn { to, .. }
         | Op::TestStr { to, .. }
@@ -188,9 +408,11 @@ pub(super) fn successors(op: &Op, ip: usize, len: usize, mut f: impl FnMut(usize
         | Op::MakeRecord { .. }
         | Op::UpdateRecord { .. }
         | Op::GetField { .. }
+        | Op::TakeField { .. }
         | Op::GetOptField { .. }
         | Op::GetIndex { .. }
         | Op::GetPayload { .. }
+        | Op::TakePayload { .. }
         | Op::GetRest { .. }
         | Op::GetElem { .. }
         | Op::GetSlice { .. }
@@ -249,6 +471,7 @@ fn reads(op: &Op, out: &mut Vec<Reg>) {
         Op::BinK { a, .. } | Op::BinIntK { a, .. } => out.push(a),
 
         Op::JumpFalse { cond, .. }
+        | Op::JumpFalseDrop { cond, .. }
         | Op::TestBool { cond, .. }
         | Op::Expect { cond }
         | Op::TestExpect { cond } => out.push(cond),
@@ -281,10 +504,14 @@ fn reads(op: &Op, out: &mut Vec<Reg>) {
         }
 
         Op::GetField { obj, .. }
+        | Op::TakeField { obj, .. }
         | Op::GetOptField { obj, .. }
         | Op::GetIndex { obj, .. }
         | Op::GetPayload { obj, .. }
+        | Op::TakePayload { obj, .. }
         | Op::GetFieldOr { obj, .. }
+        | Op::TakeFieldOr { obj, .. }
+        | Op::TestTagDrop { obj, .. }
         | Op::GetRest { obj, .. }
         | Op::GetElem { obj, .. }
         | Op::GetSlice { obj, .. }
@@ -340,9 +567,11 @@ fn kills(op: &Op, out: &mut Vec<Reg>) {
         | Op::MakeRecord { dst, .. }
         | Op::UpdateRecord { dst, .. }
         | Op::GetField { dst, .. }
+        | Op::TakeField { dst, .. }
         | Op::GetOptField { dst, .. }
         | Op::GetIndex { dst, .. }
         | Op::GetPayload { dst, .. }
+        | Op::TakePayload { dst, .. }
         | Op::GetRest { dst, .. }
         | Op::GetElem { dst, .. }
         | Op::GetSlice { dst, .. }
@@ -369,18 +598,21 @@ fn kills(op: &Op, out: &mut Vec<Reg>) {
         | Op::CellSet { .. }
         | Op::Jump { .. }
         | Op::JumpFalse { .. }
+        | Op::JumpFalseDrop { .. }
         | Op::Ret { .. }
         | Op::ListPush { .. }
         | Op::TestLit { .. }
         | Op::TestLitDyn { .. }
         | Op::TestStr { .. }
         | Op::TestTag { .. }
+        | Op::TestTagDrop { .. }
         | Op::TestTuple { .. }
         | Op::TestRecord { .. }
         | Op::TestList { .. }
         | Op::TestBool { .. }
         | Op::NoMatch { .. }
         | Op::GetFieldOr { .. }
+        | Op::TakeFieldOr { .. }
         | Op::Expect { .. }
         | Op::TestExpect { .. }
         | Op::Dbg { .. }
@@ -405,7 +637,7 @@ mod tests {
             Op::Move { dst: 1, src: 5 },
             Op::Ret { src: 1 },
         ];
-        mark_takes(&mut code, 8);
+        mark_takes(&mut code, 8, &[]);
         assert!(matches!(code[0], Op::MoveTake { dst: 5, src: 1 }), "{:?}", code[0]);
     }
 
@@ -418,7 +650,7 @@ mod tests {
             Op::CallFn { dst: 5, chunk: 0, base: 5, argc: 1 },
             Op::Ret { src: 1 },
         ];
-        mark_takes(&mut code, 8);
+        mark_takes(&mut code, 8, &[]);
         assert!(matches!(code[0], Op::Move { dst: 5, src: 1 }), "{:?}", code[0]);
     }
 
@@ -430,7 +662,7 @@ mod tests {
             Op::Move { dst: 5, src: 1 },   // 0: reads reg 1
             Op::Jump { to: 0 },            // 1: and comes back to read it again
         ];
-        mark_takes(&mut code, 8);
+        mark_takes(&mut code, 8, &[]);
         assert!(matches!(code[0], Op::Move { dst: 5, src: 1 }), "{:?}", code[0]);
     }
 
@@ -442,7 +674,7 @@ mod tests {
             Op::UpdateRecord { dst: 1, obj: 0, name: 0, base: 2, n: 1, take: false },
             Op::Ret { src: 1 },
         ];
-        mark_takes(&mut code, 4);
+        mark_takes(&mut code, 4, &[]);
         assert!(matches!(code[0], Op::UpdateRecord { take: true, .. }), "{:?}", code[0]);
     }
 
@@ -456,8 +688,106 @@ mod tests {
             Op::UpdateRecord { dst: 3, obj: 1, name: 0, base: 2, n: 1, take: false },
             Op::TailCall { func: 0, chunk: Some(0), base: 2, argc: 2 },
         ];
-        mark_takes(&mut code, 8);
+        mark_takes(&mut code, 8, &[]);
         assert!(matches!(code[1], Op::UpdateRecord { take: true, .. }), "{:?}", code[1]);
+    }
+
+    /// `r.xs` and then `r.n`: the record stays live, but nothing reads `xs` again, so
+    /// that read may move `xs` out. The later `n` read is a different part.
+    #[test]
+    fn a_field_nothing_reads_again_is_taken_while_the_record_lives() {
+        let mut code = vec![
+            Op::GetField { dst: 2, obj: 1, name: 0 },
+            Op::GetField { dst: 3, obj: 1, name: 1 },
+            Op::Ret { src: 2 },
+        ];
+        mark_takes(&mut code, 8, &["xs", "n"]);
+        assert!(matches!(code[0], Op::TakeField { .. }), "{:?}", code[0]);
+        assert!(matches!(code[1], Op::TakeField { .. }), "{:?}", code[1]);
+    }
+
+    /// The same field read twice: the first read must leave it.
+    #[test]
+    fn a_field_read_again_is_not_taken() {
+        let mut code = vec![
+            Op::GetField { dst: 2, obj: 1, name: 0 },
+            Op::GetField { dst: 3, obj: 1, name: 0 },
+            Op::Ret { src: 2 },
+        ];
+        mark_takes(&mut code, 8, &["xs"]);
+        assert!(matches!(code[0], Op::GetField { .. }), "{:?}", code[0]);
+    }
+
+    /// A field read and then the whole record used: moving the field out would show.
+    #[test]
+    fn a_field_of_a_record_used_whole_later_is_not_taken() {
+        let mut code = vec![
+            Op::GetField { dst: 2, obj: 1, name: 0 },
+            Op::Ret { src: 1 },
+        ];
+        mark_takes(&mut code, 8, &["xs"]);
+        assert!(matches!(code[0], Op::GetField { .. }), "{:?}", code[0]);
+    }
+
+    /// A match: the payload read under `Found` may be taken even though the failure
+    /// edge reaches the `Missing` arm's reads of the same value, because a value that
+    /// passed `Found` cannot pass `Missing`. Only `Missing`'s own payload read counts
+    /// then, and it is a DIFFERENT tag's.
+    #[test]
+    fn a_payload_under_a_proven_tag_is_taken_past_the_other_arm() {
+        let mut code = vec![
+            Op::TestTag { obj: 0, name: 0, n: 1, to: 4 },  // 0: Found?
+            Op::GetPayload { dst: 1, obj: 0, i: 0 },       // 1
+            Op::TestRecord { obj: 1, to: 4 },                           // 2: may fail on
+            Op::Ret { src: 1 },                                         // 3
+            Op::TestTag { obj: 0, name: 1, n: 1, to: 7 },  // 4: Missing?
+            Op::GetPayload { dst: 2, obj: 0, i: 0 },       // 5
+            Op::Ret { src: 2 },                                         // 6
+            Op::NoMatch { obj: 0 },                                     // 7
+        ];
+        mark_takes(&mut code, 8, &["Found", "Missing"]);
+        assert!(matches!(code[1], Op::TakePayload { .. }), "{:?}", code[1]);
+    }
+
+    /// Without the proven tag (the read is reachable by a jump), the other arm's
+    /// payload read of the same element counts, and the take is refused.
+    #[test]
+    fn a_payload_reachable_by_a_jump_is_not_taken_past_another_read() {
+        let mut code = vec![
+            Op::Jump { to: 1 },                                         // 0
+            Op::GetPayload { dst: 1, obj: 0, i: 0 },       // 1: jumped to
+            Op::GetPayload { dst: 2, obj: 0, i: 0 },       // 2
+            Op::Ret { src: 2 },
+        ];
+        mark_takes(&mut code, 8, &[]);
+        assert!(matches!(code[1], Op::GetPayload { .. }), "{:?}", code[1]);
+    }
+
+    /// Round a loop the same field is read again: not taken.
+    #[test]
+    fn a_field_read_again_round_a_loop_is_not_taken() {
+        let mut code = vec![
+            Op::GetField { dst: 2, obj: 1, name: 0 },     // 0
+            Op::Jump { to: 0 },                                         // 1
+        ];
+        mark_takes(&mut code, 8, &["xs"]);
+        assert!(matches!(code[0], Op::GetField { .. }), "{:?}", code[0]);
+    }
+
+    /// A branch where one arm returns the scrutinee and the other does not: leaving by
+    /// the other arm clears it, so it stops sharing what that arm is about to change.
+    #[test]
+    fn a_value_only_one_arm_needs_is_cleared_on_the_other() {
+        let mut code = vec![
+            Op::TestTag { obj: 1, name: 0, n: 0, to: 2 },  // 0
+            Op::Ret { src: 0 },                                         // 1: needs reg 0
+            Op::Ret { src: 1 },                                         // 2: does not
+        ];
+        let drops = mark_takes(&mut code, 4, &["Found"]);
+        assert!(matches!(code[0], Op::TestTagDrop { drop: 1, .. }), "{:?}", code[0]);
+        // And symmetrically: falling through, register 1 is the one only the jump
+        // target needs.
+        assert_eq!(drops, vec![(vec![1], vec![0])]);
     }
 
     /// The same, with the original still wanted afterwards.
@@ -467,7 +797,7 @@ mod tests {
             Op::UpdateRecord { dst: 1, obj: 0, name: 0, base: 2, n: 1, take: false },
             Op::Ret { src: 0 },
         ];
-        mark_takes(&mut code, 4);
+        mark_takes(&mut code, 4, &[]);
         assert!(matches!(code[0], Op::UpdateRecord { take: false, .. }), "{:?}", code[0]);
     }
 }
