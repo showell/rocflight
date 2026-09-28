@@ -96,3 +96,19 @@ True True False False
 "####;
     assert_eq!(run("math", program), expected);
 }
+
+/// The checker reads these functions' signatures from `Builtin.roc`, so a list handed to
+/// `from_utf8_prefix` is a `List(U8)` and prints as one, not as the `Dec`s its numerals
+/// would default to.
+#[test]
+fn a_list_passed_to_a_numeric_function_takes_its_parameter_type() {
+    let program = r####"app [main!] {}
+
+main! = |_args| {
+	bytes = [0x35, 0x0D]
+	echo!("${Str.inspect(U8.from_utf8_prefix(bytes))} ${Str.inspect(bytes)}\n")
+	Ok({})
+}
+"####;
+    assert_eq!(run("list_param", program), "Ok({ rest: [13], value: 5 }) [53, 13]\n");
+}

@@ -22,7 +22,7 @@ use crate::types::Type;
 
 /// Bumped whenever the FORMAT changes, so an artifact from an older tree is rejected by
 /// `build.rs` rather than decoded as nonsense.
-pub const MAGIC: &[u8; 8] = b"ROCFLT07";
+pub const MAGIC: &[u8; 8] = b"ROCFLT09";
 
 /// FNV-1a of the source an artifact was built from. `build.rs` computes the same thing
 /// over `src/roc/Builtin.roc` and refuses to build if they differ.
@@ -1048,6 +1048,11 @@ op_codec! {
     54 Crash { src: r, },
     55 IterNext { dst: r, iter: r, idx: r, to: u32, },
     56 IterNextBack { dst: r, iter: r, idx: r, to: u32, },
+    57 TakeField { dst: r, obj: r, name: u16, },
+    58 TakeFieldOr { dst: r, obj: r, name: u16, to: u32, },
+    59 TakePayload { dst: r, obj: r, i: u16, },
+    60 TestTagDrop { obj: r, name: u16, n: u16, to: u32, drop: u16, },
+    61 JumpFalseDrop { cond: r, to: u32, kind: cond, drop: u16, },
 }
 
 fn binop_tag(op: crate::ast::BinOp) -> u8 {
@@ -1198,6 +1203,10 @@ fn put_chunk(w: &mut Writer, chunk: &Chunk, node_base: u32, node_end: u32) {
     w.seq(&chunk.consts, |w, v| put_value(w, v));
     w.seq(&chunk.pats, |w, p| put_pattern(w, p));
     w.seq(&chunk.code, |w, op| put_op(w, op));
+    w.seq(&chunk.drops, |w, (fall, jump)| {
+        w.seq(fall, |w, reg| w.w16(*reg));
+        w.seq(jump, |w, reg| w.w16(*reg));
+    });
     // Spans are node ids, rebased on load exactly as the AST's are — but not every one
     // of them is a builtin's. A group's top level begins with the compiler pointing at
     // the APP's node, and that node means nothing in a prefix reused by another
@@ -1234,6 +1243,10 @@ fn get_chunk(r: &mut Reader, id: u32, node_base: u32) -> Chunk {
         consts: r.seq(0, |r, _| get_value(r)),
         pats: r.seq(0, |r, _| get_pattern(r)),
         code: r.seq(0, |r, _| get_op(r)),
+        drops: r.seq(0, |r, _| {
+            let fall = r.seq(0, |r, _| r.r16());
+            (fall, r.seq(0, |r, _| r.r16()))
+        }),
         spans: r.seq(node_base, |r, base| match r.r32() {
             0 => crate::ast::fresh_node_unlocated(),
             at => NodeId(base + at - 1),
@@ -1314,6 +1327,8 @@ pub struct Artifact {
     members: Vec<(&'static str, usize)>,
     /// Where each compiled prefix's body starts, by selection key.
     prefixes: Vec<(&'static str, usize)>,
+    /// Where each signature table starts, by module.
+    tables: Vec<(&'static str, usize)>,
     blob: &'static [u8],
 }
 
@@ -1362,7 +1377,16 @@ impl Artifact {
             prefixes.push((key, r.at));
             r.at += length;
         }
-        Some(Artifact { strings, members, prefixes, blob })
+        let n_tables = r.u() as usize;
+        let mut tables = Vec::with_capacity(n_tables);
+        for _ in 0..n_tables {
+            let key = r.s();
+            let length = u32::from_le_bytes(blob.get(r.at..r.at + 4)?.try_into().ok()?) as usize;
+            r.at += 4;
+            tables.push((key, r.at));
+            r.at += length;
+        }
+        Some(Artifact { strings, members, prefixes, tables, blob })
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -1460,6 +1484,24 @@ pub struct Prefix {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The signatures of a module that `Builtin.roc` declares inside another member, as
+/// `U8` is inside `Num`. The checker wants `U8`'s 130-odd, and parsing `Num` for them
+/// costs 6ms, 20 times what the rest of a small program takes.
+///
+/// Written after the compiled prefixes, preceded by their count.
+pub fn put_signature_table(w: &mut Writer, module: &str, signatures: &[(&'static str, Type)]) {
+    w.s(module);
+    let length_at = w.out.len();
+    w.out.extend_from_slice(&0u32.to_le_bytes());
+    let body_at = w.out.len();
+    w.seq(signatures, |w, (n, t)| {
+        w.s(n);
+        put_type(w, t);
+    });
+    let length = (w.out.len() - body_at) as u32;
+    w.out[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
+}
+
 pub fn put_prefix(
     w: &mut Writer,
     key: &str,
@@ -1557,6 +1599,14 @@ impl Artifact {
     pub fn has_prefix(&self, key: &str) -> bool {
         self.prefixes.iter().any(|(n, _)| *n == key)
     }
+
+    /// One module's signature table, for a module that is not a member of its own:
+    /// see `put_signature_table`.
+    pub fn signature_table(&self, module: &str) -> Option<Vec<(&'static str, Type)>> {
+        let (_, at) = self.tables.iter().find(|(n, _)| *n == module)?;
+        let mut r = Reader { blob: self.blob, at: *at, strings: &self.strings };
+        Some(r.seq(0, |r, _| (r.s(), get_type(r))))
+    }
 }
 
 #[cfg(test)]
@@ -1581,7 +1631,8 @@ mod tests {
             &loaded.nominals,
         );
         // No compiled prefixes in this one, but the section still has to be there.
-        w.count(0);
+        w.count(0); // no compiled prefixes
+        w.count(0); // no signature tables
         let blob: &'static [u8] = Box::leak(w.finish(0, 1).into_boxed_slice());
         let artifact = Artifact::open(blob).expect("open");
         let back = artifact.member("Box").expect("member");
@@ -1640,7 +1691,8 @@ mod tests {
             &loaded.signatures,
             &loaded.nominals,
         );
-        w.count(0);
+        w.count(0); // no compiled prefixes
+        w.count(0); // no signature tables
         let blob: &'static [u8] = Box::leak(w.finish(0, 1).into_boxed_slice());
         let artifact = Artifact::open(blob).expect("open");
         let before = crate::ast::node_count() as u32;

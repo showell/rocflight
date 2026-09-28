@@ -241,6 +241,8 @@ pub enum Op {
     /// decides only what a non-`Bool` is told — roc words the three cases differently
     /// and the tree-walker followed it, so the VM has to as well.
     JumpFalse { cond: Reg, to: u32, kind: CondKind },
+    /// `JumpFalse`, clearing registers as `TestTagDrop` does.
+    JumpFalseDrop { cond: Reg, to: u32, kind: CondKind, drop: u16 },
     /// `dst = closure(chunk, regs[base..base + n])` — the captures are already in
     /// consecutive registers, put there by the enclosing function.
     MakeClosure { dst: Reg, chunk: ChunkId, base: Reg, n: u16 },
@@ -282,6 +284,11 @@ pub enum Op {
     UpdateRecord { dst: Reg, obj: Reg, name: u16, base: Reg, n: u16, take: bool },
     /// `dst = regs[obj].field`, the field name from `names`.
     GetField { dst: Reg, obj: Reg, name: u16 },
+    /// `GetField`, where `liveness` proved nothing reads this field of `obj` again: when
+    /// the record's `Rc` is unique and the field is a container, it is moved out and
+    /// `Unit` left behind, so a list inside the record stays unique. Otherwise it reads
+    /// as `GetField` does.
+    TakeField { dst: Reg, obj: Reg, name: u16 },
     /// `dst = Ok(regs[obj].field)`, or `Err(MissingField)` when it is absent.
     GetOptField { dst: Reg, obj: Reg, name: u16 },
     /// `dst = regs[obj].i` — a tuple's positional element.
@@ -298,6 +305,10 @@ pub enum Op {
     TestStr { obj: Reg, pat: u16, base: Reg, to: u32 },
     /// A tag with this name and this many payload elements.
     TestTag { obj: Reg, name: u16, n: u16, to: u32 },
+    /// `TestTag`, and then clear the registers `Chunk::drops[drop - 1]` lists for the
+    /// edge it left by: live along the other edge, dead along this one. A match arm that
+    /// no longer needs a value must not keep sharing it.
+    TestTagDrop { obj: Reg, name: u16, n: u16, to: u32, drop: u16 },
     /// A tuple of exactly this length.
     TestTuple { obj: Reg, n: u16, to: u32 },
     /// A record — which fields it needs is checked by `GetFieldOr`.
@@ -321,6 +332,10 @@ pub enum Op {
     GetPayload { dst: Reg, obj: Reg, i: u16 },
     /// `dst = regs[obj].field`, or jump to `to` when the record has no such field.
     GetFieldOr { dst: Reg, obj: Reg, name: u16, to: u32 },
+    /// `GetPayload`, moving a unique container out as `TakeField` does.
+    TakePayload { dst: Reg, obj: Reg, i: u16 },
+    /// `GetFieldOr`, moving a unique container out as `TakeField` does.
+    TakeFieldOr { dst: Reg, obj: Reg, name: u16, to: u32 },
     /// `dst =` the record's fields that `names[name .. name + n]` does not name.
     GetRest { dst: Reg, obj: Reg, name: u16, n: u16 },
     /// `dst = regs[obj][i]`, counting from the END when `from_end`.
@@ -430,6 +445,9 @@ pub struct Chunk {
     /// Literal patterns, by index. Only `Int`, `Float` and `Str` ever land here: every
     /// other pattern is compiled into tests and destructuring ops.
     pub pats: Vec<crate::ast::Pattern>,
+    /// The registers `TestTagDrop`/`JumpFalseDrop` with `drop == i + 1` clear:
+    /// `drops[i]` is (falling through, jumping). See `liveness::mark_takes`.
+    pub drops: Vec<(Vec<Reg>, Vec<Reg>)>,
     /// For errors and `dbg` only — never looked up by.
     pub name: &'static str,
     /// The AST node each instruction came from, parallel to `code`.
@@ -761,6 +779,46 @@ pub fn run(program: &Rc<Program>) -> Result<Value, EvalError> {
 /// `None` is an empty argument list, which is all a platformless run can offer.
 pub fn run_with_args(program: &Rc<Program>, args: Option<Value>) -> Result<Value, EvalError> {
     run_scoped(program, args, |_| ()).map(|(value, _)| value)
+}
+
+/// `TestTag`'s question, for `TestTagDrop`: is `value` the tag `want` with `n` payload
+/// elements? Kept word for word with `TestTag`'s arm, which stays inline because it is
+/// hot.
+fn tag_matches(value: &Value, want: &str, n: u16) -> bool {
+    match value {
+        Value::Tag(tag, payload) => *tag == want && payload.len() == n as usize,
+        // A boolean is its tag, and like any non-tag value it also reads as `Ok(it)`.
+        Value::Bool(b) => (n == 0 && want == if *b { "True" } else { "False" }) || (want == "Ok" && n == 1),
+        Value::Missing => want == "Err" && n == 1,
+        _ => want == "Ok" && n == 1,
+    }
+}
+
+/// A field moved out of the record in `slot`, when this register holds the only handle
+/// to it and the field is a container worth keeping unique; `Unit` is left in its
+/// place. `None` for anything else (a shared record, a scalar field, a field it lacks,
+/// not a record at all), and the caller reads the field as usual.
+///
+/// Only sound where `liveness` has proved nothing reads this field of this register
+/// again, which is what `TakeField`/`TakeFieldOr` record.
+fn take_field(slot: &mut Value, field: &str) -> Option<Value> {
+    let Value::Record(fields) = slot else { return None };
+    let fields = Rc::get_mut(fields)?;
+    let (_, value) = fields.iter_mut().find(|(name, _)| *name == field)?;
+    worth_taking(value).then(|| std::mem::replace(value, Value::Unit))
+}
+
+/// `take_field` for a tag's payload element `i` (`TakePayload`).
+fn take_payload(slot: &mut Value, i: usize) -> Option<Value> {
+    let Value::Tag(_, payload) = slot else { return None };
+    let value = Rc::get_mut(payload)?.get_mut(i)?;
+    worth_taking(value).then(|| std::mem::replace(value, Value::Unit))
+}
+
+/// A value whose uniqueness is worth keeping: the containers an in-place builtin
+/// changes. A scalar is as cheap to copy as to move.
+fn worth_taking(value: &Value) -> bool {
+    matches!(value, Value::List(_) | Value::Record(_) | Value::Tag(..) | Value::Tuple(_))
 }
 
 /// Run, and while the program is still installed render `Str.inspect` of the result —
@@ -1218,6 +1276,83 @@ impl Vm {
                         }
                     }
                     regs[base + dst as usize] = record;
+                }
+                Op::TakeField { dst, obj, name } => {
+                    let field = program.chunks[chunk_id as usize].names[name as usize];
+                    let value = match take_field(&mut regs[base + obj as usize], field) {
+                        Some(value) => value,
+                        // Exactly `GetField`'s reading, for a value that could not be
+                        // taken from (shared, or not a record).
+                        None => match &regs[base + obj as usize] {
+                            Value::Record(fields) => fields
+                                .iter()
+                                .find(|(f, _)| *f == field)
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or(Value::Missing),
+                            Value::Unit => Value::Missing,
+                            other if field == "len_if_known" && crate::eval::module_for(other) == Some("List") => {
+                                crate::eval::size_hint_of(other)
+                                    .map_err(|e| locate_error(&program, chunk_id, ip, e))?
+                            }
+                            other => {
+                                return Err(locate_error(&program, chunk_id, ip, EvalError {
+                                    message: format!("Cannot access field '{}' on {}", field, other),
+                                }))
+                            }
+                        },
+                    };
+                    regs[base + dst as usize] = value;
+                }
+                Op::TakeFieldOr { dst, obj, name, to } => {
+                    let field = program.chunks[chunk_id as usize].names[name as usize];
+                    match take_field(&mut regs[base + obj as usize], field) {
+                        Some(value) => regs[base + dst as usize] = value,
+                        None => {
+                            let found = match &regs[base + obj as usize] {
+                                Value::Record(fields) => {
+                                    fields.iter().find(|(f, _)| *f == field).map(|(_, v)| v.clone())
+                                }
+                                other => unreachable_shape("a record", other)?,
+                            };
+                            match found {
+                                Some(value) => regs[base + dst as usize] = value,
+                                None => ip = to as usize,
+                            }
+                        }
+                    }
+                }
+                Op::TakePayload { dst, obj, i } => {
+                    let value = match take_payload(&mut regs[base + obj as usize], i as usize) {
+                        Some(value) => value,
+                        None => match &regs[base + obj as usize] {
+                            Value::Tag(_, payload) => payload[i as usize].clone(),
+                            Value::Missing => Value::bare("MissingField"),
+                            other => other.clone(),
+                        },
+                    };
+                    regs[base + dst as usize] = value;
+                }
+                Op::TestTagDrop { obj, name, n, to, drop } => {
+                    let next = ip;
+                    if !tag_matches(&regs[base + obj as usize], program.chunks[chunk_id as usize].names[name as usize], n) {
+                        ip = to as usize;
+                    }
+                    let (fall, jump) = &program.chunks[chunk_id as usize].drops[drop as usize - 1];
+                    for r in if ip == next { fall } else { jump } {
+                        regs[base + *r as usize] = Value::Unit;
+                    }
+                }
+                Op::JumpFalseDrop { cond, to, kind, drop } => {
+                    let next = ip;
+                    match &regs[base + cond as usize] {
+                        Value::Bool(true) => {}
+                        Value::Bool(false) => ip = to as usize,
+                        other => return Err(locate_error(&program, chunk_id, ip, kind.expected_bool(other))),
+                    }
+                    let (fall, jump) = &program.chunks[chunk_id as usize].drops[drop as usize - 1];
+                    for r in if ip == next { fall } else { jump } {
+                        regs[base + *r as usize] = Value::Unit;
+                    }
                 }
                 Op::GetField { dst, obj, name } => {
                     let field = program.chunks[chunk_id as usize].names[name as usize];

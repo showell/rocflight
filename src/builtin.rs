@@ -447,6 +447,11 @@ fn member_of(module: &str) -> &str {
     if module == "Try" { "Box" } else { module }
 }
 
+/// The numeric types, whose signatures are all in the one `Num` member:
+/// `U8.from_utf8_prefix` is declared inside `Num :: {}.{ U8 :: [].{ … } }`.
+const NUMERIC_MODULES: &[&str] =
+    &["U8", "I8", "U16", "I16", "U32", "I32", "U64", "I64", "U128", "I128", "Dec", "F32", "F64"];
+
 /// The `Type.method` signatures for one module, parsed on FIRST USE and kept.
 ///
 /// Lazily, because seeding all four up front costs every program a parse it may not
@@ -473,13 +478,24 @@ pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Ty
     // Checked before the cache, because the checker asks this of EVERY qualified name
     // it meets and most of them are not a member at all. Taking a lock to be told so
     // is the sort of cost that only shows up in a benchmark.
-    if !TYPED_MEMBERS.contains(&module) {
+    let numeric = NUMERIC_MODULES.contains(&module);
+    if !TYPED_MEMBERS.contains(&module) && !numeric {
         return &[];
     }
     let cache = CACHE.get_or_init(Default::default);
 
     if let Some(found) = cache.lock().expect("signature cache").get(module) {
         return found;
+    }
+    if numeric {
+        let table: Box<[(&'static str, crate::types::Type)]> =
+            match artifact().and_then(|a| a.signature_table(module)) {
+                Some(found) => found.into_boxed_slice(),
+                None => numeric_signatures(module),
+            };
+        let table: &'static [(&'static str, crate::types::Type)] = Box::leak(table);
+        cache_signatures(module, table);
+        return table;
     }
     // The artifact holds these already, parsed at build time with the whole member in
     // scope — which is strictly more than the annotations-only re-parse below sees.
@@ -555,8 +571,41 @@ pub fn seed_signatures(loaded: &[Loaded]) {
     }
 }
 
+/// The signature tables `gen-artifact` writes: one per numeric type.
+pub fn signature_tables() -> Vec<(&'static str, Box<[(&'static str, crate::types::Type)]>)> {
+    NUMERIC_MODULES.iter().map(|module| (*module, numeric_signatures(module))).collect()
+}
+
+/// `module`'s signatures, out of `Num`.
+fn numeric_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
+    let prefix = format!("{}.", module);
+    num_signatures().iter().filter(|(name, _)| name.starts_with(&prefix)).cloned().collect()
+}
+
+/// Every numeric type's signatures, parsed out of `Num` once for all thirteen.
+fn num_signatures() -> &'static [(&'static str, crate::types::Type)] {
+    static PARSED: std::sync::OnceLock<Box<[(&'static str, crate::types::Type)]>> =
+        std::sync::OnceLock::new();
+    PARSED.get_or_init(|| {
+        let mut step = std::time::Instant::now();
+        let parsed = parse_member_signatures("Num", |_| true);
+        crate::tick("signatures_for(Num)", &mut step);
+        parsed
+    })
+}
+
 fn parse_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
-    let Some(slice) = MEMBERS.iter().find(|s| s.name == member_of(module)) else { return Box::new([]) };
+    // One `Module.` prefix, not one per signature: `Num` declares 828 of them.
+    let prefix = format!("{}.", module);
+    parse_member_signatures(member_of(module), |name| name.starts_with(&prefix))
+}
+
+/// The annotations of member `module`, parsed, keeping the names `keep` accepts.
+fn parse_member_signatures(
+    module: &str,
+    keep: impl Fn(&str) -> bool,
+) -> Box<[(&'static str, crate::types::Type)]> {
+    let Some(slice) = MEMBERS.iter().find(|s| s.name == module) else { return Box::new([]) };
     // `Set(item) :: Dict(item, {})` — so `Set`'s own signatures only carry their
     // element type if `Dict` is a known parameterised nominal while they are parsed.
     // Alone, `Dict(item, {})` degrades to a placeholder and `item` is dropped, which is
@@ -579,12 +628,10 @@ fn parse_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
     if parser.parse_expr().is_err() {
         return Box::new([]);
     }
-    // One `Module.` prefix, not one per signature: `Num` declares 828 of them.
-    let prefix = format!("{}.", module);
     parser
         .signatures()
         .iter()
-        .filter(|(name, _)| name.starts_with(&prefix))
+        .filter(|(name, _)| keep(name))
         .map(|(name, ty)| (*name, normalise(ty)))
         .collect()
 }

@@ -276,7 +276,7 @@ impl TypeChecker {
                 self.bind_annotated(value, definitions);
             }
             if let Some(declared) = annotation {
-                let declared = self.with_rows(declared);
+                let declared = self.with_rows(&Self::open_outputs(declared));
                 let mut generics = Vec::new();
                 Self::type_vars_in(&declared, &mut generics);
                 generics.sort_unstable();
@@ -1714,7 +1714,7 @@ impl TypeChecker {
                 .find(|(name, _)| *name == qualified)
                 .map(|(_, ty)| ty.clone())?,
         };
-        let ty = self.with_rows(&ty);
+        let ty = self.with_rows(&Self::open_outputs(&ty));
         let mut generics = Vec::new();
         Self::type_vars_in(&ty, &mut generics);
         generics.sort_unstable();
@@ -1790,6 +1790,51 @@ impl TypeChecker {
         let with = self.add_rows(ty);
         self.note_rows(&with);
         with
+    }
+
+    /// A function signature as its callers see it: every tag union written without
+    /// `..` in an OUTPUT position is open.
+    ///
+    /// roc's rule (`design.md`, "Polarity: Output-Position Tag Unions Are Implicitly
+    /// Open"): the root is an output, a function's argument flips it, and every other
+    /// position keeps it. So `from_str : Str -> Try(U8, [BadNumStr])` lets a caller's
+    /// `?` widen `[BadNumStr]` into its own error union. `[]` stays closed: it says
+    /// there is no error at all. The definition's own body is still checked against the
+    /// union as written, so it cannot produce a tag the annotation leaves out.
+    fn open_outputs(ty: &Type) -> Type {
+        fn walk(ty: &Type, output: bool) -> Type {
+            match ty {
+                Type::Function(a, b) => Type::Function(Box::new(walk(a, !output)), Box::new(walk(b, output))),
+                Type::TagUnion { tags, open, row } => Type::TagUnion {
+                    tags: tags
+                        .iter()
+                        .map(|(n, payload)| (*n, payload.iter().map(|t| walk(t, output)).collect()))
+                        .collect(),
+                    open: *open || (output && !tags.is_empty()),
+                    row: *row,
+                },
+                Type::List(inner) => Type::List(Box::new(walk(inner, output))),
+                Type::Range(inner) => Type::Range(Box::new(walk(inner, output))),
+                Type::Optional(inner) => Type::Optional(Box::new(walk(inner, output))),
+                Type::Tuple(items) => Type::Tuple(items.iter().map(|t| walk(t, output)).collect()),
+                Type::Record { fields, open } => Type::Record {
+                    fields: fields.iter().map(|(n, t)| (*n, walk(t, output))).collect(),
+                    open: *open,
+                },
+                Type::Nominal { name, backing, args } => Type::Nominal {
+                    name: *name,
+                    backing: backing.clone(),
+                    args: args.iter().map(|t| walk(t, output)).collect(),
+                },
+                other => other.clone(),
+            }
+        }
+        match ty {
+            Type::Function(..) => walk(ty, true),
+            // A value's annotation is not opened: roc opens it into one row every use
+            // shares, which rocflight does not model, and closed is the stricter reading.
+            _ => ty.clone(),
+        }
     }
 
     fn add_rows(&mut self, ty: &Type) -> Type {
@@ -2910,7 +2955,14 @@ impl TypeChecker {
                 // declares the signature — for a user nominal and for `Builtin.roc`'s
                 // own types alike, once `declare_builtins` has seeded them. Applying it
                 // consumes the receiver plus the written arguments.
-                if let Some(module) = self.module_named(&resolved) {
+                //
+                // Not for a numeral nothing has pinned yet. It answers as `Dec` only
+                // because that is its default, and applying `Dec`'s signature would
+                // make it one: `n = 5` then `I64.to_str(-n)` needs `n.negate()` to
+                // leave `n` free for the `I64` to pin.
+                let unpinned_numeral =
+                    matches!(&resolved, Type::TypeVar(v) if self.numeral_vars.contains(v));
+                if let Some(module) = self.module_named(&resolved).filter(|_| !unpinned_numeral) {
                     if let Some(signature) = self.declared(module, method) {
                         if let Some((params, result)) =
                             Self::peel_params(&signature, args.len() + 1)
@@ -3677,11 +3729,17 @@ impl TypeChecker {
                         } else {
                             self.instantiate(declared, &generics)
                         };
+                        // What a USE sees, a recursive one included: the output unions
+                        // opened. The body itself is checked against `instance`, the
+                        // annotation as written.
+                        let for_callers = self.with_rows(&Self::open_outputs(annotation.as_ref().expect("declared")));
+                        let mut caller_generics = Vec::new();
+                        Self::type_vars_in(&for_callers, &mut caller_generics);
                         // Bound BEFORE the value is checked, so a recursive call
                         // inside the body resolves through the annotation. Without
                         // this, `hanoi` calling itself produced an unresolved type and
                         // anything dispatched on the result failed.
-                        self.bind_poly(name, declared.clone(), generics.clone());
+                        self.bind_poly(name, for_callers.clone(), caller_generics.clone());
                         // The declared RESULT, when it is one of the annotation's own
                         // variables, belongs to the caller: the body must produce it
                         // from its arguments, not decide what it is. Only while this
@@ -3696,7 +3754,7 @@ impl TypeChecker {
                             self.rigid_vars.remove(v);
                         }
                         outcome?;
-                        self.bind_poly(name, declared.clone(), generics);
+                        self.bind_poly(name, for_callers, caller_generics);
                     }
                     // Inferred: generalise, exactly as an annotated binding is. Without
                     // this, `describe = |c| ...` is monomorphic — the first call site
@@ -3721,8 +3779,11 @@ impl TypeChecker {
                         // site, so `add_one = |x| x + 1` is a `Dec` where nothing
                         // constrains it and a `U8` where an annotation does, in the
                         // same block. Its copies stay numerals (see `instantiate`).
+                        // Nor is an open union's row: roc gives a value ONE row that
+                        // every use shares (`design.md`, "Polarity"), and quantifying it
+                        // made every `r = parse(s)` walk the whole environment below.
                         if !matches!(value, Expr::Lambda { .. }) {
-                            generics.retain(|v| !self.numeral_vars.contains(v));
+                            generics.retain(|v| !self.numeral_vars.contains(v) && !self.row_vars.contains(v));
                         }
                         // A body that asks a parameter whether an operation OVERFLOWS
                         // is asking about a WIDTH: `a.plus_overflows(b)` is a different
