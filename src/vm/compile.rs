@@ -3548,8 +3548,8 @@ fn operator_method_name(op: crate::ast::BinOp) -> Option<&'static str> {
 
 /// A type as a runtime value, for the builtins that must read one.
 ///
-/// Only the shape a JSON reader needs: a list of what, a nominal by name, and a
-/// stopping point for everything else — where the reader falls back to reading the
+/// Only the shape a JSON reader needs: a list of what, a nominal by name, a number's
+/// type, and a stopping point for everything else — where the reader falls back to reading the
 /// document as it stands.
 fn type_descriptor(ty: &crate::types::Type) -> Value {
     use crate::types::Type;
@@ -3583,6 +3583,9 @@ fn type_descriptor(ty: &crate::types::Type) -> Value {
             Some((_, payload)) if payload.len() == 1 => type_descriptor(&payload[0]),
             _ => Value::Unit,
         },
+        // A number by its type: roc reads each with that type's own grammar and range
+        // (`Json.parse_u8`, ...), so the reader has to know which.
+        _ if ty.is_numeric() => Value::tag("Num", [crate::eval::str_value(ty.to_string())]),
         _ => Value::Unit,
     }
 }
