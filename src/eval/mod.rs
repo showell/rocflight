@@ -2295,11 +2295,21 @@ pub fn low_level_arity(name: &str) -> Option<usize> {
         "u8_list_get_unsafe" => 2,
         "hasher_finish" => 1,
         "dict_pseudo_seed" => 0,
+        "f64_atan2_unsafe" | "f32_atan2_unsafe" | "dec_atan2_unsafe" => 2,
+        // `u8_from_str_prefix_raw`, `dec_from_utf8_prefix_raw`, … for every numeric type:
+        // what 2026-09-27's `Json` number parsers and `T.from_str_prefix` call.
+        _ if name
+            .strip_suffix("_from_str_prefix_raw")
+            .or_else(|| name.strip_suffix("_from_utf8_prefix_raw"))
+            .and_then(num_parse::Kind::named)
+            .is_some() =>
+        {
+            1
+        }
         _ => return None,
     })
 }
 
-/// Run one low-level op. `low_level_arity` decides what reaches here.
 /// The numeric members `Builtin.roc` (roc 2026-09-27) defines, as their Roc bodies
 /// define them: parsing (`from_str`, `from_str_prefix`, `from_utf8_prefix`, one
 /// grammar in `num_parse`), `atan2`, `is_approx_eq`, and `Dec`'s rounding in whole
@@ -2525,6 +2535,7 @@ fn dec_atan2(y: i128, x: i128) -> i128 {
     }
 }
 
+/// Run one low-level op. `low_level_arity` decides what reaches here.
 fn call_low_level(name: &str, args: &mut [Value]) -> Result<Value, EvalError> {
     let wrong = |what: &str| EvalError { message: format!("{} needs {}", name, what) };
     // Moved out of `args`, so a list nothing else holds is mutated in place — which is
@@ -2786,33 +2797,6 @@ pub fn call_builtin_values(
     // `from_str` is dispatched on the numeric type too: `I64.from_str`, and so on.
     // It returns a Try, which is the tag union [Ok(a), Err(b)] — so the result is
     // an ordinary tag value. roc names the failure `BadNumStr`.
-    if name == "from_str" && is_numeric_module(module) {
-        if args.len() != 1 {
-            return Err(EvalError {
-                message: format!("{}.from_str expects 1 argument, got {}", module, args.len()),
-            });
-        }
-        let text = match args[0].clone() {
-            Value::Str(s) => s,
-            other => {
-                return Err(EvalError {
-                    message: format!("{}.from_str needs a Str, got {}", module, other),
-                })
-            }
-        };
-        // Only `Num.from_str` reaches here: every named numeric type answered above, in
-        // `call_num_2026_09_27`, with roc's own grammar.
-        let text = text.trim();
-        let parsed = match module {
-            "Dec" => dec_from_str(text).map(Value::Dec),
-            _ => text.parse::<f64>().ok().map(Value::Float),
-        };
-        return Ok(match parsed {
-            Some(value) => Value::tag("Ok", [value]),
-            None => Value::tag("Err", [Value::bare("BadNumStr")]),
-        });
-    }
-
     // Width conversions: `I64.to_f64(n)`, `n.to_dec()`, `x.to_i64()`. Integer
     // widths are not modelled separately here, so every integer target is the same
     // conversion — only int/float actually changes the representation.

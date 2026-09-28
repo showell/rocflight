@@ -569,6 +569,10 @@ fn parse_float_token(token: &[u8], narrow: bool) -> Option<f64> {
             text.parse::<f64>().ok()?
         }
     };
+    // Narrowed BEFORE the infinity test: a hex F32 rounds to 24 bits in f64 arithmetic,
+    // and a round-half-to-even carry past F32's maximum is 2^128, finite as an f64 but
+    // not as an F32.
+    let magnitude = if narrow { f64::from(magnitude as f32) } else { magnitude };
     let explicit_infinity = body.eq_ignore_ascii_case(b"inf") || body.eq_ignore_ascii_case(b"infinity");
     if magnitude.is_infinite() && !explicit_infinity {
         return None;
@@ -711,5 +715,55 @@ mod tests {
         assert_eq!(parse_float_token(b"0x1.fffffffffffff8p0", false), Some(2.0));
         assert_eq!(parse_float_token(b"0x1p1024", false), None);
         assert_eq!(f("0x"), None);
+    }
+
+    /// Review finding F1: a hex F32 whose rounding carries past F32's maximum is out of
+    /// range, as roc 09-27 answers (`Err(BadNumStr)`, and `OutOfRange` for a prefix),
+    /// not `inf`. Just below the halfway point it is still the maximum.
+    #[test]
+    fn an_f32_hex_float_rounding_past_the_maximum_is_out_of_range() {
+        let f32_whole = |t: &str| parse_whole(Kind::F32, t.as_bytes()).map(|v| v.to_string());
+        assert_eq!(f32_whole("0x1.ffffffp127"), None);
+        assert_eq!(f32_whole("-0x1.ffffffp127"), None);
+        assert_eq!(parse_prefix(Kind::F32, b"0x1.ffffffp127,").0, 14);
+        assert!(parse_prefix(Kind::F32, b"0x1.ffffffp127,").1.is_none());
+        assert!(parse_prefix(Kind::F32, b"0x1p128").1.is_none());
+        let max = Some(Value::F32(f32::MAX).to_string());
+        assert_eq!(f32_whole("0x1.fffffe8p127"), max);
+        assert_eq!(f32_whole("0x1.fffffefp127"), max);
+        assert_eq!(f32_whole("inf"), Some(Value::F32(f32::INFINITY).to_string()));
+    }
+
+    /// The 29 low-level ops the 09-27 `Builtin.roc` added are in the registry the
+    /// compiler asks, so Roc code that calls them (`Json.parse_json_number_prefix`)
+    /// reaches them, and nothing that is not one of them is.
+    #[test]
+    fn the_new_low_level_ops_are_registered() {
+        let types = ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "u128", "i128", "f32", "f64", "dec"];
+        for t in types {
+            for suffix in ["_from_str_prefix_raw", "_from_utf8_prefix_raw"] {
+                assert_eq!(super::super::low_level_arity(&format!("{}{}", t, suffix)), Some(1), "{}{}", t, suffix);
+            }
+        }
+        for t in ["f32", "f64", "dec"] {
+            assert_eq!(super::super::low_level_arity(&format!("{}_atan2_unsafe", t)), Some(2));
+        }
+        assert_eq!(super::super::low_level_arity("str_from_str_prefix_raw"), None);
+    }
+
+    /// Review finding F2: long hex F64 literals round correctly here. roc 09-27 does
+    /// not: its vendored `parse.zig` stops collecting digits once the mantissa passes
+    /// 10^15, a decimal cutoff applied in base 16, and answers 1, 1.0000000000000002
+    /// and 2.098829547942064e19 for these three. The expected values are Python's
+    /// `float.fromhex`. When the roc issue is filed, it belongs here.
+    #[test]
+    fn long_hex_f64_literals_round_correctly_where_roc_does_not() {
+        let f64_whole = |t: &str| match parse_whole(Kind::F64, t.as_bytes()) {
+            Some(Value::Float(x)) => x,
+            other => panic!("{:?}", other),
+        };
+        assert_eq!(f64_whole("0x1.0000000000000800000001p0"), 1.0000000000000002);
+        assert_eq!(f64_whole("0x1.00000000000018000p0"), 1.0000000000000004);
+        assert_eq!(f64_whole("0x123456789abcdef01"), 2.0988295479420645e19);
     }
 }
