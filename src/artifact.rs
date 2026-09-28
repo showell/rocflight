@@ -22,7 +22,7 @@ use crate::types::Type;
 
 /// Bumped whenever the FORMAT changes, so an artifact from an older tree is rejected by
 /// `build.rs` rather than decoded as nonsense.
-pub const MAGIC: &[u8; 8] = b"ROCFLT05";
+pub const MAGIC: &[u8; 8] = b"ROCFLT06";
 
 /// FNV-1a of the source an artifact was built from. `build.rs` computes the same thing
 /// over `src/roc/Builtin.roc` and refuses to build if they differ.
@@ -1025,6 +1025,11 @@ op_codec! {
     54 Crash { src: r, },
     55 IterNext { dst: r, iter: r, idx: r, to: u32, },
     56 IterNextBack { dst: r, iter: r, idx: r, to: u32, },
+    57 TakeField { dst: r, obj: r, name: u16, },
+    58 TakeFieldOr { dst: r, obj: r, name: u16, to: u32, },
+    59 TakePayload { dst: r, obj: r, i: u16, },
+    60 TestTagDrop { obj: r, name: u16, n: u16, to: u32, drop: u16, },
+    61 JumpFalseDrop { cond: r, to: u32, kind: cond, drop: u16, },
 }
 
 fn binop_tag(op: crate::ast::BinOp) -> u8 {
@@ -1173,6 +1178,10 @@ fn put_chunk(w: &mut Writer, chunk: &Chunk, node_base: u32, node_end: u32) {
     w.seq(&chunk.consts, |w, v| put_value(w, v));
     w.seq(&chunk.pats, |w, p| put_pattern(w, p));
     w.seq(&chunk.code, |w, op| put_op(w, op));
+    w.seq(&chunk.drops, |w, (fall, jump)| {
+        w.seq(fall, |w, reg| w.w16(*reg));
+        w.seq(jump, |w, reg| w.w16(*reg));
+    });
     // Spans are node ids, rebased on load exactly as the AST's are — but not every one
     // of them is a builtin's. A group's top level begins with the compiler pointing at
     // the APP's node, and that node means nothing in a prefix reused by another
@@ -1209,6 +1218,10 @@ fn get_chunk(r: &mut Reader, id: u32, node_base: u32) -> Chunk {
         consts: r.seq(0, |r, _| get_value(r)),
         pats: r.seq(0, |r, _| get_pattern(r)),
         code: r.seq(0, |r, _| get_op(r)),
+        drops: r.seq(0, |r, _| {
+            let fall = r.seq(0, |r, _| r.r16());
+            (fall, r.seq(0, |r, _| r.r16()))
+        }),
         spans: r.seq(node_base, |r, base| match r.r32() {
             0 => crate::ast::fresh_node_unlocated(),
             at => NodeId(base + at - 1),
