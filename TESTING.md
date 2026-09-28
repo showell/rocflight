@@ -36,6 +36,7 @@ A regression found there is fixed in the next batch; it doesn't block the one th
 - **Fast Track timings** (Tier 2) run for any batch that touches the VM, the runtime, or the checker's cost, since performance is objective 1. A timing more than 10% off is re-timed on a quiet box before anyone believes it.
 - **Nothing reaches B-Teague** (PR pushes, PR bodies, issue comments) without Tier 2 green on the commits it carries.
 - **The pin:** gates run under `nightly-2026-09-27-a3ce7f1`. A second nightly is used only to tell whether a change in roc explains a result.
+- **Moving the pin, or re-syncing `Builtin.roc`, gets every tier,** Tier 3 included. The change reaches every program, so a batch's usual scope doesn't apply.
 
 ## Tracking what's outbound
 
