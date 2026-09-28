@@ -644,10 +644,9 @@ impl Parser {
         // every signature the file declares would arrive less precise than the types
         // rocflight already has.
         //
-        // `Iter` is the exception: rocflight maps `Iter(a)` to `List(a)` for the
-        // builtin iterator, but a program may declare its OWN `Iter` record type, and
-        // then that record — with its `next` field and method block — is what the
-        // annotation means, not a list.
+        // `Iter` is the exception: a program may declare its OWN `Iter` record type,
+        // and then that record — with its `next` field and method block — is what the
+        // annotation means, not the builtin iterator.
         if !(name == "Iter" && self.nominal("Iter").is_some()) {
             if let Some(builtin) = builtin_type(name, &mut args, || Type::TypeVar(u32::MAX)) {
                 return Ok(builtin);
@@ -5905,11 +5904,9 @@ fn builtin_type(name: &str, args: &mut Vec<Type>, mut fresh: impl FnMut() -> Typ
         // A boxed value is the value here — `Box.box` and `Box.unbox` are the identity
         // at run time — so `Box(I64 -> I64)` types as the function it holds.
         ("Box", 1) => args.pop().expect("arity 1"),
-        // An iterator is walked with the List methods, so it IS the list it behaves
-        // like here. As a nameless nominal its element was dropped, and a lambda
-        // handed to `.iter().map(..)` was checked against nothing — `x * 2` never
-        // learnt it was an I64 and printed `4.0`.
-        ("Iter", 1) => Type::List(Box::new(args.pop().expect("arity 1"))),
+        // An iterator is its own type, with the `Iter` block's methods: its element is
+        // its argument, so a lambda handed to `.iter().map(..)` learns what it is given.
+        ("Iter", 1) => Type::iter(args.pop().expect("arity 1")),
         // `Range(num)` over a third-party numeric type keeps its element in the backing,
         // so `range : Range(Distance)` pins the numbers inside a `Range.custom` config
         // to `Distance`. rocflight's own integer ranges never write the name.
