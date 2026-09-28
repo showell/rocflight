@@ -6,7 +6,7 @@
 # A separator must sit BETWEEN digits, so it never starts or ends a run.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     big : I64
     big = 1_000_000

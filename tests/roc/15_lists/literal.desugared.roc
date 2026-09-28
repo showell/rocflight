@@ -10,7 +10,7 @@ xs = [1, 2, 3]
 empty : List(I64)
 empty = []
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${Str.inspect(xs)},${Str.inspect(empty)},${I64.to_str(xs.fold(0, |a, x| a + x))}")
     Ok({})

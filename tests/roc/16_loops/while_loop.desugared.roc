@@ -14,7 +14,7 @@ sum_below = |limit| {
     $sum
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${I64.to_str(sum_below(5))},${I64.to_str(sum_below(0))}")
     Ok({})

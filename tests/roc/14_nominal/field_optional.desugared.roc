@@ -15,7 +15,7 @@ describe = |c| match c.?timeout {
     Err(MissingField) => "no timeout"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${describe(Cfg.{ host: "a" })},${describe(Cfg.{ host: "b", timeout: 30 })}")
     Ok({})

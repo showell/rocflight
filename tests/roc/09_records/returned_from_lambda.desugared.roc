@@ -8,7 +8,7 @@ app [main!] {}
 flags : Bool -> { enabled: Bool, disabled: Bool }
 flags = |on| { enabled: on, disabled: Bool.not(on) }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!(Str.inspect(flags(Bool.True)))
     Ok({})

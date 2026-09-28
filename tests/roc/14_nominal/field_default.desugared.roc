@@ -13,7 +13,7 @@ Cfg := { host: Str, port: U16 ?? 8080 }
 show : Cfg -> Str
 show = |c| "${c.host}:${c.port.to_str()}"
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${show(Cfg.{ host: "a" })},${show(Cfg.{ host: "b", port: 99 })}")
     Ok({})

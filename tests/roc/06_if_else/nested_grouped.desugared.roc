@@ -15,7 +15,7 @@ size = |n| {
     }
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${size(20)},${size(5)},${size(0 - 1)}")
     Ok({})

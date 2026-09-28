@@ -6,7 +6,7 @@ app [main!] {}
 point : { x: Bool, y: Bool }
 point = { x: Bool.True, y: Bool.False }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!(Str.inspect(point))
     Ok({})

@@ -17,7 +17,7 @@ Counter :: { n: I64 }.{
     show = |c| c.n.to_str()
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     c : Counter
     c = Counter.bump(Counter.start, 5)

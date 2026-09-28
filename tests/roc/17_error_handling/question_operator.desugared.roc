@@ -17,7 +17,7 @@ parse_both = |a, b| {
     }
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     match parse_both("1", "2") {
         Ok(n) => echo!(I64.to_str(n))

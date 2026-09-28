@@ -5,7 +5,7 @@ app [main!] {}
 make_adder : I64 -> (I64 -> I64)
 make_adder = |n| |x| x + n
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     add5 : I64 -> I64
     add5 = make_adder(5)

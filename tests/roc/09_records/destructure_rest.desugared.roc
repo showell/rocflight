@@ -15,7 +15,7 @@ drop_email = |p| {
     rest
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     trimmed = drop_email({ name: "ada", age: 30, email: "a@b.c" })
     echo!("${Str.inspect(trimmed)},${I64.to_str(trimmed.age)}")

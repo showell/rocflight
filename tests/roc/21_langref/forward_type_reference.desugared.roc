@@ -16,7 +16,7 @@ initial = { pos: { x: 10, y: 10 }, tail: [{ x: 9, y: 10 }] }
 step : State -> State
 step = |s| { ..s, pos: { x: s.pos.x + 1, y: s.pos.y } }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     moved : State
     moved = step(step(initial))

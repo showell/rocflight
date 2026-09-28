@@ -1,7 +1,7 @@
 # Syntax: // and % — desugared, explicit types.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     d : I64
     d = 7 // 2

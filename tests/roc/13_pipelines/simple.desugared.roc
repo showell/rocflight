@@ -7,7 +7,7 @@ app [main!] {}
 double : I64 -> I64
 double = |n| n * 2
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     n : I64
     n = 21

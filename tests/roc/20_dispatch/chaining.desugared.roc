@@ -8,7 +8,7 @@
 # precisely because it would give a different answer if the arguments were swapped.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     seed : I64
     seed = I64.from_str("10") ?? 0

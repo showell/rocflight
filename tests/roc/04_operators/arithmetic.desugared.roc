@@ -5,7 +5,7 @@
 # the two files differ ONLY in sugar and must build the same AST.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     sum : I64
     sum = 5 + 3

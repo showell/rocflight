@@ -10,7 +10,7 @@ nested = Outer(Inner("y"))
 mixed : [Wrap({ b: Bool, a: [Red] })]
 mixed = Wrap({ b: Bool.True, a: Red })
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${Str.inspect(nested)}|${Str.inspect(mixed)}")
     Ok({})

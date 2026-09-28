@@ -7,7 +7,7 @@ app [main!] {}
 scale : I64 -> I64
 scale = |x| x * 10
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     r : { v: I64 }
     r = { v: 4 }

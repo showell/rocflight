@@ -13,7 +13,7 @@ add_one = |s| {
     }
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     good = match add_one("41") { Ok(v) => I64.to_str(v) Err(_) => "err" }
     bad = match add_one("nope") { Ok(v) => I64.to_str(v) Err(_) => "err" }

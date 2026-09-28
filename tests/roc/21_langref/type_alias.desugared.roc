@@ -17,7 +17,7 @@ size = |b| b.len()
 shout : Label -> Label
 shout = |l| l.concat("!")
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     raw : List(U8)
     raw = [65, 66, 67]

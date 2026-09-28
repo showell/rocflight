@@ -11,7 +11,7 @@ unwrap = |t| match t {
     Bare => "bare"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${unwrap(Wrap(Inner("deep")))},${unwrap(Wrap(Empty))},${unwrap(Bare)}")
     Ok({})

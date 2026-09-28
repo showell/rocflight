@@ -4,7 +4,7 @@
 # which would be a field access.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     empty : Str
     empty = ""
