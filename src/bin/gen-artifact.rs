@@ -12,7 +12,7 @@
 //! per selection and run with `emit_prefix` — because the checker's per-node facts are
 //! what the compiler reads, and reproducing that pipeline here would be a second
 //! implementation of it to keep in step.
-use rocflight::artifact::{put_member, put_prefix, source_hash, Writer};
+use rocflight::artifact::{put_member, put_prefix, put_signature_table, source_hash, Writer};
 
 fn main() {
     // Nothing below reads the artifact it is about to replace.
@@ -78,6 +78,13 @@ fn main() {
             &group.globals,
             &group.fns,
         );
+    }
+
+    // The signature tables, for the modules that live inside another member.
+    let tables = rocflight::builtin::signature_tables();
+    writer.count(tables.len());
+    for (module, signatures) in &tables {
+        put_signature_table(&mut writer, module, signatures);
     }
 
     let blob = writer.finish(source_hash(rocflight::builtin::SOURCE), written);

@@ -1229,3 +1229,18 @@ main! = |_args| {
 "#;
     assert_eq!(run_program(src), Ok(()));
 }
+
+#[test]
+fn a_numeric_function_is_checked_against_its_builtin_signature() {
+    // `U16.from_le_bytes : List(U8), U64 -> Try(U16, …)`, from `Num` in `Builtin.roc`.
+    // Typed by its name alone it took anything, and a `Str` reached the run time.
+    assert!(type_error("U16.from_le_bytes(\"ab\", 0)").contains("List(U8)"));
+    assert_eq!(type_of("U8.range_len_if_known(1, 5, 1, Exclusive)"), "[Known(U64), Unknown]");
+}
+
+#[test]
+fn negating_a_numeral_leaves_it_for_its_use_to_pin() {
+    // `-n` is `n.negate()`. `Dec`'s signature, which an unpinned numeral answers to
+    // only by default, must not make `n` a `Dec` before `I64.to_str` sees it.
+    assert_eq!(defaulted_type_of("n = 5\nm = -n\nI64.to_str(m)\nn"), "I64");
+}

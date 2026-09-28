@@ -2853,7 +2853,14 @@ impl TypeChecker {
                 // declares the signature — for a user nominal and for `Builtin.roc`'s
                 // own types alike, once `declare_builtins` has seeded them. Applying it
                 // consumes the receiver plus the written arguments.
-                if let Some(module) = self.module_named(&resolved) {
+                //
+                // Not for a numeral nothing has pinned yet. It answers as `Dec` only
+                // because that is its default, and applying `Dec`'s signature would
+                // make it one: `n = 5` then `I64.to_str(-n)` needs `n.negate()` to
+                // leave `n` free for the `I64` to pin.
+                let unpinned_numeral =
+                    matches!(&resolved, Type::TypeVar(v) if self.numeral_vars.contains(v));
+                if let Some(module) = self.module_named(&resolved).filter(|_| !unpinned_numeral) {
                     if let Some(signature) = self.declared(module, method) {
                         if let Some((params, result)) =
                             Self::peel_params(&signature, args.len() + 1)
