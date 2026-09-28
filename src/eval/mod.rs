@@ -4167,6 +4167,89 @@ fn json_parse_piece(read: &str, state: Option<&Value>) -> Result<Value, EvalErro
     })
 }
 
+/// A JSON number read as `kind`, as roc 2026-09-27's `Json` reads it: the type's own
+/// prefix parser must take a token that ends at a scalar delimiter, and the token must
+/// be a strict JSON literal for the type (`parse_json_number_prefix`). `Dec` splits the
+/// scalar at its delimiter and reads it exactly (`parse_json_number`). `None` is
+/// `InvalidJson`: out of range, too precise, `01`, `1e3` for an integer, `.5`, `NaN`.
+fn json_number(cursor: &mut JsonCursor, kind: num_parse::Kind) -> Option<Value> {
+    let bytes = &cursor.bytes[cursor.at..];
+    let delimiter = |b: u8| matches!(b, b',' | b'}' | b']' | b' ' | b'\n' | b'\t' | b'\r');
+    let (length, value) = if kind == num_parse::Kind::Dec {
+        let length = bytes.iter().position(|b| delimiter(*b)).unwrap_or(bytes.len());
+        let token = &bytes[..length];
+        if length == 0 || !json_number_literal(token) {
+            return None;
+        }
+        (length, num_parse::parse_whole(kind, token)?)
+    } else {
+        let (length, value) = num_parse::parse_prefix(kind, bytes);
+        let value = value?;
+        if bytes.get(length).is_some_and(|b| !delimiter(*b)) {
+            return None;
+        }
+        let token = &bytes[..length];
+        let literal = match kind {
+            num_parse::Kind::Int { signed: false, .. } => json_unsigned_literal(token),
+            num_parse::Kind::Int { signed: true, .. } => {
+                json_unsigned_literal(token.strip_prefix(b"-").unwrap_or(token))
+            }
+            _ => json_number_literal(token),
+        };
+        if !literal {
+            return None;
+        }
+        (length, value)
+    };
+    cursor.at += length;
+    Some(value)
+}
+
+/// `0` or `[1-9][0-9]*`: roc's `is_json_unsigned_int_literal`.
+fn json_unsigned_literal(token: &[u8]) -> bool {
+    match token {
+        [b'0'] => true,
+        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        _ => false,
+    }
+}
+
+/// RFC 8259's number, `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`: roc's
+/// `is_json_number`.
+fn json_number_literal(token: &[u8]) -> bool {
+    let mut at = usize::from(token.first() == Some(&b'-'));
+    let digits = |at: &mut usize| {
+        let start = *at;
+        while token.get(*at).is_some_and(u8::is_ascii_digit) {
+            *at += 1;
+        }
+        *at > start
+    };
+    match token.get(at) {
+        Some(b'0') => at += 1,
+        Some(b'1'..=b'9') => {
+            digits(&mut at);
+        }
+        _ => return false,
+    }
+    if token.get(at) == Some(&b'.') {
+        at += 1;
+        if !digits(&mut at) {
+            return false;
+        }
+    }
+    if matches!(token.get(at), Some(b'e' | b'E')) {
+        at += 1;
+        if matches!(token.get(at), Some(b'+' | b'-')) {
+            at += 1;
+        }
+        if !digits(&mut at) {
+            return false;
+        }
+    }
+    at == token.len()
+}
+
 /// `Json.parse` and `Json.to_str`.
 ///
 /// `Builtin.roc` derives these from the SHAPE being decoded, through the `Encoding`
@@ -4195,8 +4278,8 @@ fn call_json(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
             // roc records are structural, so an object becomes a record and
             // `record.image.title` lands on a field.
             let target = args.get(1).cloned().unwrap_or(Value::Unit);
-            let invalid =
-                || Value::tag("Err", [Value::tag("InvalidJson", [str_value(text.clone())])]);
+            // roc's `Json.invalid_json`: one message for every structural failure.
+            let invalid = || Value::tag("Err", [Value::tag("InvalidJson", [str_value("Invalid JSON")])]);
             let mut cursor = JsonCursor { bytes: text.as_bytes(), at: 0 };
             Some(match json_read_as(&mut cursor, &target) {
                 Err(e) => Err(e),
@@ -4371,6 +4454,10 @@ fn json_read_as(
             let Some(Value::Str(name)) = payload.first() else { return Ok(None) };
             let wrapped = payload.get(1).cloned().unwrap_or(Value::Unit);
             custom_parser(name, &wrapped, cursor)
+        }
+        Value::Tag(tag, payload) if &**tag == "Num" => {
+            let Some(Value::Str(name)) = payload.first() else { return Ok(None) };
+            Ok(num_parse::Kind::named(name).and_then(|kind| json_number(cursor, kind)))
         }
         _ => Ok(cursor.value()),
     }
@@ -4612,10 +4699,20 @@ impl JsonCursor<'_> {
                 }
                 _ => {
                     // A whole character, not a byte: slicing mid-UTF-8 would corrupt it.
-                    let rest = std::str::from_utf8(&self.bytes[self.at..]).ok()?;
-                    let ch = rest.chars().next()?;
+                    // Decoded from its OWN bytes, the count its lead byte announces:
+                    // validating the rest of the document to read one character made
+                    // every string cost the length of the whole document.
+                    let lead = self.bytes[self.at];
+                    let width = match lead {
+                        0x00..=0x7F => 1,
+                        0xC0..=0xDF => 2,
+                        0xE0..=0xEF => 3,
+                        0xF0..=0xF7 => 4,
+                        _ => return None,
+                    };
+                    let ch = std::str::from_utf8(self.bytes.get(self.at..self.at + width)?).ok()?.chars().next()?;
                     out.push(ch);
-                    self.at += ch.len_utf8();
+                    self.at += width;
                 }
             }
         }
