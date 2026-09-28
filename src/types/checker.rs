@@ -137,6 +137,10 @@ pub struct TypeChecker {
     /// Without this the bare name is unknown, its result is a fresh variable, and every
     /// use of the method it belongs to loses its type.
     enclosing_type: Vec<String>,
+    /// The values of the top level's definitions, checked by `predeclare` in the
+    /// order they read each other. The walk that reaches them in file order finds
+    /// them bound already, and doesn't check them twice.
+    prechecked: std::collections::HashSet<crate::ast::NodeId>,
     /// Every type `synth` found and every type `check` was told, in the order they
     /// were pushed, when `record_types` asks; `node_types` resolves them. Off by
     /// default: it costs a type clone per call, and only a tool that reads the whole
@@ -233,13 +237,41 @@ impl TypeChecker {
     /// order gave such a call an unknown result, and every numeral that met it —
     /// `full.rest.drop_last(1)` — defaulted to a fraction. `check_let` binds the same
     /// annotation again when it reaches the definition, which changes nothing.
-    pub fn predeclare(&mut self, ast: &Expr) {
+    pub fn predeclare(&mut self, ast: &Expr) -> Result<(), TypeError> {
+        let mut definitions = Vec::new();
+        self.bind_annotated(ast, &mut definitions);
+        for (name, ..) in self.env.iter().flatten() {
+            for method in [".from_quote", ".from_numeral", ".from_interpolation"] {
+                if let Some(owner) = name.strip_suffix(method) {
+                    self.conversion_nominals.insert(owner.to_string());
+                    self.quotable |= method != ".from_numeral";
+                }
+            }
+        }
+        // An unannotated definition has no type until it is checked, so every
+        // definition is checked here, after the unannotated ones it reads: see
+        // `order`.
+        for i in super::order::check_order(&definitions) {
+            let (name, annotation, value) = definitions[i];
+            self.check_binding(&name, annotation, value)?;
+            self.prechecked.insert(value.id());
+        }
+        Ok(())
+    }
+
+    /// Bind each annotated top-level name to its annotation, and collect every
+    /// definition.
+    fn bind_annotated<'e>(
+        &mut self,
+        ast: &'e Expr,
+        definitions: &mut Vec<(&'static str, &'e Option<Type>, &'e Expr)>,
+    ) {
         let mut cursor = ast;
         while let Expr::Let { name, annotation, value, body, .. } = cursor {
             // A `_ = <chain>` is the parser's shape for declarations followed by
             // top-level `expect`s; its chain is the program's top level too.
             if *name == "_" && matches!(**value, Expr::Let { .. }) {
-                self.predeclare(value);
+                self.bind_annotated(value, definitions);
             }
             if let Some(declared) = annotation {
                 let declared = self.with_rows(declared);
@@ -249,15 +281,10 @@ impl TypeChecker {
                 generics.dedup();
                 self.bind_poly(name, declared, generics);
             }
-            cursor = body;
-        }
-        for (name, ..) in self.env.iter().flatten() {
-            for method in [".from_quote", ".from_numeral", ".from_interpolation"] {
-                if let Some(owner) = name.strip_suffix(method) {
-                    self.conversion_nominals.insert(owner.to_string());
-                    self.quotable |= method != ".from_numeral";
-                }
+            if *name != "_" {
+                definitions.push((name, annotation, &**value));
             }
+            cursor = body;
         }
     }
 
@@ -479,6 +506,7 @@ impl TypeChecker {
             dispatches: Vec::new(),
             collect_targets: std::collections::HashMap::new(),
             enclosing_type: Vec::new(),
+            prechecked: std::collections::HashSet::new(),
             recorded_types: None,
             literals: Vec::new(),
             numeral_vars: std::collections::HashSet::new(),
@@ -3522,17 +3550,7 @@ impl TypeChecker {
                 loop {
                     match cursor {
                         Expr::Let { name, annotation, value, body, .. } => {
-                            // `Graph.from_dict = …` is a METHOD, and its siblings are
-                            // in scope unqualified while its value is checked.
-                            let owns = name.rsplit_once('.').map(|(owner, _)| owner.to_string());
-                            if let Some(owner) = owns.clone() {
-                                self.enclosing_type.push(owner);
-                            }
-                            let checked = self.check_let(name, annotation, value);
-                            if owns.is_some() {
-                                self.enclosing_type.pop();
-                            }
-                            checked?;
+                            self.check_binding(name, annotation, value)?;
                             cursor = body;
                         }
                         Expr::VarDecl { name, value, body, .. } => {
@@ -3555,6 +3573,21 @@ impl TypeChecker {
         }
     }
 
+    /// A statement's `let`: `check_let`, with a method's siblings in scope.
+    fn check_binding(&mut self, name: &&'static str, annotation: &Option<Type>, value: &Expr) -> Result<(), TypeError> {
+        // `Graph.from_dict = …` is a METHOD, and its siblings are in scope
+        // unqualified while its value is checked.
+        let owns = name.rsplit_once('.').map(|(owner, _)| owner.to_string());
+        if let Some(owner) = owns.clone() {
+            self.enclosing_type.push(owner);
+        }
+        let checked = self.check_let(name, annotation, value);
+        if owns.is_some() {
+            self.enclosing_type.pop();
+        }
+        checked
+    }
+
     /// The binding half of a `Let`: everything but its body.
     fn check_let(
         &mut self,
@@ -3562,6 +3595,9 @@ impl TypeChecker {
         annotation: &Option<Type>,
         value: &Expr,
     ) -> Result<(), TypeError> {
+        if self.prechecked.contains(&value.id()) {
+            return Ok(());
+        }
         {
             {
                 match annotation {

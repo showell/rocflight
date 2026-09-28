@@ -1130,3 +1130,77 @@ main! = |_args| {
     assert!(type_error("f = |x| {\n    _a = x.frob()\n    U8.to_str(x)\n}\nList.len([\"a\"])").contains("frob"));
     assert!(!accepts("f = |x| {\n    _a = x.frob()\n    _b = x.blarg()\n    U8.to_str(x)\n}\nList.len([\"a\"])"));
 }
+
+#[test]
+fn a_top_level_name_is_checked_before_the_names_above_that_read_it() {
+    // roc checks top-level definitions in the order they read each other, not in file
+    // order: `factor` is typed by `scale`'s `U64` though it is written below it, and
+    // `double_all`'s method call is checked where `main!` calls it from above. In file
+    // order both defaulted to `Dec`, printing `(6.0, 3.0)` and `[2.0, 4.0]`
+    // (B-Teague/rocflight#24). roc prints each as asserted.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+scale : U64 -> U64
+scale = |x| x * factor
+
+main! = |_args| {
+    check(Str.inspect((scale(2), factor)), "(6, 3)")
+    check(Str.inspect(double_all([1.I64, 2])), "[2, 4]")
+    check(Str.inspect(twice([3.U8])), "[12]")
+    Ok({})
+}
+
+twice = |xs| double_all(double_all(xs))
+
+factor = 3
+
+double_all = |it| it.map(|x| x * 2)
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
+
+#[test]
+fn an_annotated_definition_is_still_checked_before_the_definitions_below_it() {
+    // With nothing read from below, the order is file order, annotated definitions
+    // included: `k : Code` makes the numeral `n` a `Code` before `s` and `p` call
+    // `Code`'s methods on it. Checking every unannotated definition first lost that
+    // pin, and `n.twice()` found no receiver. roc prints `(42, 3, 21)`.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+Code :: I64.{
+    code : Code -> I64
+    code = |Code.(c)| c
+
+    twice : Code -> Code
+    twice = |Code.(c)| Code.(c * 2)
+
+    parts : Code -> { hi : I64, lo : I64 }
+    parts = |Code.(c)| { hi: c // 10, lo: c % 10 }
+
+    from_numeral : Numeral -> Try(Code, [InvalidNumeral(Str)])
+    from_numeral = |n| match I64.from_numeral(n) {
+        Ok(c) => Ok(Code.(c))
+        Err(e) => Err(e)
+    }
+}
+
+n = 21
+
+k : Code
+k = n
+
+s = n.twice().code()
+
+p = n.parts().hi + 1
+
+main! = |_args| {
+    check(Str.inspect((s, p, Code.code(k))), "(42, 3, 21)")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
