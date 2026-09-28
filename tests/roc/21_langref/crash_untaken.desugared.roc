@@ -9,7 +9,7 @@ app [main!] {}
 check : List(Str) -> Str
 check = |args| if List.len(args) > 99 { crash "impossible" } else { "ok" }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |args| {
     echo!(check(args))
     Ok({})

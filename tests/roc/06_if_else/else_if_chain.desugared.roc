@@ -17,7 +17,7 @@ name_of = |n| {
     }
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${name_of(3)},${name_of(4)},${name_of(9)}")
     Ok({})

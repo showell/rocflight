@@ -10,7 +10,7 @@ app [main!] {}
 identity : a -> a
 identity = |x| x
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     s : Str
     s = identity("hi")

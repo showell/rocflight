@@ -19,7 +19,7 @@ initial = |s| match s {
     _ => "?"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${count_name(1)},${count_name(9)},${initial("bob")},${initial("zed")}")
     Ok({})

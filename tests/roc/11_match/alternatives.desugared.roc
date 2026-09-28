@@ -10,7 +10,7 @@ warm_or_cool = |c| match c {
     Blue | Cyan => "cool"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${warm_or_cool(Red)},${warm_or_cool(Orange)},${warm_or_cool(Cyan)}")
     Ok({})

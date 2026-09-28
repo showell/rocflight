@@ -16,7 +16,7 @@ classify = |xs| match xs {
     _ => 100
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${U64.to_str(classify([1, 2, 9]))},${U64.to_str(classify([2, 8, 8, 1]))},${U64.to_str(classify([9, 4, 4]))},${U64.to_str(classify([3, 5]))},${U64.to_str(classify([7]))}")
     Ok({})

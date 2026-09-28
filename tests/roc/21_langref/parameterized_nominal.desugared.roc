@@ -16,7 +16,7 @@ unwrap = |w| w.item
 swap : Pairing(a, b) -> Pairing(b, a)
 swap = |p| Pairing.{ left: p.right, right: p.left }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     word : Wrapper(Str)
     word = Wrapper.{ item: "roc" }

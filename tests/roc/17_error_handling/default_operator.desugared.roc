@@ -10,7 +10,7 @@ parse_or = |s, d| match I64.from_str(s) {
     Err(_) => d
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${I64.to_str(parse_or("42", 0))},${I64.to_str(parse_or("nope", 7))}")
     Ok({})

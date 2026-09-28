@@ -4,7 +4,7 @@
 # spellings below render as "café", one precomposed and one with a combining accent.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     accented : Str
     accented = "caf\u(e9)"

@@ -5,7 +5,7 @@
 # result of one dispatch is itself a receiver — `xs.len().to_str()`.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     seed : I64
     seed = I64.from_str("0") ?? 0

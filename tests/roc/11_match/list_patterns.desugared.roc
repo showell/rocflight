@@ -16,7 +16,7 @@ describe = |xs| match xs {
     _ => "many"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${describe([])},${describe([7])},${describe([1, 2])},${describe([3, 4])},${describe([1, 2, 3])}")
     Ok({})

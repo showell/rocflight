@@ -11,7 +11,7 @@ app [main!] {}
 label : a -> Str where [a.to_str : a -> Str]
 label = |x| "<${x.to_str()}>"
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     n : I64
     n = I64.from_str("7") ?? 0

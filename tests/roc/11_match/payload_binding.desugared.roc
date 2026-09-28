@@ -10,7 +10,7 @@ render = |t| match t {
     Bar => "bar"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${render(Foo(42, "answer"))},${render(Bar)}")
     Ok({})

@@ -8,7 +8,7 @@ name = "Roc"
 count : I64
 count = 3
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${name} has ${I64.to_str(count)} letters")
     Ok({})

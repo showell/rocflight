@@ -12,7 +12,7 @@ locate = |p| match p {
     _ => "elsewhere"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${locate((0, 0))},${locate((3, 0))},${locate((0, 4))},${locate((1, 1))}")
     Ok({})

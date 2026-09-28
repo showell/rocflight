@@ -14,7 +14,7 @@ name_of = |r| r.name
 same_extras : { id: I64, ..r }, { id: I64, ..r } -> I64
 same_extras = |a, b| a.id + b.id
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     person = { name: "Ada", age: 36 }
     bare = { name: "Bob" }

@@ -14,7 +14,7 @@ Pair := (I64, Str)
 show_id : UserId -> Str
 show_id = |u| Str.inspect(u)
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     id = UserId.(7)
     computed = UserId.(3 + 4)

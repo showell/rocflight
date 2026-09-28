@@ -20,7 +20,7 @@ first_negative = |xs| {
     $found
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${I64.to_str(first_negative([1, 2, 0 - 7, 3]))},${I64.to_str(first_negative([1, 2]))}")
     Ok({})

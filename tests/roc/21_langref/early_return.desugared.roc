@@ -13,7 +13,7 @@ sign = |n| {
     "pos"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${sign(0 - 1)},${sign(0)},${sign(1)}")
     Ok({})

@@ -7,11 +7,11 @@
 app [main!] {}
 
 sum_over = |range| {
-    var total = 0
+    var $total = 0
     for n in range {
-        total = total + n
+        $total = $total + n
     }
-    total
+    $total
 }
 
 main! = |_args| {

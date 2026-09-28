@@ -14,7 +14,7 @@ pair = |x, _y| x
 first : a, b -> a
 first = |x, _y| x
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     both : I64
     both = pair(1, 2)

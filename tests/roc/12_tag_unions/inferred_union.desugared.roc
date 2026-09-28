@@ -14,7 +14,7 @@ pick = |b| {
     }
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${Str.inspect(pick(Bool.True))},${Str.inspect(pick(Bool.False))}")
     Ok({})

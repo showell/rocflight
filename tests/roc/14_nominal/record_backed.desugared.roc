@@ -12,7 +12,7 @@ Point := { x: I64, y: I64 }
 origin_distance : Point -> I64
 origin_distance = |p| p.x + p.y
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     here : Point
     here = Point.{ x: 3, y: 4 }

@@ -11,7 +11,7 @@ app [main!] {}
 subtract : I64, I64 -> I64
 subtract = |a, b| a - b
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     n : I64
     n = 10

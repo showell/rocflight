@@ -10,7 +10,7 @@ parse_or_sum = |s| match I64.from_str(s) {
     Err(_) => (1 + 2)
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${I64.to_str(parse_or_sum("nope"))},${I64.to_str(parse_or_sum("9"))}")
     Ok({})

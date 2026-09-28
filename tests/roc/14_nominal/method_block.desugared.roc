@@ -15,7 +15,7 @@ Secret :: { key: Str }.{
     reveal = |s| s.key
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     s : Secret
     s = Secret.new("hunter2")

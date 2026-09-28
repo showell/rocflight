@@ -14,7 +14,7 @@ speak = |a| match a {
     Animal.Cat(name) => "${name} says meow"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${speak(Animal.Dog("rex"))},${speak(Animal.Cat("tom"))}")
     Ok({})
