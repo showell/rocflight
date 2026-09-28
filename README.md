@@ -54,7 +54,7 @@ If you find this project useful, the people to thank are theirs, not ours.
 
 > Roc is still pre-1.0. Its own README opens with *"Work in progress! Roc is not ready
 > for a 0.1 release yet."* This interpreter chases a moving target on purpose, and is
-> pinned to `nightly-2026-09-03-62fcb65`.
+> pinned to `nightly-2026-09-27-a3ce7f1`.
 
 ---
 
@@ -108,7 +108,7 @@ or WebAssembly.
 | Golden pairs | **99 / 99** across 20 phases |
 | Rust tests | **574** pass; 2 `vm_test` assertions fail, and are stale rather than broken (see `Learning.md`, "Known red gates") |
 | Language examples | **20** of the 28 vendored examples match `roc` byte for byte — Snake among them, on basic-cli's real host, including a whole game played key by key. 2 fail, 6 are pending on language gaps, 1 `roc` itself rejects |
-| `Builtin.roc` | **12 of 12** members parse; 1,443 definitions in Roc, 1,109 intrinsics in Rust |
+| `Builtin.roc` | **12 of 12** members parse; 1,486 definitions in Roc, 1,138 intrinsics in Rust |
 
 ```bash
 tests/check_eval.sh --strict    # roc's own eval tests, rocflight as a fifth backend

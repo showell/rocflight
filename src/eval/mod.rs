@@ -15,6 +15,7 @@ use crate::error::EvalError;
 pub mod crypto;
 pub mod f32math;
 pub mod lazy;
+pub mod num_parse;
 pub mod numeral;
 pub mod value;
 
@@ -1070,14 +1071,6 @@ fn call_u128(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
     match method {
         "highest" => return Some(out(u128::MAX)),
         "lowest" => return Some(out(0)),
-        "from_str" => {
-            let Value::Str(text) = args.first()? else { return None };
-            let parsed = text.trim().parse::<u128>().ok();
-            return Some(Ok(match parsed {
-                Some(n) => Value::tag("Ok", [Value::U128(n)]),
-                None => Value::tag("Err", [Value::bare("BadNumStr")]),
-            }));
-        }
         _ => {}
     }
     let a = u(args.first()?)?;
@@ -2008,21 +2001,6 @@ fn call_float(module: &str, method: &str, args: &[Value]) -> Option<Result<Value
             let step = if narrow { Value::F32(1.0) } else { Value::Float(1.0) };
             return numeric_range(m, args[0].clone(), args[1].clone(), step);
         }
-        "from_str" => {
-            let Value::Str(text) = args.first()? else { return None };
-            let text = text.trim();
-            // Rust reads `inf` and `NaN`; roc's `from_str` reads digits.
-            let parsed = if text.bytes().any(|b| b.is_ascii_alphabetic() && b != b'e' && b != b'E') {
-                None
-            } else {
-                // `"1e400"` is not a number an `F64` can hold.
-                text.parse::<f64>().ok().filter(|x| x.is_finite())
-            };
-            return Some(Ok(match parsed {
-                Some(x) => Value::tag("Ok", [mk(x)]),
-                None => Value::tag("Err", [Value::bare("BadNumStr")]),
-            }));
-        }
         "from_bits" => {
             let bits = as_whole(args.first()?)?;
             return Some(ok(if narrow {
@@ -2218,21 +2196,6 @@ fn call_numeric(
     match method {
         "highest" => return Some(Ok(Value::Int(hi))),
         "lowest" => return Some(Ok(Value::Int(lo))),
-        // `U8.from_str("256")` is `Err(BadNumStr)`: the width decides, not the parse.
-        "from_str" => {
-            let Value::Str(text) = args.first()? else { return None };
-            // Plain digits first; then the exact decimal reader, so that `"2e5"` and
-            // `"1.0"` are whole numbers too.
-            let text = text.trim();
-            let parsed = text.parse::<i128>().ok().or_else(|| {
-                let attos = dec_from_str(text)?;
-                (attos % DEC_SCALE == 0).then_some(attos / DEC_SCALE)
-            });
-            return Some(Ok(match parsed {
-                Some(n) if fits(n) => Value::tag("Ok", [Value::Int(n)]),
-                _ => Value::tag("Err", [Value::bare("BadNumStr")]),
-            }));
-        }
         _ => {}
     }
 
@@ -2396,8 +2359,244 @@ pub fn low_level_arity(name: &str) -> Option<usize> {
         "u8_list_get_unsafe" => 2,
         "hasher_finish" => 1,
         "dict_pseudo_seed" => 0,
+        "f64_atan2_unsafe" | "f32_atan2_unsafe" | "dec_atan2_unsafe" => 2,
+        // `u8_from_str_prefix_raw`, `dec_from_utf8_prefix_raw`, … for every numeric type:
+        // what 2026-09-27's `Json` number parsers and `T.from_str_prefix` call.
+        _ if name
+            .strip_suffix("_from_str_prefix_raw")
+            .or_else(|| name.strip_suffix("_from_utf8_prefix_raw"))
+            .and_then(num_parse::Kind::named)
+            .is_some() =>
+        {
+            1
+        }
         _ => return None,
     })
+}
+
+/// The numeric members `Builtin.roc` (roc 2026-09-27) defines, as their Roc bodies
+/// define them: parsing (`from_str`, `from_str_prefix`, `from_utf8_prefix`, one
+/// grammar in `num_parse`), `atan2`, `is_approx_eq`, and `Dec`'s rounding in whole
+/// attos. `None` for every other name, which the older dispatch answers.
+fn call_num_2026_09_27(module: &str, name: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
+    let kind = num_parse::Kind::named(module)?;
+    let crash = |what: &str| Some(Err(EvalError { message: format!("crash: {}", what) }));
+    let field = |value: &Value, wanted: &str| match value {
+        Value::Record(fields) => fields.iter().find(|(f, _)| *f == wanted).map(|(_, v)| v.clone()),
+        _ => None,
+    };
+    let overflow = || Value::tag("Err", [Value::bare("Overflow")]);
+    match name {
+        "from_str" => {
+            let Value::Str(text) = args.first()? else { return None };
+            Some(Ok(match num_parse::parse_whole(kind, text.as_bytes()) {
+                Some(value) => Value::tag("Ok", [value]),
+                None => Value::tag("Err", [Value::bare("BadNumStr")]),
+            }))
+        }
+        "from_str_prefix" | "from_utf8_prefix" => {
+            let low_level = format!("{}_{}_raw", module.to_ascii_lowercase(), name);
+            let parsed = call_low_level(&low_level, &mut [args.first()?.clone()]);
+            let parsed = match parsed {
+                Ok(parsed) => parsed,
+                Err(e) => return Some(Err(e)),
+            };
+            let err = field(&parsed, "err")?;
+            Some(Ok(match err {
+                Value::Int(0) => Value::tag(
+                    "Ok",
+                    [Value::record(vec![("rest", field(&parsed, "rest")?), ("value", field(&parsed, "value")?)])],
+                ),
+                Value::Int(1) => Value::tag("Err", [Value::bare("NotANumber")]),
+                _ => Value::tag("Err", [Value::bare("OutOfRange")]),
+            }))
+        }
+        // `atan2 = |{ x, y }| f64_atan2_unsafe(y, x)`.
+        "atan2" if matches!(kind, num_parse::Kind::F32 | num_parse::Kind::F64 | num_parse::Kind::Dec) => {
+            let point = args.first()?;
+            let low_level = format!("{}_atan2_unsafe", module.to_ascii_lowercase());
+            Some(call_low_level(&low_level, &mut [field(point, "y")?, field(point, "x")?]))
+        }
+        "is_approx_eq" => {
+            let (a, b, options) = (args.first()?, args.get(1)?, args.get(2)?);
+            let (rel, abs) = (field(options, "rel")?, field(options, "abs")?);
+            let equal = match kind {
+                num_parse::Kind::F64 => {
+                    let (a, b, rel, abs) = (as_f64(a)?, as_f64(b)?, as_f64(&rel)?, as_f64(&abs)?);
+                    if !(rel >= 0.0 && rel <= 1.0 && abs >= 0.0 && abs.is_finite()) {
+                        return crash("F64.is_approx_eq: rel must be in [0, 1] and abs finite and non-negative");
+                    }
+                    a == b || (a.is_finite() && b.is_finite() && (a - b).abs() <= abs.max(rel * a.abs().max(b.abs())))
+                }
+                num_parse::Kind::F32 => {
+                    let f32_of = |v: &Value| as_f64(v).map(|x| x as f32);
+                    let (a, b, rel, abs) = (f32_of(a)?, f32_of(b)?, f32_of(&rel)?, f32_of(&abs)?);
+                    if !(rel >= 0.0 && rel <= 1.0 && abs >= 0.0 && abs.is_finite()) {
+                        return crash("F32.is_approx_eq: rel must be in [0, 1] and abs finite and non-negative");
+                    }
+                    a == b || (a.is_finite() && b.is_finite() && (a - b).abs() <= abs.max(rel * a.abs().max(b.abs())))
+                }
+                num_parse::Kind::Dec => {
+                    let (a, b, rel, abs) = (as_dec(a)?, as_dec(b)?, as_dec(&rel)?, as_dec(&abs)?);
+                    if !(rel >= 0 && rel <= DEC_SCALE && abs >= 0) {
+                        return crash("Dec.is_approx_eq: rel must be in [0, 1] and abs non-negative");
+                    }
+                    if a == b {
+                        true
+                    } else {
+                        let diff = if a > b { a.checked_sub(b) } else { b.checked_sub(a) };
+                        match diff {
+                            // A difference too large for a Dec is never approximately equal.
+                            None => false,
+                            Some(diff) => {
+                                let magnitude = if a == i128::MIN || b == i128::MIN {
+                                    i128::MAX
+                                } else {
+                                    a.abs().max(b.abs())
+                                };
+                                match dec_mul(rel, magnitude) {
+                                    Some(scaled) => diff <= abs.max(scaled),
+                                    None => return Some(Err(EvalError { message: "crash: Dec overflowed".to_string() })),
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => return None,
+            };
+            Some(Ok(Value::Bool(equal)))
+        }
+        // `Dec`'s rounding, in whole attos: `dec_round_to_multiple_try` and
+        // `dec_attos_multiple_try`, with a whole number as the step unless `round_to`.
+        "round" | "round_try" | "floor" | "floor_try" | "ceiling" | "ceiling_try" | "trunc" | "round_to"
+        | "round_to_try"
+            if kind == num_parse::Kind::Dec =>
+        {
+            let attos = as_dec(args.first()?)?;
+            let multiple = |quotient: i128, step: i128| quotient.checked_mul(step);
+            let nearest = |step: i128, to_even: bool| {
+                let truncated = attos / step;
+                let remainder = (attos % step).abs();
+                let distance_to_next = step - remainder;
+                let away = remainder > distance_to_next
+                    || (remainder == distance_to_next && (!to_even || truncated % 2 != 0));
+                let quotient = if !away {
+                    truncated
+                } else if attos < 0 {
+                    truncated - 1
+                } else {
+                    truncated + 1
+                };
+                multiple(quotient, step)
+            };
+            let result = match name {
+                "round" | "round_try" => nearest(DEC_SCALE, false),
+                "floor" | "floor_try" => multiple(floor_div(attos, DEC_SCALE), DEC_SCALE),
+                "ceiling" | "ceiling_try" => multiple(ceil_div(attos, DEC_SCALE), DEC_SCALE),
+                "trunc" => Some(attos / DEC_SCALE * DEC_SCALE),
+                _ => {
+                    let options = args.get(1)?;
+                    let step = as_dec(&field(options, "step")?)?;
+                    if step <= 0 {
+                        return crash("Dec.round_to: step must be positive");
+                    }
+                    let to_even = matches!(field(options, "ties")?, Value::Tag("ToEven", _));
+                    nearest(step, to_even)
+                }
+            };
+            Some(Ok(match (name.ends_with("_try"), result) {
+                (true, Some(attos)) => Value::tag("Ok", [Value::Dec(attos)]),
+                (true, None) => overflow(),
+                (false, Some(attos)) => Value::Dec(attos),
+                (false, None) => return crash(&format!("Dec.{} overflowed", name)),
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Division rounding toward positive infinity, as `I128.div_ceil_by`.
+fn ceil_div(a: i128, b: i128) -> i128 {
+    let q = a / b;
+    if (a % b != 0) && ((a < 0) == (b < 0)) {
+        q + 1
+    } else {
+        q
+    }
+}
+
+/// Division rounding toward negative infinity, as `I128.div_floor_by`.
+fn floor_div(a: i128, b: i128) -> i128 {
+    let q = a / b;
+    if (a % b != 0) && ((a < 0) != (b < 0)) {
+        q - 1
+    } else {
+        q
+    }
+}
+
+/// `Dec.atan2`, as roc computes it (`dec.zig`): vectoring CORDIC on the two
+/// coordinates normalised together, in Dec's own fixed point, so the answer is bit for
+/// bit roc's rather than a float's rounded back.
+fn dec_atan2(y: i128, x: i128) -> i128 {
+    const PI: i128 = 3_141_592_653_589_793_238;
+    const HALF_PI: i128 = 1_570_796_326_794_896_619;
+    const STEPS: [i128; 64] = [
+        785398163397448309, 463647609000806116, 244978663126864154, 124354994546761435,
+        62418809995957348, 31239833430268276, 15623728620476830, 7812341060101111,
+        3906230131966971, 1953122516478818, 976562189559319, 488281211194898,
+        244140620149361, 122070311893670, 61035156174208, 30517578115526,
+        15258789061315, 7629394531101, 3814697265606, 1907348632810,
+        953674316405, 476837158203, 238418579101, 119209289550,
+        59604644775, 29802322387, 14901161193, 7450580596,
+        3725290298, 1862645149, 931322574, 465661287,
+        232830643, 116415321, 58207660, 29103830,
+        14551915, 7275957, 3637978, 1818989,
+        909494, 454747, 227373, 113686,
+        56843, 28421, 14210, 7105,
+        3552, 1776, 888, 444,
+        222, 111, 55, 27,
+        13, 6, 3, 1,
+        0, 0, 0, 0,
+    ];
+    if y == 0 {
+        return if x < 0 { PI } else { 0 };
+    }
+    if x == 0 {
+        return if y < 0 { -HALF_PI } else { HALF_PI };
+    }
+    let (ax, ay) = (x.unsigned_abs(), y.unsigned_abs());
+    // The larger magnitude's leading bit at bit 120: headroom for CORDIC's growth.
+    let leading = ax.max(ay).leading_zeros();
+    let (mut cx, mut cy) = if leading >= 7 {
+        ((ax << (leading - 7)) as i128, (ay << (leading - 7)) as i128)
+    } else {
+        ((ax >> (7 - leading)) as i128, (ay >> (7 - leading)) as i128)
+    };
+    let mut angle: i128 = 0;
+    for (i, step) in STEPS.iter().enumerate() {
+        if cy == 0 {
+            break;
+        }
+        let (dx, dy) = (cx >> i, cy >> i);
+        if cy > 0 {
+            cx += dy;
+            cy -= dx;
+            angle += step;
+        } else {
+            cx -= dy;
+            cy += dx;
+            angle -= step;
+        }
+    }
+    if x < 0 {
+        angle = PI - angle;
+    }
+    if y < 0 {
+        -angle
+    } else {
+        angle
+    }
 }
 
 /// Run one low-level op. `low_level_arity` decides what reaches here.
@@ -2476,6 +2675,58 @@ fn call_low_level(name: &str, args: &mut [Value]) -> Result<Value, EvalError> {
         // make hash flooding impractical, which no test here can observe, and a
         // constant keeps a Dict's iteration order reproducible between runs.
         "dict_pseudo_seed" => Ok(Value::Int(0x243F_6A88_85A3_08D3u64 as i128)),
+        // `atan2 = |{ x, y }| f64_atan2_unsafe(y, x)`: (y, x) order, as C's.
+        "f64_atan2_unsafe" | "f32_atan2_unsafe" | "dec_atan2_unsafe" => {
+            // By value, as the rest of the numeric runtime reads its arguments: a numeral
+            // the checker could not type arrives as a `Dec`.
+            let (y, x) = (&args[0], &args[1]);
+            let answer = match name {
+                "f64_atan2_unsafe" => as_f64(y).zip(as_f64(x)).map(|(y, x)| Value::Float(libm::atan2(y, x))),
+                "f32_atan2_unsafe" => {
+                    as_f64(y).zip(as_f64(x)).map(|(y, x)| Value::F32(f32math::atan2(y as f32, x as f32)))
+                }
+                _ => as_dec(y).zip(as_dec(x)).map(|(y, x)| Value::Dec(dec_atan2(y, x))),
+            };
+            answer.ok_or_else(|| wrong("two numbers"))
+        }
+        // `u8_from_str_prefix_raw : Str -> { err : U8, rest : Str, value : U8 }`, and the
+        // same over `List(U8)`. `err` is 0 for a number, 1 when none starts the input and
+        // 2 when the longest token does not fit; see `num_parse`.
+        _ if name.ends_with("_from_str_prefix_raw") || name.ends_with("_from_utf8_prefix_raw") => {
+            let kind = name
+                .split('_')
+                .next()
+                .and_then(num_parse::Kind::named)
+                .ok_or_else(|| wrong("a numeric type"))?;
+            let (consumed, parsed, rest) = match &args[0] {
+                Value::Str(text) => {
+                    let (consumed, parsed) = num_parse::parse_prefix(kind, text.as_bytes());
+                    (consumed, parsed, str_value(text[consumed..].to_string()))
+                }
+                Value::List(items) => {
+                    let bytes: Vec<u8> = items
+                        .iter()
+                        .map(|item| as_whole(item).and_then(|b| u8::try_from(b).ok()))
+                        .collect::<Option<_>>()
+                        .ok_or_else(|| wrong("a List(U8)"))?;
+                    let (consumed, parsed) = num_parse::parse_prefix(kind, &bytes);
+                    // Bytes, whatever shape an untyped numeral gave them on the way in.
+                    let rest = bytes[consumed..].iter().map(|b| Value::Int(i128::from(*b))).collect();
+                    (consumed, parsed, Value::list(rest))
+                }
+                _ => return Err(wrong("a Str or a List(U8)")),
+            };
+            let err = match (consumed, &parsed) {
+                (_, Some(_)) => 0,
+                (0, None) => 1,
+                (_, None) => 2,
+            };
+            Ok(Value::record(vec![
+                ("err", Value::Int(err)),
+                ("rest", rest),
+                ("value", parsed.unwrap_or_else(|| kind.zero())),
+            ]))
+        }
         _ => Err(EvalError { message: format!("low-level op `{}` is not implemented", name) }),
     }
 }
@@ -2509,6 +2760,19 @@ pub fn call_builtin_values(
     }
     if module == "Lit" && name == "coerce" {
         return numeral::coerce(args);
+    }
+    // What roc 2026-09-27's `Builtin.roc` defines for the numeric types and rocflight
+    // runs in Rust, since the `Num` member is not loaded; see `call_num_2026_09_27`.
+    // Only these names, tested before anything else so every other numeric call pays
+    // one string match and nothing more.
+    if matches!(
+        name,
+        "from_str" | "from_str_prefix" | "from_utf8_prefix" | "atan2" | "is_approx_eq" | "round" | "round_try"
+            | "floor" | "floor_try" | "ceiling" | "ceiling_try" | "trunc" | "round_to" | "round_to_try"
+    ) {
+        if let Some(result) = call_num_2026_09_27(module, name, args) {
+            return result;
+        }
     }
     // `U32.from_numeral(n)` is the width's `from_str` of the literal's text, with roc's
     // name for the failure.
@@ -2597,34 +2861,6 @@ pub fn call_builtin_values(
     // `from_str` is dispatched on the numeric type too: `I64.from_str`, and so on.
     // It returns a Try, which is the tag union [Ok(a), Err(b)] — so the result is
     // an ordinary tag value. roc names the failure `BadNumStr`.
-    if name == "from_str" && is_numeric_module(module) {
-        if args.len() != 1 {
-            return Err(EvalError {
-                message: format!("{}.from_str expects 1 argument, got {}", module, args.len()),
-            });
-        }
-        let text = match args[0].clone() {
-            Value::Str(s) => s,
-            other => {
-                return Err(EvalError {
-                    message: format!("{}.from_str needs a Str, got {}", module, other),
-                })
-            }
-        };
-        // The integer widths answered above, in `call_numeric`; these are the
-        // fractional ones. `Dec` is parsed EXACTLY, digit by digit, never through
-        // a float.
-        let text = text.trim();
-        let parsed = match module {
-            "Dec" => dec_from_str(text).map(Value::Dec),
-            _ => text.parse::<f64>().ok().map(Value::Float),
-        };
-        return Ok(match parsed {
-            Some(value) => Value::tag("Ok", [value]),
-            None => Value::tag("Err", [Value::bare("BadNumStr")]),
-        });
-    }
-
     // Width conversions: `I64.to_f64(n)`, `n.to_dec()`, `x.to_i64()`. Integer
     // widths are not modelled separately here, so every integer target is the same
     // conversion — only int/float actually changes the representation.

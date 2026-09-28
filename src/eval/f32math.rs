@@ -326,3 +326,59 @@ mod tests {
         assert_eq!(atan(f32::from_bits(0x401b_ffff)).to_bits(), 0x3f97_3ab9);
     }
 }
+
+/// Angle of (x, y), preserving IEEE signed zeros, infinities and NaNs: roc's
+/// `float_math/f32.zig` `atan2`, the musl reduction around this file's `atan`.
+pub fn atan2(y: f32, x: f32) -> f32 {
+    const PI: f32 = 3.1415927410e+00;
+    const PI_LO: f32 = -8.7422776573e-08;
+    if x.is_nan() || y.is_nan() {
+        return x + y;
+    }
+    let (mut x_bits, mut y_bits) = (x.to_bits(), y.to_bits());
+    if x_bits == 0x3F80_0000 {
+        return atan(y);
+    }
+    // 2 * sign(x) + sign(y)
+    let m = ((y_bits >> 31) & 1) | ((x_bits >> 30) & 2);
+    x_bits &= 0x7FFF_FFFF;
+    y_bits &= 0x7FFF_FFFF;
+    if y_bits == 0 {
+        return match m {
+            0 | 1 => y,
+            2 => PI,
+            _ => -PI,
+        };
+    }
+    if x_bits == 0 {
+        return if m & 1 != 0 { -PI / 2.0 } else { PI / 2.0 };
+    }
+    if x_bits == 0x7F80_0000 {
+        return if y_bits == 0x7F80_0000 {
+            match m {
+                0 => PI / 4.0,
+                1 => -PI / 4.0,
+                2 => 3.0 * PI / 4.0,
+                _ => -3.0 * PI / 4.0,
+            }
+        } else {
+            match m {
+                0 => 0.0,
+                1 => -0.0,
+                2 => PI,
+                _ => -PI,
+            }
+        };
+    }
+    // |y / x| > 0x1p26
+    if x_bits + (26 << 23) < y_bits || y_bits == 0x7F80_0000 {
+        return if m & 1 != 0 { -PI / 2.0 } else { PI / 2.0 };
+    }
+    let z = if m & 2 != 0 && y_bits + (26 << 23) < x_bits { 0.0 } else { atan((y / x).abs()) };
+    match m {
+        0 => z,
+        1 => -z,
+        2 => PI - (z - PI_LO),
+        _ => (z - PI_LO) - PI,
+    }
+}
