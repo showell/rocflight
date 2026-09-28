@@ -836,6 +836,18 @@ impl TypeChecker {
         }
 
         match expr {
+            // A nominal construction knows its own field types better than whatever it
+            // is being checked against — an open record grown from field reads names
+            // only the fields that were read. Synthesising routes it through the
+            // declaration; the expectation is then checked against the result. First,
+            // whatever the payload's shape: the parser erases `Label.(Str.concat(..))`
+            // to its payload, and checked as a call whose result is a `Label`, it was
+            // marked for a run-time `from_quote`. Inside `from_quote` that conversion
+            // called `from_quote` again, until the stack overflowed.
+            _ if expr_id_has_nominal(self, expr) => {
+                let actual = self.synth(expr)?;
+                self.unify(&actual, &resolved)
+            }
             // Numeric literals are POLYMORPHIC: `255` is a U8 in `x : U8`, an I64 in
             // `x : I64`. Synthesising them as I64 and unifying would reject every
             // annotation that is not I64.
@@ -970,15 +982,6 @@ impl TypeChecker {
                         self.unify(&actual, &resolved)
                     }
                 }
-            }
-
-            // A nominal construction knows its own field types better than whatever it
-            // is being checked against — an open record grown from field reads names
-            // only the fields that were read. Synthesising routes it through the
-            // declaration; the expectation is then checked against the result.
-            _ if expr_id_has_nominal(self, expr) => {
-                let actual = self.synth(expr)?;
-                self.unify(&actual, &resolved)
             }
 
             // An OPTIONAL field holds an ordinary value of its inner type; the option

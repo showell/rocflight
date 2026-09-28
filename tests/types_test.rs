@@ -1204,3 +1204,28 @@ main! = |_args| {
 "#;
     assert_eq!(run_program(src), Ok(()));
 }
+
+#[test]
+fn a_construction_over_a_call_is_not_converted_again() {
+    // `Label.(Str.concat("L:", s))` builds a `Label` from a `Str`. Checked as a call
+    // whose result is a `Label`, it was marked for a run-time `from_quote`, and inside
+    // `from_quote` that conversion called `from_quote` again until the stack
+    // overflowed. roc prints `"L:a"`.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+Label := Str.{
+    from_quote : Str -> Try(Label, [BadQuotedBytes(Str)])
+    from_quote = |s| Ok(Label.(Str.concat("L:", s)))
+}
+
+main! = |_args| {
+    l : Label
+    l = "a"
+    check(Str.inspect(l), "\"L:a\"")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
