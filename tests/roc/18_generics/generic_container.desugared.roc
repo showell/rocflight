@@ -13,7 +13,7 @@ echo_list = |xs| xs
 count : List(a) -> U64
 count = |xs| List.len(xs)
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     nums : List(I64)
     nums = echo_list([1, 2])

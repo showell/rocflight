@@ -9,7 +9,7 @@ app [main!] {}
 classify : I64 -> Str
 classify = |n| if n == 1 "One" else "NotOne"
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${classify(1)},${classify(2)}")
     Ok({})

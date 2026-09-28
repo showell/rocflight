@@ -15,7 +15,7 @@ birthday = |p| { ..p, age: 31 }
 rename : Person -> Person
 rename = |p| { ..p, name: "renamed" }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     start : Person
     start = { name: "ada", age: 30 }

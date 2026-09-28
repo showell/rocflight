@@ -12,7 +12,7 @@ sign_of = |n| match n {
     _ => "positive"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${sign_of(0)},${sign_of(0 - 5)},${sign_of(5)}")
     Ok({})

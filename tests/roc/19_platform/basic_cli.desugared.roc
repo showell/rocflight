@@ -17,7 +17,7 @@ import cli.Stdout
 import cli.IOErr exposing [IOErr]
 import cli.OsStr exposing [OsStr]
 
-main! : List(OsStr) => Try({}, [Exit(I32), StdoutErr(IOErr), ..])
+main! : List(OsStr) => Try({}, [Exit(I32), StdoutErr(IOErr)])
 main! = |_args| {
 	Stdout.line!("hello from a real platform")
 }

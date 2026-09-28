@@ -6,7 +6,7 @@
 # A failing `expect` is reported, not fatal — the program continues.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     dbg "marker"
     expect 1 + 1 == 2

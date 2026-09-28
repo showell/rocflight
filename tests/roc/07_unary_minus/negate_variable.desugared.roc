@@ -5,7 +5,7 @@
 # that method" rather than a syntax error. Writing it out is valid roc.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     n : I64
     n = 5

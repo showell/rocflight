@@ -5,7 +5,7 @@ app [main!] {}
 line : Str
 line = "tab:\there\nquote:\"q\"\nbackslash:\\"
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!(line)
     Ok({})

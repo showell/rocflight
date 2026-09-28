@@ -9,7 +9,7 @@ app [main!] {}
 shout : Str -> Str
 shout = |s| s
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("a=${shout("one")},b=${shout("two")}")
     Ok({})

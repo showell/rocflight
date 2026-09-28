@@ -5,7 +5,7 @@
 # block whose value is `name`.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     person : { name: Str, age: I64 }
     person = { name: "ada", age: 30 }

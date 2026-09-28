@@ -12,7 +12,7 @@ stepped = |start| {
     $acc
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${I64.to_str(stepped(5))},${I64.to_str(stepped(0))}")
     Ok({})

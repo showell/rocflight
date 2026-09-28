@@ -14,7 +14,7 @@ describe = |n| if n == 5 {
     "NotFive"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${describe(5)},${describe(6)}")
     Ok({})

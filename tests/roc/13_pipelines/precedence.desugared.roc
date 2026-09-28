@@ -10,7 +10,7 @@ app [main!] {}
 inc : I64 -> I64
 inc = |n| n + 1
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     a : I64
     a = 1 + 2 |> inc

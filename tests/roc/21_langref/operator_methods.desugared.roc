@@ -23,7 +23,7 @@ Money :: { cents: I64 }.{
     is_eq = |a, b| a.cents == b.cents
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     a : Money
     a = Money.{ cents: 5 }

@@ -12,7 +12,7 @@ describe = |c| match c {
     Blue => "blue"
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${describe(Red)},${describe(Green)},${describe(Blue)}")
     Ok({})

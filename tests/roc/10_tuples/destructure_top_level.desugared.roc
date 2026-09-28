@@ -12,7 +12,7 @@ pair = ("Roc", 1)
 
 (_, second) = pair
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${name},${I64.to_str(n)},${I64.to_str(second)}")
     Ok({})

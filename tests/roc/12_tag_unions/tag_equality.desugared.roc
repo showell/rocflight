@@ -7,7 +7,7 @@ app [main!] {}
 chosen : [Red, Green, Blue]
 chosen = Green
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!(Str.inspect({ same: chosen == Green, other: chosen == Red }))
     Ok({})

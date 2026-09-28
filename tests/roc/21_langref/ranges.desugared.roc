@@ -8,14 +8,14 @@ app [main!] {}
 
 sum_over : Range(I64) -> I64
 sum_over = |range| {
-    var total = 0
+    var $total = 0
     for n in range {
-        total = total + n
+        $total = $total + n
     }
-    total
+    $total
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     exclusive : I64
     exclusive = sum_over(0..<5)

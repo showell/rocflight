@@ -12,7 +12,7 @@ app [main!] {}
 r : { zebra: Bool, apple: Bool, mango: Bool }
 r = { zebra: Bool.True, apple: Bool.False, mango: Bool.True }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!(Str.inspect(r))
     Ok({})

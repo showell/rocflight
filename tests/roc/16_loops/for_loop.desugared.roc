@@ -17,7 +17,7 @@ total = |xs| {
     $sum
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${I64.to_str(total([1, 2, 3, 4]))},${I64.to_str(total([]))}")
     Ok({})

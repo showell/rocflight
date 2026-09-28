@@ -7,7 +7,7 @@
 # fractional type, so `42.to_str()` would print "42.0".
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     n : I64
     n = I64.from_str("42") ?? 0

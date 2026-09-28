@@ -10,7 +10,7 @@ pair = ("Roc", 1)
 mk : I64 -> (I64, I64)
 mk = |n| (n, n + 1)
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${pair.0},${I64.to_str(pair.1)},${I64.to_str(mk(5).1)}")
     Ok({})

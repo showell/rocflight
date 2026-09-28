@@ -4,7 +4,7 @@
 # unifies with any number type and takes part in arithmetic.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     a : I64
     a = 'a'

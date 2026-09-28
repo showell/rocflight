@@ -8,7 +8,7 @@ app [main!] {}
 favourite : [Red, Green, Blue]
 favourite = Green
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${Str.inspect(favourite)},${Str.inspect(Red)}")
     Ok({})

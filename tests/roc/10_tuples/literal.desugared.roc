@@ -15,7 +15,7 @@ tri = (1, 2, 3)
 nested : (I64, (Str, I64))
 nested = (1, ("a", 2))
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${Str.inspect(pair)},${Str.inspect(tri)},${Str.inspect(nested)},${I64.to_str(pair.1)},${I64.to_str(tri.0 + tri.1 + tri.2)},${I64.to_str(nested.0)},${I64.to_str(nested.1.1)}")
     Ok({})

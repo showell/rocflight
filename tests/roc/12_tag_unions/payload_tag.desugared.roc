@@ -15,7 +15,7 @@ first_of = |t| match t {
     _ => 0
 }
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     echo!("${Str.inspect(pair)},${Str.inspect(single)},${Str.inspect(Bar)},${I64.to_str(first_of(pair))}")
     Ok({})

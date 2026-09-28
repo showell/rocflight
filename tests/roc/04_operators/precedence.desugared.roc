@@ -2,7 +2,7 @@
 # Desugaring makes the implicit grouping explicit with parens.
 app [main!] {}
 
-main! : List(Str) => Try({}, [Exit(I8), ..])
+main! : List(Str) => Try({}, [Exit(I8)])
 main! = |_args| {
     a : I64
     a = 2 + (3 * 4)
