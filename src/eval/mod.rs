@@ -678,6 +678,26 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
         }
         "take_first" | "take_last" | "drop_first" | "drop_last" => {
             expect(2, args.len())?;
+            // A list nothing else holds is cut down where it stands, as roc's seamless
+            // slices do: copying the kept part made `xs = xs.drop_last(1)` in a loop
+            // quadratic.
+            if matches!(&args[0], Value::List(items) if std::rc::Rc::strong_count(items) == 1) {
+                let n = as_index(&args[1]).unwrap_or(0);
+                let Value::List(items) = std::mem::replace(&mut args[0], Value::Unit) else { unreachable!() };
+                let mut items = value::into_items(items);
+                let n = n.min(items.len());
+                match name {
+                    "take_first" => items.truncate(n),
+                    "take_last" => {
+                        items.drain(..items.len() - n);
+                    }
+                    "drop_first" => {
+                        items.drain(..n);
+                    }
+                    _ => items.truncate(items.len() - n),
+                }
+                return Ok(Value::list(items));
+            }
             let items = peek(&args[0], name)?;
             let n = as_index(&args[1]).unwrap_or(0).min(items.len());
             let taken = match name {
@@ -3448,10 +3468,14 @@ pub fn interpolated(value: &Value) -> String {
 /// the receiver then `remove`d off the front and a SECOND `Vec` built to put it back:
 /// two allocations and an O(n) shift on every method call that reaches a builtin.
 pub fn dispatch_builtin(method: &str, values: &mut [Value]) -> Result<Value, EvalError> {
+    // BORROWED, never cloned: the window holds the only reference to a list the
+    // caller moved in, and a clone here made its `Rc` shared for the whole call, so
+    // every in-place builtin (`append`, `prepend`, `concat`, `Dict.insert`, …) copied
+    // it and `xs.append(x)` in a loop was quadratic. Only the two answers that hand
+    // the receiver back take it, and they take it out of the window.
     let (receiver, args) = values.split_first().ok_or_else(|| EvalError {
         message: format!("`{}` was dispatched on nothing", method),
     })?;
-    let receiver = receiver.clone();
     // `.iter()` on something already iterable is the identity. A range STAYS a range:
     // building the list of its elements cost 190 MB on a two-million-element range, and
     // every builtin that only walks the elements can walk a range instead. It also
@@ -3460,10 +3484,8 @@ pub fn dispatch_builtin(method: &str, values: &mut [Value]) -> Result<Value, Eva
     // ponytail: still eager in the sense that `map` over a range builds its output
     // list. Fusing `map` into the consumer needs a real lazy iterator; this removes the
     // ceiling without one.
-    if method == "iter" && args.is_empty() {
-        if matches!(receiver, Value::List(_) | Value::Range { .. }) {
-            return Ok(receiver);
-        }
+    if method == "iter" && args.is_empty() && matches!(receiver, Value::List(_) | Value::Range { .. }) {
+        return Ok(std::mem::replace(&mut values[0], Value::Unit));
     }
 
     // The `Encoding` protocol's reading half. A type's own `parser_for` dispatches
@@ -3524,15 +3546,15 @@ pub fn dispatch_builtin(method: &str, values: &mut [Value]) -> Result<Value, Eva
     // `encode` on every scalar as exactly that one hop, and rocflight does not load
     // those members. The format supplies the real work.
     if method == "encode" && args.len() == 1 {
-        if let Some(kind) = module_for(&receiver).map(|m| m.to_ascii_lowercase()) {
+        if let Some(kind) = module_for(receiver).map(|m| m.to_ascii_lowercase()) {
             let named = format!("encode_{}", kind);
             if let Some((_, func)) = crate::vm::best_method(&named, &args[0]) {
-                return call_function(func, vec![args[0].clone(), receiver]);
+                return call_function(func, vec![args[0].clone(), receiver.clone()]);
             }
         }
     }
 
-    let module = module_for(&receiver).ok_or_else(|| EvalError {
+    let module = module_for(receiver).ok_or_else(|| EvalError {
         message: format!("Cannot dispatch `{}` on {}", method, receiver),
     })?;
 
