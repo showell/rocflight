@@ -103,11 +103,17 @@ pub struct TypeChecker {
     interp_literals: Vec<(crate::ast::NodeId, Type)>,
     /// Literals with a nominal suffix, from `Parser::nominal_suffixes`.
     suffixed_nominals: std::collections::HashMap<crate::ast::NodeId, String>,
-    /// Expressions checked against a nominal with a literal conversion, which a raw
-    /// literal may reach through a generic body; the compiler converts at run time.
-    coerce_values: std::collections::HashMap<crate::ast::NodeId, String>,
-    /// Lambdas whose declared parameters are such nominals: `(param index, nominal)`.
-    coerce_params: std::collections::HashMap<crate::ast::NodeId, Vec<(usize, String)>>,
+    /// Calls whose result is a generic function's own literal, with that result's
+    /// type: `seven({})` with `seven = |_| 7`. The body is compiled once, so its `7`
+    /// is a raw literal at run time; where the result turns out to be a nominal with
+    /// a literal conversion, the compiler converts it at the call. See
+    /// `coerce_values`.
+    raw_results: Vec<(crate::ast::NodeId, Type)>,
+    /// The copies `instantiate` made of a generalised literal's variable, numeral or
+    /// string: a call whose result is one of these hands back a raw literal.
+    raw_copies: std::collections::HashSet<u32>,
+    /// String-literal variables a `let` generalised; see `generalized_numerals`.
+    generalized_quotes: std::collections::HashSet<u32>,
     /// Every `match` and its scrutinee's type, for literal patterns on a nominal.
     matches: Vec<(crate::ast::NodeId, Type)>,
     /// `for` loops whose iterable is a nominal with an `iter` method: the compiler
@@ -532,8 +538,9 @@ impl TypeChecker {
             str_literals: Vec::new(),
             interp_literals: Vec::new(),
             suffixed_nominals: std::collections::HashMap::new(),
-            coerce_values: std::collections::HashMap::new(),
-            coerce_params: std::collections::HashMap::new(),
+            raw_results: Vec::new(),
+            raw_copies: std::collections::HashSet::new(),
+            generalized_quotes: std::collections::HashSet::new(),
             matches: Vec::new(),
             for_iter_calls: std::collections::HashSet::new(),
             missing_fields: std::collections::HashMap::new(),
@@ -649,6 +656,11 @@ impl TypeChecker {
         // variable's copy made `List.append`'s element a number, because an
         // annotation's variable ids and these share a number space.
         for (id, fresh) in &mapping {
+            if let Type::TypeVar(v) = fresh {
+                if self.generalized_numerals.contains(id) || self.generalized_quotes.contains(id) {
+                    self.raw_copies.insert(*v);
+                }
+            }
             if let (Type::TypeVar(v), true) = (fresh, self.generalized_numerals.contains(id)) {
                 self.numeral_vars.insert(*v);
                 self.numeral_copies.entry(*id).or_default().push(*v);
@@ -836,6 +848,17 @@ impl TypeChecker {
         }
 
         match expr {
+            // A nominal construction knows its own field types better than whatever it
+            // is being checked against — an open record grown from field reads names
+            // only the fields that were read. Synthesising routes it through the
+            // declaration; the expectation is then checked against the result. First,
+            // whatever the payload's shape: the parser erases `Label.(Str.concat(..))`
+            // to its payload, and checked as a call whose result is a `Label`, it was
+            // marked for a run-time `from_quote` it doesn't need.
+            _ if expr_id_has_nominal(self, expr) => {
+                let actual = self.synth(expr)?;
+                self.unify(&actual, &resolved)
+            }
             // Numeric literals are POLYMORPHIC: `255` is a U8 in `x : U8`, an I64 in
             // `x : I64`. Synthesising them as I64 and unifying would reject every
             // annotation that is not I64.
@@ -941,6 +964,7 @@ impl TypeChecker {
                 let peeled = Self::peel_params(&self.apply(&callee), args.len());
                 match peeled {
                     Some((params, result)) => {
+                        self.note_raw_result(expr.id(), &result);
                         self.unify(&result, &resolved)?;
                         // `List.with_capacity(n)` of a zero-sized element never
                         // allocates, so roc reports its capacity as 0.
@@ -955,14 +979,6 @@ impl TypeChecker {
                             let ty = self.apply(ty);
                             self.check(arg, &ty)?;
                         }
-                        // As the fallback arm does: a generic call whose result is a
-                        // nominal that converts literals hands back a raw literal at
-                        // run time, and the conversion happens at this node.
-                        if let Type::Nominal { name, .. } = &resolved {
-                            if self.converts_literals(&resolved) {
-                                self.coerce_values.insert(expr.id(), (*name).to_string());
-                            }
-                        }
                         Ok(())
                     }
                     None => {
@@ -970,15 +986,6 @@ impl TypeChecker {
                         self.unify(&actual, &resolved)
                     }
                 }
-            }
-
-            // A nominal construction knows its own field types better than whatever it
-            // is being checked against — an open record grown from field reads names
-            // only the fields that were read. Synthesising routes it through the
-            // declaration; the expectation is then checked against the result.
-            _ if expr_id_has_nominal(self, expr) => {
-                let actual = self.synth(expr)?;
-                self.unify(&actual, &resolved)
             }
 
             // An OPTIONAL field holds an ordinary value of its inner type; the option
@@ -1208,20 +1215,6 @@ impl TypeChecker {
                 };
                 match Self::peel_params(&resolved, arity) {
                     Some((param_types, result_type)) => {
-                        // A parameter declared as a nominal with a literal conversion
-                        // may receive a raw literal from a generic caller.
-                        let coerce: Vec<(usize, String)> = param_types
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, t)| self.converts_literals(&self.apply(t)))
-                            .map(|(i, t)| match self.apply(t) {
-                                Type::Nominal { name, .. } => (i, name.to_string()),
-                                _ => unreachable!("filtered"),
-                            })
-                            .collect();
-                        if !coerce.is_empty() {
-                            self.coerce_params.insert(expr.id(), coerce);
-                        }
                         self.push_scope();
                         for (param, ty) in params.iter().zip(param_types.iter()) {
                             self.bind(param, ty.clone());
@@ -1263,17 +1256,7 @@ impl TypeChecker {
             }
             _ => {
                 let actual = self.synth(expr)?;
-                self.unify(&actual, &resolved)?;
-                // Not a literal, so nothing converts it here; a raw literal can still
-                // arrive at run time through a generic body, and is converted then.
-                if let Type::Nominal { name, .. } = &resolved {
-                    if self.converts_literals(&resolved)
-                        && !matches!(expr, Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::StrInterp(..))
-                    {
-                        self.coerce_values.insert(expr.id(), (*name).to_string());
-                    }
-                }
-                Ok(())
+                self.unify(&actual, &resolved)
             }
         }
     }
@@ -2055,20 +2038,45 @@ impl TypeChecker {
         out
     }
 
-    /// Expressions the compiler converts at run time if a raw literal reaches them;
-    /// see `coerce_values`.
+    /// Calls the compiler converts at run time, with the nominal: a generic
+    /// function's own literal, returned where the call's type is a nominal with a
+    /// literal conversion, or a list of one. Decided after inference, as
+    /// `literal_conversions` is.
+    ///
+    /// The conversion goes where the raw literal is PRODUCED, because a nominal is
+    /// erased at run time: a `Code` already built looks the same as a raw `10`, so
+    /// converting wherever a `Code` is expected converted built values again, once per
+    /// boundary. Still missed: a generic function that passes its literal into a
+    /// function it was given, `apply5 = |f| f(5)` with `apply5(Code.code)`.
     pub fn coerce_values(&self) -> std::collections::HashMap<crate::ast::NodeId, &'static str> {
-        self.coerce_values.iter().map(|(id, name)| (*id, Self::leak(name))).collect()
+        let mut out = std::collections::HashMap::new();
+        for (id, ty) in &self.raw_results {
+            let resolved = match self.apply(ty) {
+                Type::List(elem) => self.apply(&elem),
+                other => other,
+            };
+            if let Type::Nominal { name, .. } = &resolved {
+                if self.converts_literals(&resolved) {
+                    out.insert(*id, Self::leak(name));
+                }
+            }
+        }
+        out
     }
 
-    /// Lambda parameters the compiler converts at entry; see `coerce_params`.
-    pub fn coerce_params(
-        &self,
-    ) -> std::collections::HashMap<crate::ast::NodeId, Vec<(usize, &'static str)>> {
-        self.coerce_params
-            .iter()
-            .map(|(id, params)| (*id, params.iter().map(|(i, n)| (*i, Self::leak(n))).collect()))
-            .collect()
+    /// Record `call` if its result is a generic function's own literal: a fresh
+    /// copy of a generalised literal's variable, or a list of one. Asked as the
+    /// call is typed, before unification binds the copy to anything else.
+    fn note_raw_result(&mut self, call: crate::ast::NodeId, result: &Type) {
+        let raw = |ty: &Type| matches!(ty, Type::TypeVar(v) if self.raw_copies.contains(v));
+        let result = self.apply(result);
+        let is_raw = match &result {
+            Type::List(elem) => raw(&self.apply(elem)),
+            other => raw(other),
+        };
+        if is_raw {
+            self.raw_results.push((call, result));
+        }
     }
 
     /// Each `match` whose scrutinee's type mentions a nominal with a literal
@@ -3538,7 +3546,7 @@ impl TypeChecker {
                     self.unify(&current_type, &expected)?;
                     current_type = return_type;
                 }
-
+                self.note_raw_result(expr.id(), &current_type);
                 Ok(self.apply(&current_type))
             }
             // The statement spine — a block's `let`s, `var`s and assignments — is
@@ -3687,6 +3695,8 @@ impl TypeChecker {
 
                         self.generalized_numerals
                             .extend(generics.iter().filter(|v| self.numeral_vars.contains(v)));
+                        self.generalized_quotes
+                            .extend(generics.iter().filter(|v| self.quote_vars.contains(v)));
                         // The quantified variables' constraints leave the table for the
                         // scheme, applied, so each use copies them from there.
                         let mut constraints = Vec::new();

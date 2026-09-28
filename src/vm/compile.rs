@@ -176,10 +176,9 @@ pub struct Unit<'a> {
     pub conversions: std::collections::HashMap<crate::ast::NodeId, (&'static str, &'static str)>,
     /// Every numeric literal's text, for `from_numeral`; from `Parser::numeral_texts`.
     pub numeral_texts: std::collections::HashMap<crate::ast::NodeId, String>,
-    /// From `TypeChecker::coerce_values` and `coerce_params`: where a raw literal may
-    /// arrive at run time and which nominal it should be.
+    /// From `TypeChecker::coerce_values`: the calls that hand back a raw literal at
+    /// run time, and the nominal it should be.
     pub coerce_values: std::collections::HashMap<crate::ast::NodeId, &'static str>,
-    pub coerce_params: std::collections::HashMap<crate::ast::NodeId, Vec<(usize, &'static str)>>,
     /// From `TypeChecker::zero_sized_capacity`: `List.with_capacity` calls compiled
     /// with a capacity of 0, as roc never allocates for a zero-sized element.
     pub zero_sized_capacity: std::collections::HashSet<crate::ast::NodeId>,
@@ -238,7 +237,6 @@ pub fn compile(ast: &Expr, entry: Option<&str>) -> Result<Program, String> {
         conversions: std::collections::HashMap::new(),
         numeral_texts: std::collections::HashMap::new(),
         coerce_values: std::collections::HashMap::new(),
-        coerce_params: std::collections::HashMap::new(),
         zero_sized_capacity: std::collections::HashSet::new(),
         match_types: std::collections::HashMap::new(),
         for_iter_calls: std::collections::HashSet::new(),
@@ -451,7 +449,6 @@ pub fn compile_reporting(
         conversions: &unit.conversions,
         numeral_texts: &unit.numeral_texts,
         coerce_values: unit.coerce_values.clone(),
-        coerce_params: &unit.coerce_params,
         zero_sized_capacity: unit.zero_sized_capacity.clone(),
         match_types: &unit.match_types,
         default_sites: &unit.default_sites,
@@ -472,7 +469,6 @@ pub fn compile_reporting(
                 Some((*name, fields))
             })
             .collect(),
-        pending_coerce: None,
         literal_coercions: Vec::new(),
         missing_fields: &unit.missing_fields,
         fractional_literals: &unit.fractional_literals,
@@ -487,9 +483,8 @@ pub fn compile_reporting(
     };
 
     for (name, value) in bindings.iter().take(phase_a) {
-        if let Expr::Lambda { params, body, id } = value {
+        if let Expr::Lambda { params, body, .. } = value {
             let (chunk, _) = c.tops.func(name).expect("collected above");
-            c.pending_coerce = c.coerce_params.get(id).cloned();
             let captures = c.function(chunk, name, params, body, None)?;
             debug_assert!(captures.is_empty(), "a top-level function captured something");
         }
@@ -514,9 +509,8 @@ pub fn compile_reporting(
         c.tops.index();
     }
     for (name, value) in bindings.iter().skip(phase_a) {
-        if let Expr::Lambda { params, body, id } = value {
+        if let Expr::Lambda { params, body, .. } = value {
             let (chunk, _) = c.tops.func(name).expect("collected above");
-            c.pending_coerce = c.coerce_params.get(id).cloned();
             // A top-level function is at the outermost level, so it has nothing to
             // capture: every free name in it is a global or another top-level function.
             let captures = c.function(chunk, name, params, body, None)?;
@@ -754,7 +748,6 @@ struct Compiler<'u> {
     conversions: &'u std::collections::HashMap<crate::ast::NodeId, (&'static str, &'static str)>,
     numeral_texts: &'u std::collections::HashMap<crate::ast::NodeId, String>,
     coerce_values: std::collections::HashMap<crate::ast::NodeId, &'static str>,
-    coerce_params: &'u std::collections::HashMap<crate::ast::NodeId, Vec<(usize, &'static str)>>,
     zero_sized_capacity: std::collections::HashSet<crate::ast::NodeId>,
     match_types: &'u std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
     default_sites: &'u std::collections::HashMap<crate::ast::NodeId, &'static str>,
@@ -763,9 +756,6 @@ struct Compiler<'u> {
     /// fields are optional (fill `<missing>`) versus defaulted (fill the default).
     nominal_records:
         std::collections::HashMap<&'static str, &'u [(&'static str, crate::types::Type)]>,
-    /// The parameter conversions of the lambda about to be compiled; `function` takes
-    /// them.
-    pending_coerce: Option<Vec<(usize, &'static str)>>,
     /// See `Program::literal_coercions`.
     literal_coercions: Vec<(&'static str, Value)>,
     /// See `Unit::missing_fields`.
@@ -1239,17 +1229,6 @@ impl<'u> Compiler<'u> {
         for param in params.iter() {
             let reg = self.alloc()?;
             self.st().locals.push(Local { name: param, reg, is_var: false, captured: false, boxed: false });
-        }
-        // A parameter declared as a nominal with a literal conversion: a raw literal
-        // from a generic caller is converted on entry, anything else passes through.
-        if let Some(coerce) = self.pending_coerce.take() {
-            for (i, nominal) in coerce {
-                let reg = i as Reg;
-                let save = self.st().next_reg;
-                let got = self.coerce(reg, nominal)?;
-                self.emit(Op::Move { dst: reg, src: got });
-                self.st().next_reg = save;
-            }
         }
         // The body is in tail position by definition, which is what turns a
         // tail-recursive function into a loop.
@@ -1978,10 +1957,7 @@ impl<'u> Compiler<'u> {
         // body resolves it to the running closure rather than to a binding that does
         // not exist yet.
         let src = match value {
-            Expr::Lambda { params, body, id } => {
-                self.pending_coerce = self.coerce_params.get(id).cloned();
-                self.closure(name, params, body, Some(name))
-            }
+            Expr::Lambda { params, body, .. } => self.closure(name, params, body, Some(name)),
             other => self.expr(other),
         };
         let src = match src {
@@ -2123,10 +2099,7 @@ impl<'u> Compiler<'u> {
             Expr::Ident("_", _) => self.literal(Value::Missing),
             Expr::Ident(name, _) => self.use_name(name),
 
-            Expr::Lambda { params, body, id } => {
-                self.pending_coerce = self.coerce_params.get(id).cloned();
-                self.closure("<lambda>", params, body, None)
-            }
+            Expr::Lambda { params, body, .. } => self.closure("<lambda>", params, body, None),
 
             // `and` and `or` short-circuit, as roc's do: `False and crash "x"` is `False`.
             Expr::BinOp { left, op: op @ (crate::ast::BinOp::And | crate::ast::BinOp::Or), right, .. } => {

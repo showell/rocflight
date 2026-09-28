@@ -410,7 +410,6 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         conversions: type_checker.literal_conversions(),
         numeral_texts: parser.numeral_texts(),
         coerce_values: type_checker.coerce_values(),
-        coerce_params: type_checker.coerce_params(),
         zero_sized_capacity: type_checker.zero_sized_capacity(),
         match_types: type_checker.match_types(),
         for_iter_calls: type_checker.for_iter_calls(),

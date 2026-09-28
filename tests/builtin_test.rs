@@ -290,7 +290,6 @@ fn run_with(src: &str, builtins: &[&str]) -> Result<String, String> {
         conversions: checker.literal_conversions(),
         numeral_texts: Default::default(),
         coerce_values: checker.coerce_values(),
-        coerce_params: checker.coerce_params(),
         zero_sized_capacity: checker.zero_sized_capacity(),
         match_types: checker.match_types(),
         for_iter_calls: checker.for_iter_calls(),

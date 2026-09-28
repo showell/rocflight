@@ -1204,3 +1204,82 @@ main! = |_args| {
 "#;
     assert_eq!(run_program(src), Ok(()));
 }
+
+#[test]
+fn a_construction_over_a_call_is_the_nominal_and_is_not_converted_again() {
+    // `Label.(Str.concat("L:", s))` builds a `Label` from a `Str`. Checked as a call
+    // whose result is a `Label`, it was marked for a run-time `from_quote`, and inside
+    // `from_quote` that conversion called `from_quote` again until the stack
+    // overflowed. roc prints `["L:a", "L:b"]`.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+Label :: Str.{
+    from_quote : Str -> Try(Label, [BadQuotedBytes(Str)])
+    from_quote = |s| Ok(Label.(Str.concat("L:", s)))
+
+    text : Label -> Str
+    text = |Label.(s)| s
+}
+
+texts : List(Label) -> List(Str)
+texts = |labels| List.map(labels, Label.text)
+
+main! = |_args| {
+    check(Str.inspect(texts(["a", "b"])), "[\"L:a\", \"L:b\"]")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
+
+#[test]
+fn a_literal_is_converted_once_where_it_becomes_a_nominal() {
+    // A nominal is erased at run time, so a `Code` already built looks the same as a
+    // raw `7`. Converting wherever a `Code` was expected ran `from_numeral` again on
+    // built values, once per boundary: `sum([1, 2, 3])` was `6000`. A generic
+    // function's own literal is still raw when it comes back, so `seven({})` and
+    // `greeting({})` are converted at the call, once. roc prints each as asserted.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+Code :: I64.{
+    from_numeral : Numeral -> Try(Code, [InvalidNumeral(Str)])
+    from_numeral = |n| match I64.from_numeral(n) {
+        Ok(c) => Ok(Code.(c * 10))
+        Err(e) => Err(e)
+    }
+
+    code : Code -> I64
+    code = |Code.(c)| c
+}
+
+Label :: Str.{
+    from_quote : Str -> Try(Label, [BadQuotedBytes(Str)])
+    from_quote = |s| Ok(Label.(Str.concat("L:", s)))
+
+    text : Label -> Str
+    text = |Label.(s)| s
+}
+
+sum : List(Code) -> I64
+sum = |codes| List.fold(codes, 0, |acc, c| acc + Code.code(c))
+
+seven = |_| 7
+
+greeting = |_| "hi"
+
+main! = |_args| {
+    check(Str.inspect(sum([1, 2, 3])), "60")
+    c : Code
+    c = seven({})
+    l : Label
+    l = greeting({})
+    check(Str.inspect((Code.code(c), Label.text(l))), "(70, \"L:hi\")")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
