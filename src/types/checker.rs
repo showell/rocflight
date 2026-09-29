@@ -274,7 +274,7 @@ impl TypeChecker {
                 self.bind_annotated(value, definitions);
             }
             if let Some(declared) = annotation {
-                let declared = self.with_rows(&Self::open_outputs(declared));
+                let declared = self.with_rows(&self.open_outputs(declared));
                 let mut generics = Vec::new();
                 Self::type_vars_in(&declared, &mut generics);
                 generics.sort_unstable();
@@ -1676,7 +1676,7 @@ impl TypeChecker {
                 .find(|(name, _)| *name == qualified)
                 .map(|(_, ty)| ty.clone())?,
         };
-        let ty = self.with_rows(&Self::open_outputs(&ty));
+        let ty = self.with_rows(&self.open_outputs(&ty));
         let mut generics = Vec::new();
         Self::type_vars_in(&ty, &mut generics);
         generics.sort_unstable();
@@ -1763,39 +1763,147 @@ impl TypeChecker {
     /// `?` widen `[BadNumStr]` into its own error union. `[]` stays closed: it says
     /// there is no error at all. The definition's own body is still checked against the
     /// union as written, so it cannot produce a tag the annotation leaves out.
-    fn open_outputs(ty: &Type) -> Type {
-        fn walk(ty: &Type, output: bool) -> Type {
-            match ty {
-                Type::Function(a, b) => Type::Function(Box::new(walk(a, !output)), Box::new(walk(b, output))),
-                Type::TagUnion { tags, open, row } => Type::TagUnion {
-                    tags: tags
-                        .iter()
-                        .map(|(n, payload)| (*n, payload.iter().map(|t| walk(t, output)).collect()))
-                        .collect(),
-                    open: *open || (output && !tags.is_empty()),
-                    row: *row,
-                },
-                Type::List(inner) => Type::List(Box::new(walk(inner, output))),
-                Type::Range(inner) => Type::Range(Box::new(walk(inner, output))),
-                Type::Optional(inner) => Type::Optional(Box::new(walk(inner, output))),
-                Type::Tuple(items) => Type::Tuple(items.iter().map(|t| walk(t, output)).collect()),
-                Type::Record { fields, open } => Type::Record {
-                    fields: fields.iter().map(|(n, t)| (*n, walk(t, output))).collect(),
-                    open: *open,
-                },
-                Type::Nominal { name, backing, args } => Type::Nominal {
-                    name: *name,
-                    backing: backing.clone(),
-                    args: args.iter().map(|t| walk(t, output)).collect(),
-                },
-                other => other.clone(),
-            }
-        }
+    ///
+    /// A nominal's argument is at the reference's polarity composed with the VARIANCE
+    /// of the parameter it fills (`formal_variance`): with `Handler(e) := (e -> Str)`,
+    /// the `[A, B]` of a returned `Handler([A, B])` is an input, and stays closed.
+    fn open_outputs(&self, ty: &Type) -> Type {
         match ty {
-            Type::Function(..) => walk(ty, true),
+            Type::Function(..) => self.open_walk(ty, Polarity::Output),
             // A value's annotation is not opened: roc opens it into one row every use
             // shares, which rocflight does not model, and closed is the stricter reading.
             _ => ty.clone(),
+        }
+    }
+
+    fn open_walk(&self, ty: &Type, at: Polarity) -> Type {
+        match ty {
+            Type::Function(a, b) => {
+                Type::Function(Box::new(self.open_walk(a, at.flip())), Box::new(self.open_walk(b, at)))
+            }
+            Type::TagUnion { tags, open, row } => Type::TagUnion {
+                tags: tags
+                    .iter()
+                    .map(|(n, payload)| (*n, payload.iter().map(|t| self.open_walk(t, at)).collect()))
+                    .collect(),
+                open: *open || (at == Polarity::Output && !tags.is_empty()),
+                row: *row,
+            },
+            Type::List(inner) => Type::List(Box::new(self.open_walk(inner, at))),
+            Type::Range(inner) => Type::Range(Box::new(self.open_walk(inner, at))),
+            Type::Optional(inner) => Type::Optional(Box::new(self.open_walk(inner, at))),
+            Type::Tuple(items) => Type::Tuple(items.iter().map(|t| self.open_walk(t, at)).collect()),
+            Type::Record { fields, open } => Type::Record {
+                fields: fields.iter().map(|(n, t)| (*n, self.open_walk(t, at))).collect(),
+                open: *open,
+            },
+            Type::Nominal { name, backing, args } => Type::Nominal {
+                name: *name,
+                backing: backing.clone(),
+                args: args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let at = match self.formal_variance(name, i, &mut Vec::new()) {
+                            Variance::Covariant => at,
+                            Variance::Contravariant => at.flip(),
+                            // Nothing beneath an argument whose variance is unknown or
+                            // two-sided is opened, at any depth: closed is the answer
+                            // that keeps the annotation bounding its callers.
+                            Variance::Invariant | Variance::Unknown => Polarity::AsWritten,
+                        };
+                        self.open_walk(t, at)
+                    })
+                    .collect(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// The variance of nominal `name`'s `index`th parameter, read off its declaration.
+    ///
+    /// `Builtin.roc`'s parameterised types are all covariant, by roc's design, so they
+    /// are answered without a walk. A qualified name is another module's declaration,
+    /// which roc does not read either: unknown. A local declaration is walked, through
+    /// the local declarations it names, to a bounded depth.
+    fn formal_variance(&self, name: &str, index: usize, seen: &mut Vec<String>) -> Variance {
+        const BUILTIN: &[&str] = &["List", "Box", "Dict", "Set", "Iter", "Stream", "Range", "Try"];
+        if BUILTIN.contains(&name) {
+            return Variance::Covariant;
+        }
+        if name.contains('.') || seen.len() > 8 || seen.iter().any(|s| s == name) {
+            return Variance::Unknown;
+        }
+        let Some(&param) = self.params_of(name).and_then(|params| params.get(index)) else {
+            return Variance::Unknown;
+        };
+        let Some(declared) = self.declared_types.get(name) else { return Variance::Unknown };
+        let backing = match declared {
+            Type::Nominal { backing, .. } => &**backing,
+            other => other,
+        };
+        seen.push(name.to_string());
+        let (mut output, mut input) = (false, false);
+        self.occurrences(backing, param, true, seen, &mut output, &mut input);
+        seen.pop();
+        match (output, input) {
+            (true, true) => Variance::Invariant,
+            (false, true) => Variance::Contravariant,
+            // An unused parameter constrains nothing; covariant is its roc answer too.
+            _ => Variance::Covariant,
+        }
+    }
+
+    /// Where `var` stands in `ty`: in an output position, an input one, or both.
+    fn occurrences(&self, ty: &Type, var: u32, output: bool, seen: &mut Vec<String>, outputs: &mut bool, inputs: &mut bool) {
+        match ty {
+            Type::TypeVar(v) if *v == var => {
+                if output {
+                    *outputs = true;
+                } else {
+                    *inputs = true;
+                }
+            }
+            Type::Function(a, b) => {
+                self.occurrences(a, var, !output, seen, outputs, inputs);
+                self.occurrences(b, var, output, seen, outputs, inputs);
+            }
+            Type::TagUnion { tags, .. } => {
+                for t in tags.iter().flat_map(|(_, payload)| payload) {
+                    self.occurrences(t, var, output, seen, outputs, inputs);
+                }
+            }
+            Type::List(inner) | Type::Range(inner) | Type::Optional(inner) => {
+                self.occurrences(inner, var, output, seen, outputs, inputs)
+            }
+            Type::Tuple(items) => {
+                for t in items {
+                    self.occurrences(t, var, output, seen, outputs, inputs);
+                }
+            }
+            Type::Record { fields, .. } => {
+                for (_, t) in fields {
+                    self.occurrences(t, var, output, seen, outputs, inputs);
+                }
+            }
+            // Through a nested declaration, by ITS parameter's variance. roc counts an
+            // unknown one (another module's, a cycle, past the depth bound) as covariant
+            // here: this is the declaration's own variance, not a use of it.
+            Type::Nominal { name, args, .. } => {
+                for (i, t) in args.iter().enumerate() {
+                    match self.formal_variance(name, i, seen) {
+                        Variance::Covariant | Variance::Unknown => {
+                            self.occurrences(t, var, output, seen, outputs, inputs)
+                        }
+                        Variance::Contravariant => self.occurrences(t, var, !output, seen, outputs, inputs),
+                        Variance::Invariant => {
+                            self.occurrences(t, var, output, seen, outputs, inputs);
+                            self.occurrences(t, var, !output, seen, outputs, inputs);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3675,7 +3783,8 @@ impl TypeChecker {
                         // What a USE sees, a recursive one included: the output unions
                         // opened. The body itself is checked against `instance`, the
                         // annotation as written.
-                        let for_callers = self.with_rows(&Self::open_outputs(annotation.as_ref().expect("declared")));
+                        let opened = self.open_outputs(annotation.as_ref().expect("declared"));
+                        let for_callers = self.with_rows(&opened);
                         let mut caller_generics = Vec::new();
                         Self::type_vars_in(&for_callers, &mut caller_generics);
                         // Bound BEFORE the value is checked, so a recursive call
@@ -4984,6 +5093,34 @@ fn operator_module(ty: &Type) -> Option<&'static str> {
 /// does. `None` means the type does not name a module — a bare record or tag has no
 /// nominal to dispatch through, because roc erases nominals and the value carries no
 /// tag to recover one from.
+/// Where a tag union stands in a signature, for `open_outputs`.
+#[derive(Clone, Copy, PartialEq)]
+enum Polarity {
+    Output,
+    Input,
+    /// Beneath an argument of unknown or two-sided variance: nothing opens.
+    AsWritten,
+}
+
+impl Polarity {
+    fn flip(self) -> Self {
+        match self {
+            Polarity::Output => Polarity::Input,
+            Polarity::Input => Polarity::Output,
+            Polarity::AsWritten => Polarity::AsWritten,
+        }
+    }
+}
+
+/// How a nominal's parameter stands in its declaration; see `formal_variance`.
+#[derive(Clone, Copy, PartialEq)]
+enum Variance {
+    Covariant,
+    Contravariant,
+    Invariant,
+    Unknown,
+}
+
 fn module_of(ty: &Type) -> Option<&'static str> {
     Some(match ty {
         Type::Str => "Str",
