@@ -5487,7 +5487,10 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
                 position: 0,
             })? as i128;
             let value = if is_negative { -value } else { value };
-            return Ok((&input[next..], Expr::Int(value, crate::ast::fresh_node_unlocated())));
+            // A type suffix, as on a decimal: `0x1234.U64`. Left unread, it reached
+            // the checker as a field access on a numeral, so `0x1234.U64.is_multiple_of(2)`
+            // dispatched on a `Dec`.
+            return Ok(integer_with_suffix(&input[next..], value, crate::ast::fresh_node_unlocated()));
         }
     }
 
@@ -5593,10 +5596,15 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
     let node = crate::ast::fresh_node_unlocated();
     NUMERAL_TEXT.with(|t| t.borrow_mut().push((node, signed_text(is_negative, &number))));
 
-    // An integer type suffix, e.g. `255.U8`. The VALUE is unchanged — one integer
-    // representation — but the TYPE is not: a suffixed literal is not a numeral waiting
-    // to be defaulted, it has already been told what it is.
-    let remaining = &input[pos..];
+    Ok(integer_with_suffix(&input[pos..], value, node))
+}
+
+/// An integer literal's node, with its type suffix if one follows: `255.U8`.
+///
+/// The VALUE is unchanged — one integer representation — but the TYPE is not: a
+/// suffixed literal is not a numeral waiting to be defaulted, it has already been told
+/// what it is.
+fn integer_with_suffix(remaining: &str, value: i128, node: crate::ast::NodeId) -> (&str, Expr) {
     if remaining.starts_with('.') {
         let after = &remaining[1..];
         for suffix in [
@@ -5612,23 +5620,15 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
                         OVERFLOWED_NODES.with(|o| o.borrow_mut().push(node));
                     }
                     return if suffix.starts_with('F') || suffix == "Dec" {
-                        Ok((
-                            rest,
-                            Expr::Float(
-                                value as f64,
-                                value.saturating_mul(crate::eval::DEC_SCALE),
-                                node,
-                            ),
-                        ))
+                        (rest, Expr::Float(value as f64, value.saturating_mul(crate::eval::DEC_SCALE), node))
                     } else {
-                        Ok((rest, Expr::Int(value, node)))
+                        (rest, Expr::Int(value, node))
                     };
                 }
             }
         }
     }
-
-    Ok((remaining, Expr::Int(value, node)))
+    (remaining, Expr::Int(value, node))
 }
 
 fn signed_text(is_negative: bool, number: &str) -> String {

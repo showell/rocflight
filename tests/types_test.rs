@@ -1281,3 +1281,24 @@ fn a_function_still_cannot_return_a_tag_its_annotation_leaves_out() {
     let src = "parse : Str -> Try(U8, [Bad])\nparse = |s| if s == \"\" { Err(Other) } else { Ok(1) }\nparse(\"\")";
     assert!(type_error(src).contains("Other"));
 }
+
+#[test]
+fn a_hex_literals_type_suffix_types_it_as_a_method_receiver() {
+    // `0xFF.U8` is a `U8` as `255.U8` is. Inside `${…}` the number reader alone sees
+    // the literal, and it left the suffix unread on hex, octal and binary literals, so
+    // the call dispatched on the `Dec` the numeral defaulted to: "Unknown function
+    // Dec.plus_wrap". roc prints `0`, `1` and `15`.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+main! = |_args| {
+    check(Str.inspect(0xFF.U8.plus_wrap(1)), "0")
+    check("${Str.inspect(0xFF.U8.plus_wrap(1))}", "0")
+    check("${Str.inspect(0b1111_1111.U8.plus_wrap(2))}", "1")
+    check("${0o17.I8.to_str()}", "15")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
