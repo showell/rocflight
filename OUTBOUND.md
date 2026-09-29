@@ -11,20 +11,20 @@ What we have out upstream, and which gates each item's current head passed (tier
 | #1 | `module-imports` | `0dfe7fb` | Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
 | #22 | `fast-track-runs` | `484cf04` | Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
 | #23 | `smaller-fixes` | `d5c4fee` | Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
-| #25 | `node-types` | `44a2403` | Tier 2 in `all-prs` `46ecb76`; Tier 3 in `codex-emit` `631816f` | 2026-09-28 | #23 |
+| #25 | `node-types` | `15a89d3` | Tier 2 in `all-prs` `8f475fd` | 2026-09-29 | #23 |
 | #27 | `nightly-09-27` | `92dfe53` | branch gates under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
 | #28 | `builtin-09-27` | `222afb5` | branch gates and `check_builtin --strict` under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-29 | #27 |
 | #29 | `json-numbers` | `a3f7d09` | branch gates under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-29 | #28 |
 | #30 | `float-display` | `9ae8115` | branch gates under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-29 | #27 |
 | #31 | `list-copies` | `a824e7b` | branch gates under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-29 | #27 |
 | #32 | `issue-6-list-copy` | `42c53ff` | branch gates under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-29 | #27 |
+| #33 | `num-runtime-sweep` | `314fb60` | branch gates under 09-27; Tier 2 in `all-prs` `8f475fd` | 2026-09-29 | #28, #25 (and #23) |
 
-The work in #28 to #32 is by the cloud Claude, cherry-picked with `-x`.
+The work in #28 to #33 is by the cloud Claude, cherry-picked with `-x`.
 
 ## Held here, not yet sent
 
-- **`node-types` `15a89d3`:** a hex, octal or binary literal takes its type suffix. Tier 1 only, so it's **ungated**. It goes to #25 with the next batch's Tier 2.
-- **`cloud/num-runtime-sweep` `219250b`:** the numeric runtime sweep. It's for the next batch, then a PR stacked on #28.
+- **`cloud/h2`** (in progress): H's moves for record-update syntax and tuple elements. It'll be a PR stacked on #31.
 
 ## Issues filed
 
