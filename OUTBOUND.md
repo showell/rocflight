@@ -36,4 +36,5 @@ The work in #28 to #32 is by the cloud Claude, cherry-picked with `-x`.
 | roc-lang/roc | 11806 | segfault: an effectful call with an unresolved argument inside `for` | fixed by roc-lang/roc#11813, closed 2026-09-29 |
 | roc-lang/roc | 11807 | hex floats with more than 16 significant digits round wrongly | open |
 | roc-lang/roc | 11808 | an unannotated `to_inspect` is silently ignored | open |
+| roc-lang/roc | 11845 | `List.prepend` is O(n) and undocumented as such; after `drop_first` it reallocates every time (drafted by the cloud Claude) | open |
 | roc-lang/examples | 296 | annotate `to_inspect` in EncodeDecode and CustomInspect | merged 2026-09-28 |
