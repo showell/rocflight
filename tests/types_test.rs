@@ -1383,3 +1383,42 @@ main! = |_args| {
 "#;
     assert_eq!(run_program(src), Ok(()));
 }
+
+#[test]
+fn a_range_has_only_ranges_methods() {
+    // `Builtin.roc`'s `Range` declares `custom`, `size_hint`, `step_by`, `iter` and
+    // `iter_rev`. roc reports the list methods on a range as a missing method, and
+    // `List.len(1..=3)` as a mismatch; rocflight answered them as a `List`'s.
+    for src in ["(1..=3).len()", "List.len(1..=3)", "(1..=3).map(|x| x * 2)", "(1..=3).keep_if(|x| x > 1)", "(1..=3).fold(0, |a, x| a + x)"] {
+        assert!(!accepts(src), "{} should be rejected, as roc rejects it", src);
+    }
+}
+
+#[test]
+fn a_range_still_loops_and_iterates() {
+    // roc prints `6.0 10.0` and `22.0 Known(3) 12.0`: a generic loop takes a list or a
+    // range through `iter`, and a range's own methods still answer.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+total = |xs| {
+    var $s = 0
+    for x in xs {
+        $s = $s + x
+    }
+    $s
+}
+
+main! = |_args| {
+    check("${Str.inspect(total([1, 2, 3]))} ${Str.inspect(total(1..=4))}", "6.0 10.0")
+    var $t = 0
+    for x in (1..=10).step_by(3) {
+        $t = $t + x
+    }
+    check("${Str.inspect($t)} ${Str.inspect((1..=3).size_hint())} ${Str.inspect((1..=3).iter().map(|x| x * 2).fold(0, |a, x| a + x))}", "22.0 Known(3) 12.0")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
