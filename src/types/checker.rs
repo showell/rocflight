@@ -1644,16 +1644,14 @@ impl TypeChecker {
                 "size_hint" => {
                     return Some(Type::Function(Box::new(range), Box::new(len_hint)));
                 }
-                _ => {}
+                "step_by" => {
+                    let stepped = Type::Range(Box::new(num.clone()));
+                    return Some(Type::Function(Box::new(range), Box::new(Type::Function(Box::new(num), Box::new(stepped)))));
+                }
+                // `Builtin.roc`'s `Range` declares nothing else.
+                _ => return None,
             }
         }
-        // A range answers the List methods as the list of its element. An `Iter` has
-        // its own block in `Builtin.roc`.
-        let module = if module == "Range" && !self.declared_types.contains_key(module) {
-            "List"
-        } else {
-            module
-        };
         // `Numeral`, as `Builtin.roc` declares it for a custom `from_numeral`.
         if module == "Numeral" {
             let numeral = self.nominal_named("Numeral");
@@ -3029,21 +3027,8 @@ impl TypeChecker {
                             // state) -> state` only tells the lambda what `a` is once
                             // the list has said so.
                             //
-                            // Except a range, which answers the List methods without
-                            // being a List — `(1..=100).iter()` reaches `List.iter`.
                             if let Some(first) = params.first() {
-                                match &resolved {
-                                    // A range answers the List methods as the `List` of
-                                    // its element, so unify the first parameter against
-                                    // that — otherwise the element type is thrown away
-                                    // and a range of literals defaults to `Dec` even
-                                    // when the method's own signature would pin it.
-                                    Type::Range(elem) => {
-                                        let as_list = Type::List(elem.clone());
-                                        let _ = self.unify(first, &as_list);
-                                    }
-                                    _ => self.unify(first, &resolved)?,
-                                }
+                                self.unify(first, &resolved)?;
                             }
                             for (arg, declared) in args.iter().zip(params.iter().skip(1)) {
                                 let declared = self.apply(declared);
@@ -3054,6 +3039,20 @@ impl TypeChecker {
                     }
                 }
 
+                // A range has only `Range`'s methods, and none of them matched: roc's
+                // "missing method". Falling through would answer it from the List table.
+                if self.module_named(&resolved) == Some("Range") {
+                    return Err(TypeError {
+                        message: format!(
+                            "A range has no method `{}`: call `.iter()` for an iterator, which has the list-like methods",
+                            method
+                        ),
+                        expected: "Range".to_string(),
+                        actual: method.to_string(),
+                        line: 0,
+                        col: 0,
+                    });
+                }
                 // `negate` keeps its receiver's type; everything else comes from the
                 // shared builtin table.
                 if *method == "negate" {
@@ -4515,13 +4514,7 @@ impl TypeChecker {
         let Some(module) = self.module_named(&ty) else { return Ok(()) };
         if let Some(signature) = self.declared(module, method) {
             if let Some((params, result)) = Self::peel_params(&signature, arity) {
-                match &ty {
-                    // A range answers the List methods as the list of its element.
-                    Type::Range(elem) => {
-                        let _ = self.unify(&params[0], &Type::List(elem.clone()));
-                    }
-                    _ => self.unify(&params[0], &ty)?,
-                }
+                self.unify(&params[0], &ty)?;
                 for (declared, used) in params.iter().zip(shape_params.iter()).skip(1) {
                     self.unify(declared, used)?;
                 }
@@ -4529,7 +4522,7 @@ impl TypeChecker {
             }
         }
         if self.builtin_iter_element(&ty).is_some()
-            || (matches!(module, "List" | "Str" | "Dict" | "Set") || crate::eval::is_numeric_module(module))
+            || (matches!(module, "List" | "Str" | "Dict" | "Set" | "Range") || crate::eval::is_numeric_module(module))
                 && !crate::builtin::declared_names().contains(method)
         {
             return Err(TypeError {
@@ -4761,18 +4754,11 @@ impl TypeChecker {
                     col: 0,
                 })
             }
-            // A RANGE satisfies a `List`: it answers the List methods, `for` walks
-            // either, and `eval::module_for` calls a range a List too. Keeping them
-            // apart would make a function that loops over its argument reject a range.
-            (Type::Range(a), Type::List(b)) | (Type::List(b), Type::Range(a)) => self.unify(a, b),
-
-            // A `Range(num)` nominal iterates as a list of its element, so it satisfies a
-            // `List` or a `..` range by matching its BACKING against the element — not the
-            // whole list, which the generic nominal-vs-other arm below would wrongly try.
-            // This is what lets `mk : U64 -> Range(U64)` accept `0..<n` and a `for` loop
-            // bind the element, while the nominal identity still routes `Range.custom`.
-            (Type::Nominal { name, backing, .. }, Type::List(elem) | Type::Range(elem))
-            | (Type::List(elem) | Type::Range(elem), Type::Nominal { name, backing, .. })
+            // A `Range(num)` nominal is a `..` range, matched by its BACKING against the
+            // element. This is what lets `mk : U64 -> Range(U64)` accept `0..<n`, while
+            // the nominal identity still routes `Range.custom`. Neither is a `List`.
+            (Type::Nominal { name, backing, .. }, Type::Range(elem))
+            | (Type::Range(elem), Type::Nominal { name, backing, .. })
                 if *name == "Range" =>
             {
                 let (backing, elem) = ((**backing).clone(), (**elem).clone());
@@ -5126,9 +5112,10 @@ fn module_of(ty: &Type) -> Option<&'static str> {
         Type::Str => "Str",
         Type::Bool => "Bool",
         Type::List(_) => "List",
-        // A range answers the List methods — `(1..=n).iter().fold(..)` is the idiom —
-        // and `eval::module_for` says the same about the runtime value.
-        Type::Range(_) => "List",
+        // A range answers `Range`'s own methods, not `List`'s: `(1..=n).len()` is roc's
+        // "missing method", and `(1..=n).iter()` is how a range reaches the list-like
+        // methods.
+        Type::Range(_) => "Range",
         // Every integer width is its OWN module: `U8.shl_wrap(200, 1)` is 144 and
         // `I64.shl_wrap(200, 1)` is 400, and the width is what the module name carries
         // to `eval::call_numeric`. The runtime value is one `i128` for all of them.
