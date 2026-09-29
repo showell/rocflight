@@ -13,7 +13,7 @@ Running every gate on every fix takes 20 minutes or more, and that's what slows 
 | Tier | What | Wall time | When |
 |---|---|---|---|
 | 0 | The new test, plus that test file's suite (`cargo test --test types_test`), in debug | seconds | Every edit |
-| 1 | `cargo test`, and `check_roc.sh` on the affected directory | 1–3 min | Every commit |
+| 1 | `cargo test --release --no-fail-fast` (so one failing test binary cannot hide the rest), and `check_roc.sh` on the affected directory | 1–3 min | Every commit |
 | 2 | The all-prs gates: cargo test, check_roc, check_examples, check_artifact, the ported corpus (581), and Fast Track on the interpreter with timings | ~7 min | Once per batch, before anything goes upstream |
 | 3 | ~~The codex-emit gates~~ | | **Deprecated: not run** |
 
