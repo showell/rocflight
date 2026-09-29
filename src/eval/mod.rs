@@ -2339,7 +2339,125 @@ fn call_num_2026_09_27(module: &str, name: &str, args: &[Value]) -> Option<Resul
         _ => None,
     };
     let overflow = || Value::tag("Err", [Value::bare("Overflow")]);
+    let ok = |value: Value| Some(Ok(Value::tag("Ok", [value])));
+    let err = |tag: &'static str| Some(Ok(Value::tag("Err", [Value::bare(tag)])));
+    // A `List(U8)` argument as bytes, whatever shape an untyped numeral gave them.
+    let bytes = |value: &Value| -> Option<Vec<u8>> {
+        match value {
+            Value::List(items) => items.iter().map(|b| as_whole(b).and_then(|b| u8::try_from(b).ok())).collect(),
+            _ => None,
+        }
+    };
+    // Base-10 digits, most significant first, as the text `num_parse` reads; `None` when
+    // any item is not a digit.
+    let digits = |value: &Value| -> Option<String> {
+        let list = bytes(value)?;
+        list.iter().all(|d| *d <= 9).then(|| list.iter().map(|d| char::from(b'0' + d)).collect())
+    };
     match name {
+        // `U16.from_le_bytes(bytes, index)`: the type's width in bytes at `index`,
+        // least significant first, or `Err(OutOfBounds)` past the end.
+        "from_le_bytes" => {
+            let num_parse::Kind::Int { signed, bits } = kind else { return None };
+            let (list, index) = (bytes(args.first()?)?, as_index(args.get(1)?)?);
+            let width = bits as usize / 8;
+            let Some(chunk) = index.checked_add(width).and_then(|end| list.get(index..end)) else {
+                return err("OutOfBounds");
+            };
+            let raw = chunk.iter().rev().fold(0u128, |acc, b| acc << 8 | u128::from(*b));
+            Some(Ok(Value::tag("Ok", [if !signed && bits == 128 {
+                Value::U128(raw)
+            } else if signed && bits < 128 && raw >> (bits - 1) & 1 == 1 {
+                Value::Int(raw as i128 - (1i128 << bits))
+            } else {
+                Value::Int(raw as i128)
+            }])))
+        }
+        // `U64.append_le_bytes_to(value, bytes, count)`: the `count` lowest bytes of the
+        // value appended least significant first; more than it has is `Err(OutOfBounds)`.
+        "append_le_bytes_to" => {
+            let value = as_u128_bits(args.first()?)?;
+            let mut list = bytes(args.get(1)?)?;
+            let count = as_index(args.get(2)?)?;
+            if count > 8 {
+                return err("OutOfBounds");
+            }
+            list.extend((0..count).map(|i| (value >> (8 * i)) as u8));
+            ok(Value::list(list.into_iter().map(|b| Value::Int(i128::from(b))).collect()))
+        }
+        // `from_int_digits([1, 2, 3])` is `Ok(123)`; an item that is not a digit, an
+        // empty list, or a value the type cannot hold is `Err(OutOfRange)`.
+        "from_int_digits" => {
+            let text = digits(args.first()?);
+            match text.filter(|t| !t.is_empty()).and_then(|t| num_parse::parse_whole(kind, t.as_bytes())) {
+                Some(value) => ok(value),
+                None => err("OutOfRange"),
+            }
+        }
+        // `from_dec_digits((integer digits, fractional digits))`, always non-negative.
+        "from_dec_digits" => {
+            let Value::Tuple(parts) = args.first()? else { return None };
+            let (whole, fraction) = (digits(parts.first()?), digits(parts.get(1)?));
+            let text = whole.zip(fraction).and_then(|(w, f)| match (w.is_empty(), f.is_empty()) {
+                (true, true) => None,
+                (_, true) => Some(w),
+                (true, false) => Some(format!("0.{}", f)),
+                (false, false) => Some(format!("{}.{}", w, f)),
+            });
+            match text.and_then(|t| num_parse::parse_whole(kind, t.as_bytes())) {
+                Some(value) => ok(value),
+                None => err("OutOfRange"),
+            }
+        }
+        // `unsigned_is_multiple_of` / `signed_is_multiple_of`: every value is a multiple
+        // of -1, and only 0 is a multiple of 0.
+        "is_multiple_of" => {
+            let num_parse::Kind::Int { signed, bits } = kind else { return None };
+            let answer = if !signed && bits == 128 {
+                let (a, b) = (as_u128_bits(args.first()?)?, as_u128_bits(args.get(1)?)?);
+                if b == 0 { a == 0 } else { a % b == 0 }
+            } else {
+                let (a, b) = (as_whole(args.first()?)?, as_whole(args.get(1)?)?);
+                if b == 0 {
+                    a == 0
+                } else {
+                    b == -1 || a % b == 0
+                }
+            };
+            Some(Ok(Value::Bool(answer)))
+        }
+        // `U8.to(1, 4)` is 1, 2, 3, 4 and `U8.until(1, 4)` is 1, 2, 3: the integer ranges
+        // rocflight already walks.
+        "to" | "until" => match kind {
+            num_parse::Kind::Int { .. } => {
+                let method = if name == "to" { "range_inclusive_to" } else { "range_exclusive_to" };
+                Some(call_builtin_values(module, method, &mut args.to_vec()))
+            }
+            // `Dec.to(1.5, 4.0)` is 1.5, 2.5, 3.5: steps of 1.0 from the start, as
+            // `Builtin.roc` walks it, stopping rather than overflowing at the top.
+            num_parse::Kind::Dec => Some(Ok(Value::Iter(std::rc::Rc::new(lazy::Lazy::Range {
+                at: Value::Dec(as_dec(args.first()?)?),
+                end: Value::Dec(as_dec(args.get(1)?)?),
+                step: Value::Dec(DEC_SCALE),
+                inclusive: name == "to",
+            })))),
+            _ => None,
+        },
+        // The conversions `Builtin.roc` declares on these types that the older numeric
+        // runtime never grew; the other types answer below.
+        "to_dec_try" if matches!(module, "U128" | "I128" | "Dec") => {
+            let scaled = match args.first()? {
+                Value::Dec(d) => Some(*d),
+                Value::U128(n) => i128::try_from(*n).ok().and_then(|n| n.checked_mul(DEC_SCALE)),
+                other => as_whole(other).and_then(|n| n.checked_mul(DEC_SCALE)),
+            };
+            match scaled {
+                Some(d) => ok(Value::Dec(d)),
+                None => err("OutOfRange"),
+            }
+        }
+        "to_f64_wrap" if module == "F64" => Some(Ok(Value::Float(as_f64(args.first()?)?))),
+        "to_f64_try" if module == "F64" => ok(Value::Float(as_f64(args.first()?)?)),
         "from_str" => {
             let Value::Str(text) = args.first()? else { return None };
             Some(Ok(match num_parse::parse_whole(kind, text.as_bytes()) {
@@ -2722,6 +2840,8 @@ pub fn call_builtin_values(
         name,
         "from_str" | "from_str_prefix" | "from_utf8_prefix" | "atan2" | "is_approx_eq" | "round" | "round_try"
             | "floor" | "floor_try" | "ceiling" | "ceiling_try" | "trunc" | "round_to" | "round_to_try"
+            | "from_le_bytes" | "append_le_bytes_to" | "from_int_digits" | "from_dec_digits" | "is_multiple_of"
+            | "to" | "until" | "to_dec_try" | "to_f64_wrap" | "to_f64_try"
     ) {
         if let Some(result) = call_num_2026_09_27(module, name, args) {
             return result;
