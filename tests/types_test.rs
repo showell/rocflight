@@ -1316,3 +1316,70 @@ main! = |_args| {
 "#;
     assert_eq!(run_program(src), Ok(()));
 }
+
+const HANDLER: &str = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+Handler(e) := (e -> Str)
+
+make : Str -> Handler([A, B])
+make = |s| Handler.(|x| match x {
+    A => s
+    B => "b"
+})
+
+run : Handler(e), e -> Str
+run = |Handler.(f), x| f(x)
+
+take : Handler([A, B]) -> Str
+take = |Handler.(f)| f(A)
+"#;
+
+#[test]
+fn a_contravariant_nominal_argument_in_an_output_stays_closed() {
+    // `Handler(e) := (e -> Str)` holds `e` in an input position, so the `[A, B]` of a
+    // RETURNED `Handler([A, B])` is an input: closed, as roc keeps it. Opened, it let
+    // `run(make("a"), C)` through, and the handler's match failed at run time.
+    let src = format!("{}\nmain! = |_args| {{\n    check(run(make(\"a\"), C), \"c\")\n    Ok({{}})\n}}\n", HANDLER);
+    let error = run_program(&src).expect_err("roc rejects C for a Handler([A, B])");
+    assert!(error.contains("[C"), "{}", error);
+    let src = format!("{}\nmain! = |_args| {{\n    check(run(make(\"a\"), A), \"a\")\n    Ok({{}})\n}}\n", HANDLER);
+    assert_eq!(run_program(&src), Ok(()));
+}
+
+#[test]
+fn a_contravariant_nominal_argument_in_an_input_opens() {
+    // An input flips once more: `take : Handler([A, B]) -> Str` accepts a handler of
+    // `[A, B, C]`, as roc does. This was a type error.
+    let src = format!(
+        "{}\nmain! = |_args| {{\n    h : Handler([A, B, C])\n    h = Handler.(|x| match x {{\n        A => \"a\"\n        B => \"b\"\n        C => \"c\"\n    }})\n    check(take(h), \"a\")\n    Ok({{}})\n}}\n",
+        HANDLER
+    );
+    assert_eq!(run_program(&src), Ok(()));
+}
+
+#[test]
+fn a_covariant_nominal_argument_in_an_output_still_opens() {
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+Wrapper(e) := { v : e }
+
+wrap : Str -> Wrapper([A])
+wrap = |_s| Wrapper.({ v: A })
+
+show : Wrapper([A, B]) -> Str
+show = |Wrapper.({ v })| match v {
+    A => "a"
+    B => "b"
+}
+
+main! = |_args| {
+    check(show(wrap("x")), "a")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
