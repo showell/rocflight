@@ -11,7 +11,7 @@ What we have out upstream, and which gates each item's current head passed (tier
 | #1 | `module-imports` | `0dfe7fb` | Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
 | #22 | `fast-track-runs` | `484cf04` | Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
 | #23 | `smaller-fixes` | `d5c4fee` | Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
-| #25 | `node-types` | `15a89d3` | Tier 2 in `all-prs` `8f475fd` | 2026-09-29 | #23 |
+| #25 | `node-types` | `ecb964e` | Tier 2 in `all-prs` `d85405d` | 2026-09-29 | #23 |
 | #27 | `nightly-09-27` | `92dfe53` | branch gates under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
 | #28 | `builtin-09-27` | `222afb5` | branch gates and `check_builtin --strict` under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-29 | #27 |
 | #29 | `json-numbers` | `a3f7d09` | branch gates under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-29 | #28 |
@@ -24,7 +24,8 @@ The work in #28 to #33 is by the cloud Claude, cherry-picked with `-x`.
 
 ## Held here, not yet sent
 
-- **`cloud/h2`** (in progress): H's moves for record-update syntax and tuple elements. It'll be a PR stacked on #31.
+- **`cloud/h2` `75932a9`:** H's moves for record-update syntax and tuple elements. It's for the next batch, then a PR stacked on #31.
+- **`node-types`, uncommitted:** a range answers only `Range`'s methods. It's for the next batch.
 
 ## Issues filed
 
