@@ -798,6 +798,18 @@ fn take_index(slot: &mut Value, i: usize) -> Option<Value> {
     worth_taking(value).then(|| std::mem::replace(value, Value::Unit))
 }
 
+/// `t.i`, as `GetIndex` reads it and as `TakeIndex` does when it cannot move the
+/// element out, so both fail alike. `locate` places the error for a value that is not
+/// a tuple at all; an index past the end is reported as is.
+fn read_index(value: &Value, i: u16, locate: impl FnOnce(EvalError) -> EvalError) -> Result<Value, EvalError> {
+    match value {
+        Value::Tuple(items) => items.get(i as usize).cloned().ok_or_else(|| EvalError {
+            message: format!("Tuple has {} element(s), so .{} is out of range", items.len(), i),
+        }),
+        other => Err(locate(EvalError { message: format!("Cannot index .{} on {}", i, other) })),
+    }
+}
+
 /// A value whose uniqueness is worth keeping: the containers an in-place builtin
 /// changes. A scalar is as cheap to copy as to move.
 fn worth_taking(value: &Value) -> bool {
@@ -1323,14 +1335,7 @@ impl Vm {
                 Op::TakeIndex { dst, obj, i } => {
                     let value = match take_index(&mut regs[base + obj as usize], i as usize) {
                         Some(value) => value,
-                        None => match &regs[base + obj as usize] {
-                            Value::Tuple(items) if (i as usize) < items.len() => items[i as usize].clone(),
-                            other => {
-                                return Err(locate_error(&program, chunk_id, ip, EvalError {
-                                    message: format!("Cannot index .{} on {}", i, other),
-                                }))
-                            }
-                        },
+                        None => read_index(&regs[base + obj as usize], i, |e| locate_error(&program, chunk_id, ip, e))?,
                     };
                     regs[base + dst as usize] = value;
                 }
@@ -1407,22 +1412,7 @@ impl Vm {
                     regs[base + dst as usize] = value;
                 }
                 Op::GetIndex { dst, obj, i } => {
-                    let value = match &regs[base + obj as usize] {
-                        Value::Tuple(items) => {
-                            items.get(i as usize).cloned().ok_or_else(|| EvalError {
-                                message: format!(
-                                    "Tuple has {} element(s), so .{} is out of range",
-                                    items.len(),
-                                    i
-                                ),
-                            })?
-                        }
-                        other => {
-                            return Err(locate_error(&program, chunk_id, ip, EvalError {
-                                message: format!("Cannot index .{} on {}", i, other),
-                            }))
-                        }
-                    };
+                    let value = read_index(&regs[base + obj as usize], i, |e| locate_error(&program, chunk_id, ip, e))?;
                     regs[base + dst as usize] = value;
                 }
 
