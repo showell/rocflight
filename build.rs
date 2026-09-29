@@ -222,9 +222,11 @@ fn check_artifact(source: &str) {
         // parsing. So a missing artifact, or one from an older FORMAT, is a warning and
         // a rebuild away — where a HASH mismatch below is a hard error, because that is
         // the case where the trees no longer describe the source.
-        let mut empty = Vec::from(*b"ROCFLT05");
+        let mut empty = Vec::from(*b"ROCFLT08");
         empty.extend_from_slice(&hash.to_le_bytes());
         empty.extend_from_slice(&0u32.to_le_bytes());
+        // No strings, no compiled prefixes, no signature tables.
+        empty.push(0);
         empty.push(0);
         empty.push(0);
         std::fs::write(path, empty).expect("writing the placeholder artifact");
@@ -237,7 +239,7 @@ fn check_artifact(source: &str) {
             return;
         }
     };
-    if blob.len() < 16 || &blob[..8] != b"ROCFLT05" {
+    if blob.len() < 16 || &blob[..8] != b"ROCFLT08" {
         fresh("the builtin artifact is from an older format");
         return;
     }

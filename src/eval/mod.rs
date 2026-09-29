@@ -33,6 +33,12 @@ thread_local! {
     /// does for the reason roc does it.
     static INSPECTING: std::cell::RefCell<Vec<&'static str>> =
         const { std::cell::RefCell::new(Vec::new()) };
+
+    /// The same for `inspect_as`, with the value each method is showing. There the
+    /// types say which method applies, so only showing the SAME value again is a
+    /// loop: a `Node.to_inspect` that inspects its child `Node`s is not one.
+    static INSPECTING_TYPED: std::cell::RefCell<Vec<(&'static str, Value)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A nominal's own `to_inspect`, if it defines one.
@@ -173,6 +179,23 @@ fn elements(value: Value, name: &str) -> Result<Elements, EvalError> {
     }
 }
 
+/// `min` or `max` of some items, or `Err(empty)`: `List`'s and `Iter`'s differ only
+/// in what they call nothing.
+pub(crate) fn extreme(name: &str, mut items: impl Iterator<Item = Value>, empty: &'static str) -> Value {
+    let Some(mut best) = items.next() else {
+        return Value::tag("Err", [Value::bare(empty)]);
+    };
+    for item in items {
+        let ordering = order_values(&item, &best);
+        if (name == "min" && ordering == Some(std::cmp::Ordering::Less))
+            || (name == "max" && ordering == Some(std::cmp::Ordering::Greater))
+        {
+            best = item;
+        }
+    }
+    Value::tag("Ok", [best])
+}
+
 fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError> {
     let expect = |wanted: usize, got: usize| -> Result<(), EvalError> {
         if wanted == got {
@@ -258,8 +281,14 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             let capacity = if zero_sized { 0 } else if let Value::List(rc) = &args[0] { rc.capacity() } else { 0 };
             Ok(Value::Int(capacity as i128))
         }
-        // `.iter()` and `.collect()` are the identity on what is already a list.
-        "iter" | "collect" => {
+        // `.iter()` gives the iterator, which is `<opaque>` and whose `keep_if` is lazy;
+        // `.collect()` is the identity on what is already a list.
+        "iter" => {
+            expect(1, args.len())?;
+            let list = std::mem::replace(&mut args[0], Value::Unit);
+            Ok(lazy::of(list).map(Value::Iter).expect("a list is iterable"))
+        }
+        "collect" => {
             expect(1, args.len())?;
             Ok(std::mem::replace(&mut args[0], Value::Unit))
         }
@@ -267,7 +296,7 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             expect(1, args.len())?;
             let mut items = as_list(&mut args[0])?;
             items.reverse();
-            Ok(Value::list(items))
+            Ok(lazy::of(Value::list(items)).map(Value::Iter).expect("a list is iterable"))
         }
         "size_hint" => {
             expect(1, args.len())?;
@@ -419,19 +448,7 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
         }
         "min" | "max" => {
             expect(1, args.len())?;
-            let mut items = elements(args[0].clone(), name)?;
-            let Some(mut best) = items.next() else {
-                return Ok(Value::tag("Err", [Value::bare("IterWasEmpty")]));
-            };
-            for item in items {
-                let ordering = order_values(&item, &best);
-                if (name == "min" && ordering == Some(std::cmp::Ordering::Less))
-                    || (name == "max" && ordering == Some(std::cmp::Ordering::Greater))
-                {
-                    best = item;
-                }
-            }
-            Ok(Value::tag("Ok", [best]))
+            Ok(extreme(name, elements(args[0].clone(), name)?, "ListWasEmpty"))
         }
         "sort" | "sort_reversed" | "sort_by" | "sort_by_reversed" | "sort_with" | "sort_with_reversed" => {
             let has_fn = name != "sort" && name != "sort_reversed";
@@ -2908,25 +2925,22 @@ pub fn call_builtin_values(
             // `Iter(a) -> Iter((U64, a))` and nowhere else — so it always produces a
             // lazy iterator, even off a list.
             //
-            // `keep_if`/`drop_if` are here for a worse reason: `Builtin.roc` declares
-            // BOTH `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, and roc
-            // inspects `[1, 2, 3].keep_if(p)` as `[2, 3]` but
-            // `[1, 2, 3].iter().keep_if(p)` as `<opaque>`. Nothing here can tell those
-            // apart, because `.iter()` on a list IS the list at run time — so this path
-            // answers the lazy one for both, and the COMPILER answers the eager one
-            // wherever the checker knows the receiver is a `List` (`Compiler::list_loop`).
-            // What is left divergent is a receiver whose module the checker cannot name,
-            // such as an unannotated `|xs| xs.keep_if(p)`: roc gives a list there and
-            // this gives an iterator. Fixing it needs an `Iter` that is its own value.
-            || matches!(name, "keep_if" | "drop_if" | "with_index")
-            // `concat` and `size_hint` are shared with `List`: lazy only for a range
-            // or an iterator, so `List.concat` of two lists stays an eager list.
-            || (matches!(name, "concat" | "size_hint") && on_lazy_source)
+            || name == "with_index"
+            // The rest are shared with `List`: `Builtin.roc` declares both
+            // `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, the second lazy.
+            // `.iter()` gives a `Value::Iter`, so the receiver says which is meant: a
+            // list's stays an eager list, and a range's or an iterator's is lazy.
+            || (matches!(name, "keep_if" | "drop_if" | "concat" | "size_hint") && on_lazy_source)
             || (name == "from_iter" && on_iter);
         if lazy_method {
             if let Some(result) = lazy::call(name, args) {
                 return result;
             }
+        }
+        // `Iter.single` and `List.single` share a name and nothing else.
+        if module == "Iter" && name == "single" && args.len() == 1 {
+            let item = std::mem::replace(&mut args[0], Value::Unit);
+            return Ok(lazy::of(Value::list(vec![item])).map(Value::Iter).expect("a list is iterable"));
         }
         return call_list_builtin(name, args);
     }
@@ -2973,12 +2987,16 @@ pub fn call_builtin_values(
             }
         }
         ("Str", "inspect") => {
-            if args.len() != 1 {
+            if args.is_empty() || args.len() > 2 {
                 return Err(EvalError {
                     message: format!("Str.inspect expects 1 argument, got {}", args.len()),
                 });
             }
             let val = args[0].clone();
+            // The compiler passes the argument's type, when the checker knew it.
+            if let Some(shape) = args.get(1) {
+                return Ok(str_value(inspect_as(&val, shape)));
+            }
             // A nominal may define `to_inspect` to control how it is shown.
             if let Some(custom) = custom_inspect(&val) {
                 return Ok(custom);
@@ -3503,16 +3521,31 @@ pub fn inspect(value: &Value) -> String {
     {
         return "<opaque>".to_string();
     }
+    render(value, &|_, v| inspect(v))
+}
+
+/// A part of a value that `render` shows by asking its caller.
+pub enum Part<'a> {
+    /// A list's or tuple's element, by position.
+    Item(usize),
+    /// A record's field.
+    Field(&'a str),
+    /// A tag's payload, by position.
+    Payload(usize),
+}
+
+/// A value as roc shows it, each part shown by `part`.
+fn render(value: &Value, part: &dyn Fn(Part, &Value) -> String) -> String {
     match value {
         Value::Str(s) => crate::eval::value::quoted(s),
         Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         Value::Unit => "{}".to_string(),
         Value::List(items) => {
-            let rendered: Vec<String> = items.iter().map(inspect).collect();
+            let rendered: Vec<String> = items.iter().enumerate().map(|(i, v)| part(Part::Item(i), v)).collect();
             format!("[{}]", rendered.join(", "))
         }
         Value::Tuple(items) => {
-            let rendered: Vec<String> = items.iter().map(inspect).collect();
+            let rendered: Vec<String> = items.iter().enumerate().map(|(i, v)| part(Part::Item(i), v)).collect();
             format!("({})", rendered.join(", "))
         }
         Value::Range { .. } => "<opaque>".to_string(),
@@ -3524,18 +3557,101 @@ pub fn inspect(value: &Value) -> String {
             sorted.sort_by(|a, b| a.0.cmp(b.0));
             let rendered: Vec<String> = sorted
                 .iter()
-                .map(|(name, v)| format!("{}: {}", name, inspect(v)))
+                .map(|(name, v)| format!("{}: {}", name, part(Part::Field(name), v)))
                 .collect();
             format!("{{ {} }}", rendered.join(", "))
         }
         Value::Tag(name, args) if args.is_empty() => name.to_string(),
         Value::Tag(name, args) => {
-            let rendered: Vec<String> = args.iter().map(inspect).collect();
+            let rendered: Vec<String> = args.iter().enumerate().map(|(i, v)| part(Part::Payload(i), v)).collect();
             format!("{}({})", name, rendered.join(", "))
         }
         // roc shows every function the same way, whatever its parameters.
         Value::Closure(_) | Value::Builtin(..) => "<function>".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// `inspect`, steered by the value's static TYPE: a nominal's `to_inspect` runs
+/// exactly where the type says that nominal, and nowhere else. roc erases nominals,
+/// so a value alone cannot say it is a `CreditCard :: Str` rather than a plain
+/// `Str`; `inspect` guesses from its shape, and a `Str` fits.
+///
+/// `shape` is the compiler's descriptor of the type (`vm::compile::inspect_shape`).
+/// Where it says nothing -- a type the checker left a variable, in a generic
+/// function -- or disagrees with the value, the value is shown by `inspect`.
+pub fn inspect_as(value: &Value, shape: &Value) -> String {
+    match shape {
+        Value::Tag(kind, parts) if &**kind == "Typed" => match &parts[..] {
+            [root, Value::List(table)] => shown_as(value, root, table),
+            _ => inspect(value),
+        },
+        _ => inspect(value),
+    }
+}
+
+/// `inspect_as` below the top: `table` holds what a `Ref` to a recursive nominal is.
+fn shown_as(value: &Value, shape: &Value, table: &[Value]) -> String {
+    let Value::Tag(kind, parts) = shape else { return inspect(value) };
+    match (&**kind, &parts[..], value) {
+        ("Ref", [Value::Str(name)], _) => {
+            let entry = table.iter().find_map(|e| match e {
+                Value::Tuple(pair) if matches!(&pair[0], Value::Str(n) if n == name) => Some(pair[1].clone()),
+                _ => None,
+            });
+            entry.map_or_else(|| inspect(value), |e| shown_as(value, &e, table))
+        }
+        ("Nominal", [Value::Str(name), Value::Bool(opaque), inner], _) => {
+            let found = crate::vm::method_of(name, "to_inspect").filter(|(qualified, _)| {
+                INSPECTING_TYPED.with(|r| !r.borrow().iter().any(|(q, v)| q == qualified && values_equal(v, value)))
+            });
+            if let Some((qualified, to_inspect)) = found {
+                INSPECTING_TYPED.with(|r| r.borrow_mut().push((qualified, value.clone())));
+                let shown = call_function(to_inspect, vec![value.clone()]);
+                INSPECTING_TYPED.with(|r| {
+                    r.borrow_mut().pop();
+                });
+                if let Ok(Value::Str(shown)) = shown {
+                    return shown.to_string();
+                }
+            }
+            if *opaque {
+                return "<opaque>".to_string();
+            }
+            shown_as(value, inner, table)
+        }
+        ("Plain", [], _) => render(value, &|_, v| inspect(v)),
+        ("List", [element], Value::List(_)) => render(value, &|_, v| shown_as(v, element, table)),
+        ("Tuple", [Value::List(items)], Value::Tuple(values)) if items.len() == values.len() => {
+            render(value, &|p, v| match p {
+                Part::Item(i) => shown_as(v, &items[i], table),
+                _ => inspect(v),
+            })
+        }
+        ("Record", [Value::List(fields)], Value::Record(_)) => render(value, &|p, v| {
+            let declared = match p {
+                Part::Field(name) => fields.iter().find_map(|f| match f {
+                    Value::Tuple(pair) if matches!(&pair[0], Value::Str(n) if &**n == name) => Some(&pair[1]),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            declared.map_or_else(|| inspect(v), |d| shown_as(v, d, table))
+        }),
+        ("Tags", [Value::List(tags)], Value::Tag(tag, _)) => {
+            let payload = tags.iter().find_map(|t| match t {
+                Value::Tuple(pair) if matches!(&pair[0], Value::Str(n) if **n == **tag) => match &pair[1] {
+                    Value::List(ds) => Some(ds.clone()),
+                    _ => None,
+                },
+                _ => None,
+            });
+            render(value, &|p, v| match (p, &payload) {
+                (Part::Payload(i), Some(ds)) if i < ds.len() => shown_as(v, &ds[i], table),
+                _ => inspect(v),
+            })
+        }
+        _ => inspect(value),
     }
 }
 
@@ -3578,8 +3694,8 @@ pub fn run_test_expect(value: &Value) -> Result<(), EvalError> {
 }
 
 /// `dbg value` — to stderr, so it never mixes into a program's output.
-pub fn run_dbg(value: &Value) {
-    report(Report::Dbg, &inspect(value));
+pub fn run_dbg(value: &Value, shape: &Value) {
+    report(Report::Dbg, &inspect_as(value, shape));
 }
 
 /// What a program has to say outside its output: a `dbg`, a failed inline `expect`.
@@ -3688,17 +3804,19 @@ pub fn dispatch_builtin(method: &str, values: &mut [Value]) -> Result<Value, Eva
         message: format!("`{}` was dispatched on nothing", method),
     })?;
     let receiver = receiver.clone();
-    // `.iter()` on something already iterable is the identity. A range STAYS a range:
-    // building the list of its elements cost 190 MB on a two-million-element range, and
-    // every builtin that only walks the elements can walk a range instead. It also
-    // matches roc, which inspects a range as `<opaque>` rather than as a list.
+    // `.iter()` on a list is the iterator over it, which is what keeps `List.keep_if`
+    // and `Iter.keep_if` apart at run time. A range STAYS a range: building the list of
+    // its elements cost 190 MB on a two-million-element range, and every builtin that
+    // only walks the elements can walk a range instead. roc inspects both as `<opaque>`.
     //
     // ponytail: still eager in the sense that `map` over a range builds its output
     // list. Fusing `map` into the consumer needs a real lazy iterator; this removes the
     // ceiling without one.
     if method == "iter" && args.is_empty() {
-        if matches!(receiver, Value::List(_) | Value::Range { .. }) {
-            return Ok(receiver);
+        match receiver {
+            Value::List(_) => return Ok(lazy::of(receiver).map(Value::Iter).expect("a list is iterable")),
+            Value::Range { .. } => return Ok(receiver),
+            _ => {}
         }
     }
 

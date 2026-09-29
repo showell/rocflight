@@ -169,6 +169,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     let mut module_params: Vec<(String, Vec<u32>)> = Vec::new();
     let mut module_defaults: Vec<(String, Vec<(String, crate::ast::Expr)>)> = Vec::new();
     let mut module_where_methods: Vec<String> = Vec::new();
+    let mut module_nominal_literals: Vec<(crate::ast::NodeId, Type)> = Vec::new();
     for (path, exposed) in parser.local_modules() {
         let file = source_dir.join(format!("{}.roc", path));
         let text = std::fs::read_to_string(&file)
@@ -186,6 +187,10 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         // same as the app's: `read : item -> U64 where [item.get : item -> U64]`.
         module_where_methods.extend(module_parser.where_methods());
         module_defaults.extend(module_parser.field_default_exprs().iter().cloned());
+        // A module's own `Code.(c)` is a construction, as the app's is. Without it the
+        // checker saw a value to convert at run time, and in `from_numeral` that
+        // conversion constructs a `Code` again: B-Teague/rocflight#9.
+        module_nominal_literals.extend(module_parser.nominal_literals().iter().cloned());
         module_asts.push((module_ast, type_name, exposed.clone()));
     }
 
@@ -231,6 +236,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     type_checker.allow_dispatch(parser.where_methods());
     type_checker.allow_dispatch(module_where_methods.clone());
     type_checker.declare_nominal_literals(parser.nominal_literals());
+    type_checker.declare_nominal_literals(&module_nominal_literals);
     type_checker.declare_defaults(parser.field_default_exprs());
     type_checker.declare_defaults(&module_defaults);
     type_checker.declare_suffixed_literals(&parser.suffixed_literals());
@@ -240,13 +246,13 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         type_checker.declare_signatures(loaded.signatures.iter().cloned());
         type_checker.declare_nominal_literals(&loaded.nominal_literals);
         for module in &loaded.modules {
-            type_checker.predeclare(&module.ast);
+            type_checker.predeclare(&module.ast)?;
             type_checker.synth(&module.ast)?;
         }
     }
     for (module_ast, type_name, exposed) in &module_asts {
         // Checked first so the app sees the module's names with their real types.
-        type_checker.predeclare(module_ast);
+        type_checker.predeclare(module_ast)?;
         type_checker.synth(module_ast)?;
         // `import Foo exposing [bar]` — the bare name is `Foo.bar`, as the compiler
         // already treats it.
@@ -269,7 +275,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     if let Some(problem) = type_checker.declaration_problems() {
         return Err(format!("Type error: {}", problem).into());
     }
-    type_checker.predeclare(&ast);
+    type_checker.predeclare(&ast)?;
     let inferred = type_checker.synth(&ast)?;
     // A literal that does not fit the type it was given: refused, as roc refuses it.
     if let Some(problem) = type_checker.method_problems() {
@@ -284,7 +290,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     // The platform's entry references the app's `main!`, so it comes after the app.
     for loaded in &platform_loaded {
         if let Some((module, _)) = &loaded.entry {
-            type_checker.predeclare(&module.ast);
+            type_checker.predeclare(&module.ast)?;
             type_checker.synth(&module.ast)?;
         }
     }
@@ -420,6 +426,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         fractional_literals: type_checker.fractional_literals(),
         parse_targets: type_checker.json_parse_targets(),
         collect_targets: type_checker.collect_targets(),
+        inspect_types: type_checker.inspect_types(),
         // Every nominal in scope, the app's and each loaded builtin member's: the VM
         // needs their shapes to tell whose method a value can have meant.
         nominals: builtins

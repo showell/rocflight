@@ -437,8 +437,14 @@ fn reachable(source: &str, selected: &[&str]) -> String {
 ///
 /// All ten parsing members are verified to seed cleanly, with the golden pairs and the
 /// examples green on any combination of them, so widening this is one edit whenever the
-/// long tail beyond these four is worth its parse.
-const TYPED_MEMBERS: &[&str] = &["Dict", "Set", "Str", "List"];
+/// long tail beyond these is worth its parse. `Iter` is here because an iterator is
+/// its own type: its methods are its block's, not `List`'s.
+const TYPED_MEMBERS: &[&str] = &["Dict", "Set", "Str", "List", "Iter"];
+
+/// The numeric types, whose signatures are all in the one `Num` member:
+/// `U8.from_utf8_prefix` is declared inside `Num :: {}.{ U8 :: [].{ … } }`.
+const NUMERIC_MODULES: &[&str] =
+    &["U8", "I8", "U16", "I16", "U32", "I32", "U64", "I64", "U128", "I128", "Dec", "F32", "F64"];
 
 /// The `Type.method` signatures for one module, parsed on FIRST USE and kept.
 ///
@@ -467,13 +473,24 @@ pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Ty
     // Checked before the cache, because the checker asks this of EVERY qualified name
     // it meets and most of them are not a member at all. Taking a lock to be told so
     // is the sort of cost that only shows up in a benchmark.
-    if !TYPED_MEMBERS.contains(&module) {
+    let numeric = NUMERIC_MODULES.contains(&module);
+    if !TYPED_MEMBERS.contains(&module) && !numeric {
         return &[];
     }
     let cache = CACHE.get_or_init(Default::default);
 
     if let Some(found) = cache.lock().expect("signature cache").get(module) {
         return found;
+    }
+    if numeric {
+        let table: Box<[(&'static str, crate::types::Type)]> =
+            match artifact().and_then(|a| a.signature_table(module)) {
+                Some(found) => found.into_boxed_slice(),
+                None => numeric_signatures(module),
+            };
+        let table: &'static [(&'static str, crate::types::Type)] = Box::leak(table);
+        cache_signatures(module, table);
+        return table;
     }
     // The artifact holds these already, parsed at build time with the whole member in
     // scope — which is strictly more than the annotations-only re-parse below sees.
@@ -549,7 +566,40 @@ pub fn seed_signatures(loaded: &[Loaded]) {
     }
 }
 
+/// The signature tables `gen-artifact` writes: one per numeric type.
+pub fn signature_tables() -> Vec<(&'static str, Box<[(&'static str, crate::types::Type)]>)> {
+    NUMERIC_MODULES.iter().map(|module| (*module, numeric_signatures(module))).collect()
+}
+
+/// `module`'s signatures, out of `Num`.
+fn numeric_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
+    let prefix = format!("{}.", module);
+    num_signatures().iter().filter(|(name, _)| name.starts_with(&prefix)).cloned().collect()
+}
+
+/// Every numeric type's signatures, parsed out of `Num` once for all thirteen.
+fn num_signatures() -> &'static [(&'static str, crate::types::Type)] {
+    static PARSED: std::sync::OnceLock<Box<[(&'static str, crate::types::Type)]>> =
+        std::sync::OnceLock::new();
+    PARSED.get_or_init(|| {
+        let mut step = std::time::Instant::now();
+        let parsed = parse_member_signatures("Num", |_| true);
+        crate::tick("signatures_for(Num)", &mut step);
+        parsed
+    })
+}
+
 fn parse_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
+    // One `Module.` prefix, not one per signature: `Num` declares 828 of them.
+    let prefix = format!("{}.", module);
+    parse_member_signatures(module, |name| name.starts_with(&prefix))
+}
+
+/// The annotations of member `module`, parsed, keeping the names `keep` accepts.
+fn parse_member_signatures(
+    module: &str,
+    keep: impl Fn(&str) -> bool,
+) -> Box<[(&'static str, crate::types::Type)]> {
     let Some(slice) = MEMBERS.iter().find(|s| s.name == module) else { return Box::new([]) };
     // `Set(item) :: Dict(item, {})` — so `Set`'s own signatures only carry their
     // element type if `Dict` is a known parameterised nominal while they are parsed.
@@ -573,12 +623,10 @@ fn parse_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
     if parser.parse_expr().is_err() {
         return Box::new([]);
     }
-    // One `Module.` prefix, not one per signature: `Num` declares 828 of them.
-    let prefix = format!("{}.", module);
     parser
         .signatures()
         .iter()
-        .filter(|(name, _)| name.starts_with(&prefix))
+        .filter(|(name, _)| keep(name))
         .map(|(name, ty)| (*name, normalise(ty)))
         .collect()
 }
@@ -647,7 +695,7 @@ fn annotations_only<'a>(lines: impl Iterator<Item = &'a str>) -> String {
 fn normalise(ty: &crate::types::Type) -> crate::types::Type {
     use crate::types::Type;
     match ty {
-        Type::Nominal { name, backing } => match *name {
+        Type::Nominal { name, backing, args } => match *name {
             "Str" => Type::Str,
             "Bool" => Type::Bool,
             "U8" => Type::U8, "U16" => Type::U16, "U32" => Type::U32,
@@ -658,7 +706,7 @@ fn normalise(ty: &crate::types::Type) -> crate::types::Type {
             // `List(_item) :: [ProvidedByCompiler]` erases the element, so the most
             // that can be said is "a list of something".
             "List" => Type::List(Box::new(Type::TypeVar(u32::MAX))),
-            _ => Type::Nominal { name: *name, backing: Box::new(normalise(backing)) },
+            _ => Type::Nominal { name: *name, backing: Box::new(normalise(backing)), args: args.iter().map(normalise).collect() },
         },
         Type::Function(a, b) => {
             Type::Function(Box::new(normalise(a)), Box::new(normalise(b)))
@@ -670,12 +718,13 @@ fn normalise(ty: &crate::types::Type) -> crate::types::Type {
             fields: fields.iter().map(|(f, t)| (*f, normalise(t))).collect(),
             open: *open,
         },
-        Type::TagUnion { tags, open } => Type::TagUnion {
+        Type::TagUnion { tags, open, row } => Type::TagUnion {
             tags: tags
                 .iter()
                 .map(|(t, args)| (*t, args.iter().map(normalise).collect()))
                 .collect(),
             open: *open,
+            row: *row,
         },
         other => other.clone(),
     }

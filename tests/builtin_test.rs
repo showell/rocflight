@@ -280,6 +280,7 @@ fn run_with(src: &str, builtins: &[&str]) -> Result<String, String> {
         fractional_literals: checker.fractional_literals(),
         parse_targets: checker.json_parse_targets(),
         collect_targets: checker.collect_targets(),
+        inspect_types: checker.inspect_types(),
         f32_literals: checker.f32_literals(),
         u128_literals: checker.u128_literals(),
         default_sites: checker.default_sites(),
@@ -394,12 +395,10 @@ fn a_builtin_checks_its_arguments_too() {
         err
     );
 
-    // What it does NOT do yet: a nominal's type ARGUMENTS are dropped, so `Dict(Str,
-    // U64)` and `Dict(I64, Bool)` are one type here and an element's type is still a
-    // variable. Inserting a Str into a `Set(U64)` is therefore accepted. Carrying the
-    // arguments needs a parameterised nominal in `Type`; this records the gap so that
-    // closing it has a test to flip.
-    assert_eq!(type_of("s : Set(U64)\ns = Set.empty()\n\ns.insert(\"not a number\")"), "Set");
+    // A nominal's type ARGUMENTS count: `Set(U64)` is not `Set(Str)`, so a Str
+    // inserted into a `Set(U64)` is rejected, as roc rejects it.
+    let err = type_error("s : Set(U64)\ns = Set.empty()\n\ns.insert(\"not a number\")");
+    assert!(err.contains("Str") && err.contains("U64"), "the mismatch should name both sides: {}", err);
 }
 
 #[test]

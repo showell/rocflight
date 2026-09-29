@@ -454,7 +454,7 @@ mod tests {
     fn union_ty(tags: &[(&str, &[Type])]) -> Type {
         let mut tags: Vec<(&'static str, Vec<Type>)> = tags.iter().map(|(n, a)| (crate::memory::string_pool::intern(n), a.to_vec())).collect();
         tags.sort_by(|a, b| a.0.cmp(&b.0));
-        Type::TagUnion { tags, open: false }
+        Type::TagUnion { tags, open: false, row: None }
     }
 
     fn list(item: Type) -> Type {
@@ -628,7 +628,7 @@ mod tests {
             &ty,
         );
         // `Try({}, [Exit(I32), ..])`: the single-tag error union is bare.
-        let exit = Type::TagUnion { tags: vec![("Exit".into(), vec![Type::I32])], open: true };
+        let exit = Type::TagUnion { tags: vec![("Exit".into(), vec![Type::I32])], open: true, row: None };
         let ty = union_ty(&[("Ok", &[Type::Unit]), ("Err", &[exit])]);
         let bytes = round_trip(Value::tag("Err", [Value::tag("Exit", [Value::Int(3)])]), &ty);
         assert_eq!((&bytes[..4], bytes[4]), (&3i32.to_le_bytes()[..], 0));

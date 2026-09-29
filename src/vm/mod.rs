@@ -368,7 +368,8 @@ pub enum Op {
     /// there; a normal run does not compile it at all.
     TestExpect { cond: Reg },
     /// `dbg value`, to stderr.
-    Dbg { src: Reg },
+    /// `shape`: the value's type as `eval::inspect_as` reads it, `{}` if unknown.
+    Dbg { src: Reg, shape: Reg },
     /// `crash message`. Always an error.
     Crash { src: Reg },
 
@@ -587,6 +588,20 @@ pub fn method_by_name(module: &str, method: &str) -> Option<Value> {
     .flatten()
 }
 
+/// A nominal's own method by its owner's name, `Color.to_inspect`: for a caller that
+/// knows from the TYPE which nominal a value is, where `methods_named` guesses from
+/// its shape.
+/// Answers the method's qualified name with it.
+pub fn method_of(owner: &str, method: &str) -> Option<(&'static str, Value)> {
+    with_running(|program| {
+        program.methods_by_name.get(method)?.iter().find_map(|(qualified, chunk)| {
+            let of = qualified.strip_suffix(method)?.strip_suffix('.')?;
+            (of == owner).then(|| (*qualified, Value::Closure(Rc::clone(&program.chunks[*chunk as usize].bare))))
+        })
+    })
+    .flatten()
+}
+
 /// Is `value` exactly the shape of a nominal the running program declared opaque?
 ///
 /// Asked for every record, tag and tuple `Str.inspect` renders, nested ones included,
@@ -664,7 +679,7 @@ pub fn shape_of(ty: &crate::types::Type) -> NominalShape {
             NominalShape::Fields(fields.iter().map(|(name, ty)| ((*name).to_string(), FieldKind::of(ty))).collect())
         }
         Type::Tuple(items) => NominalShape::Tuple(items.len()),
-        Type::Nominal { name, backing } => match crate::eval::simd_kind(name) {
+        Type::Nominal { name, backing, .. } => match crate::eval::simd_kind(name) {
             Some(kind) => NominalShape::Simd(kind),
             None => shape_of(backing),
         },
@@ -1630,7 +1645,7 @@ impl Vm {
                 Op::TestExpect { cond } => {
                     crate::eval::run_test_expect(&regs[base + cond as usize]).map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                 }
-                Op::Dbg { src } => crate::eval::run_dbg(&regs[base + src as usize]),
+                Op::Dbg { src, shape } => crate::eval::run_dbg(&regs[base + src as usize], &regs[base + shape as usize]),
                 Op::Crash { src } => {
                     return Err(locate_error(
                         &program,
@@ -1753,6 +1768,14 @@ fn iter_step(
             return Err(EvalError { message: format!("vm: loop counter held {}", other) })
         }
     };
+    // A nominal iterable — a record or tag with an `iter` method — is turned into its
+    // iterator once, in place, then looped. First, because what `iter` gives may be
+    // the lazy iterator below.
+    if matches!(&regs[base + iter as usize], Value::Record(_) | Value::Tag(..)) {
+        if let Some(iterated) = call_iter_method(program, &regs[base + iter as usize])? {
+            regs[base + iter as usize] = iterated;
+        }
+    }
     // A lazy iterator carries its own state, not an index: step it, skipping past
     // `Skip`s, and write the rest back for next time.
     //
@@ -1785,13 +1808,6 @@ fn iter_step(
                 on_item
             }
         });
-    }
-    // A nominal iterable — a record or tag with an `iter` method — is turned into its
-    // iterator once, in place, then looped.
-    if matches!(&regs[base + iter as usize], Value::Record(_) | Value::Tag(..)) {
-        if let Some(iterated) = call_iter_method(program, &regs[base + iter as usize])? {
-            regs[base + iter as usize] = iterated;
-        }
     }
     let next = match &regs[base + iter as usize] {
         Value::Range { start, end, inclusive, step } => {

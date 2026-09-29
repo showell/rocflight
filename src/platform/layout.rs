@@ -224,7 +224,7 @@ fn layout_at(ty: &Type, decls: &Declarations, depth: u32) -> Result<Layout, Stri
             }
             union(variants)
         }
-        Type::Nominal { name, backing } => {
+        Type::Nominal { name, backing, .. } => {
             if *name == "Box" {
                 Layout { size: WORD, align: WORD, class: Class::Pointer, shape: Shape::Box }
             } else if matches!(**backing, Type::TypeVar(u32::MAX)) {
@@ -313,7 +313,7 @@ mod tests {
         let mut tags: Vec<(&'static str, Vec<Type>)> =
             tags.iter().map(|(n, a)| (crate::memory::string_pool::intern(n), a.to_vec())).collect();
         tags.sort_by(|a, b| a.0.cmp(&b.0));
-        Type::TagUnion { tags, open: false }
+        Type::TagUnion { tags, open: false, row: None }
     }
 
     fn record(fields: &[(&str, Type)]) -> Type {
@@ -375,7 +375,7 @@ mod tests {
         // ORACLE: size_of::<RocStr>() == 3 * size_of::<usize>().
         assert_eq!((lay(&Type::Str).size, lay(&Type::Str).align), (24, 8));
         assert_eq!((lay(&list(Type::U8)).size, lay(&list(Type::U8)).align), (24, 8));
-        let boxed = Type::Nominal { name: "Box".into(), backing: Box::new(Type::TypeVar(u32::MAX)) };
+        let boxed = Type::Nominal { name: "Box".into(), backing: Box::new(Type::TypeVar(u32::MAX)), args: Vec::new() };
         assert_eq!((lay(&boxed).size, lay(&boxed).shape), (8, Shape::Box));
         assert_eq!(lay(&Type::Unit).size, 0);
         assert_eq!(lay(&Type::I32).size, 4);
@@ -476,7 +476,7 @@ mod tests {
     fn main_result_is_8_bytes() {
         // Rule-derived: `Try({}, [Exit(I32), ..])`. One error tag needs no
         // discriminant, so the error IS its I32; the Try is 4 + 1, rounded to 8.
-        let err = Type::TagUnion { tags: vec![("Exit".into(), vec![Type::I32])], open: true };
+        let err = Type::TagUnion { tags: vec![("Exit".into(), vec![Type::I32])], open: true, row: None };
         assert_eq!((lay(&err).size, lay(&err).align), (4, 4));
         assert!(matches!(lay(&err).shape, Shape::TagUnion { disc_size: 0, .. }));
         let l = lay(&try_ty(Type::Unit, err));
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn a_declared_name_resolves_through_the_platform() {
-        let named = Type::Nominal { name: "IOErr".into(), backing: Box::new(Type::TypeVar(u32::MAX)) };
+        let named = Type::Nominal { name: "IOErr".into(), backing: Box::new(Type::TypeVar(u32::MAX)), args: Vec::new() };
         let decls = Declarations::new([("IOErr".to_string(), io_err())]);
         assert_eq!(layout_of(&named, &decls).unwrap(), lay(&io_err()));
         assert!(layout_of(&named, &Declarations::default()).unwrap_err().contains("IOErr"));

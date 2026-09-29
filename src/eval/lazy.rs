@@ -52,6 +52,8 @@ pub enum Lazy {
     StepBy { inner: Rc<Lazy>, step: u64, skip: u64 },
     Concat { first: Rc<Lazy>, second: Rc<Lazy> },
     Take { inner: Rc<Lazy>, n: u64 },
+    /// `drop_first`: each of the first `n` items is a Skip, as in roc's.
+    Drop { inner: Rc<Lazy>, n: u64 },
 }
 
 fn rc(l: Lazy) -> Rc<Lazy> {
@@ -271,6 +273,13 @@ impl Lazy {
                 Made::Skip => Ok(Made::Skip),
                 Made::One => Ok(Made::One),
             },
+            Lazy::Drop { inner, n } => match Rc::make_mut(inner).advance(out)? {
+                Made::One if *n > 0 => {
+                    *n -= 1;
+                    Ok(Made::Skip)
+                }
+                made => Ok(made),
+            },
             Lazy::Take { inner, n } => {
                 if *n == 0 {
                     return Ok(Made::Done);
@@ -302,6 +311,10 @@ impl Lazy {
             Lazy::Concat { first, second } => match (first.hint(), second.hint()) {
                 (Hint::Known(a), Hint::Known(b)) => Hint::Known(a.saturating_add(b)),
                 _ => Hint::Unknown,
+            },
+            Lazy::Drop { inner, n } => match inner.hint() {
+                Hint::Known(m) => Hint::Known(m.saturating_sub(*n)),
+                Hint::Unknown => Hint::Unknown,
             },
             Lazy::Take { inner, n } => match inner.hint() {
                 Hint::Known(m) => Hint::Known(m.min(*n)),
@@ -403,6 +416,18 @@ pub fn call(name: &str, args: &mut [Value]) -> Option<Result<Value, EvalError>> 
             Some(n) => Ok(Value::Iter(rc(Lazy::Take { inner: iter, n: n as u64 }))),
             None => Ok(Value::Iter(iter)),
         },
+        "drop_first" => match super::as_index(args.get(1).unwrap_or(&Value::Unit)) {
+            Some(n) => Ok(Value::Iter(rc(Lazy::Drop { inner: iter, n: n as u64 }))),
+            None => Ok(Value::Iter(iter)),
+        },
+        // One item before or after: a concatenation with a one-item iterator.
+        "prepended" | "append" => {
+            let one = rc(Lazy::List(Rc::new(vec![args.get(1).cloned().unwrap_or(Value::Unit)]), 0));
+            let (first, second) = if name == "prepended" { (one, iter) } else { (iter, one) };
+            Ok(Value::Iter(rc(Lazy::Concat { first, second })))
+        }
+        // Terminal, so every item is walked anyway: the List answer over them.
+        "min" | "max" => materialize(&iter).map(|items| super::extreme(name, items.into_iter(), "IterWasEmpty")),
         "concat" => match args.get(1).cloned().and_then(of) {
             Some(second) => Ok(Value::Iter(rc(Lazy::Concat { first: iter, second }))),
             None => Err(EvalError { message: "Iter.concat needs two iterators".to_string() }),
@@ -415,10 +440,16 @@ pub fn call(name: &str, args: &mut [Value]) -> Option<Result<Value, EvalError>> 
             fold(&iter, init, f)
         }
         "collect" | "to_list" | "from_iter" => materialize(&iter).map(Value::list),
-        "sum" | "product" => {
-            let (start, op) = if name == "sum" { (0, BinOp::Add) } else { (1, BinOp::Mul) };
-            fold_native(&iter, Value::Int(start), |acc, x| apply_binop(op, &acc, &x))
-        }
+        "sum" => fold_native(&iter, Value::Int(0), |acc, x| apply_binop(BinOp::Add, &acc, &x)),
+        // A `Try`, starting from the first item, as `Builtin.roc`'s is.
+        "product" => materialize(&iter).and_then(|items| {
+            let mut items = items.into_iter();
+            let Some(first) = items.next() else {
+                return Ok(Value::tag("Err", [Value::bare("IterWasEmpty")]));
+            };
+            let product = items.try_fold(first, |acc, x| apply_binop(BinOp::Mul, &acc, &x))?;
+            Ok(Value::tag("Ok", [product]))
+        }),
         "len" => materialize(&iter).map(|v| Value::Int(v.len() as i128)),
         _ => return None,
     })

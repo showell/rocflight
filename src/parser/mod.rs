@@ -644,10 +644,9 @@ impl Parser {
         // every signature the file declares would arrive less precise than the types
         // rocflight already has.
         //
-        // `Iter` is the exception: rocflight maps `Iter(a)` to `List(a)` for the
-        // builtin iterator, but a program may declare its OWN `Iter` record type, and
-        // then that record — with its `next` field and method block — is what the
-        // annotation means, not a list.
+        // `Iter` is the exception: a program may declare its OWN `Iter` record type,
+        // and then that record — with its `next` field and method block — is what the
+        // annotation means, not the builtin iterator.
         if !(name == "Iter" && self.nominal("Iter").is_some()) {
             if let Some(builtin) = builtin_type(name, &mut args, || Type::TypeVar(u32::MAX)) {
                 return Ok(builtin);
@@ -674,15 +673,18 @@ impl Parser {
                 self.check_extension(name, &nominal, &pairs);
 
                 // The recursive reference inside the body — the `ConsList(a)` of
-                // `ConsList(a) := [Nil, Cons(a, ConsList(a))]` — is a placeholder whose
-                // arguments were dropped when the declaration was parsed, and the
-                // declaration is parsed ONCE, so every instantiation shared that one
-                // variable: unifying `ConsList(ConsList(I64))`'s tail bound the inner
-                // `ConsList(I64)`'s tail to the same thing. One fresh variable per
-                // INSTANTIATION keeps the two apart while the tails within a single
-                // instantiation stay identical — which is what lets a recursive type
-                // compare equal to itself instead of tripping the occurs check.
-                return Ok(substitute_type_vars(&nominal, &pairs));
+                // `ConsList(a) := [Nil, Cons(a, ConsList(a))]` — is a placeholder,
+                // with no backing to put the arguments in, so it keeps them: the
+                // checker's `expand` puts them in place of the declaration's
+                // parameters. Kept on a declared nominal too, as written -- but only
+                // on the nominal NAMED: an alias's body (`Swap(a, b) : P(b, a)`)
+                // already carries its own arguments, substituted.
+                return Ok(match substitute_type_vars(&nominal, &pairs) {
+                    Type::Nominal { name: n, backing, args: own } if own.is_empty() && same_name(n, name) => {
+                        Type::Nominal { name: n, backing, args }
+                    }
+                    other => other,
+                });
             }
         }
 
@@ -819,6 +821,9 @@ impl Parser {
         self.pos += 1; // Skip '['
         let mut tags: Vec<(&'static str, Vec<Type>)> = Vec::new();
         let mut open = false;
+        // A NAMED extension, `..others`, is the union's row: every `..others` in the
+        // signature is the same one.
+        let mut row = None;
 
         loop {
             self.skip_whitespace();
@@ -843,6 +848,7 @@ impl Parser {
                         self.pos += rest.len() - remaining.len();
                         let id = self.annotation_var(name);
                         self.pending_extension = Some((id, false));
+                        row = Some(id);
                         self.skip_whitespace();
                         if self.input[self.pos..].starts_with(',') {
                             self.pos += 1;
@@ -904,7 +910,7 @@ impl Parser {
         }
 
         tags.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(Type::TagUnion { tags, open })
+        Ok(Type::TagUnion { tags, open, row })
     }
 
     /// Skip spaces and tabs but NOT newlines.
@@ -1137,7 +1143,7 @@ impl Parser {
         let slot = self.nominals.len();
         self.nominals.push((
             name_owned,
-            Type::Nominal { name: name_owned, backing: Box::new(Type::TypeVar(u32::MAX)) },
+            Type::Nominal { name: name_owned, backing: Box::new(Type::TypeVar(u32::MAX)), args: Vec::new() },
         ));
         match self.parse_type_operand() {
             Ok(backing) => {
@@ -1146,7 +1152,7 @@ impl Parser {
                 }
                 self.nominals[slot] = (
                     name_owned,
-                    Type::Nominal { name: name_owned, backing: Box::new(backing) },
+                    Type::Nominal { name: name_owned, backing: Box::new(backing), args: Vec::new() },
                 );
                 // Defaults belong to THIS nominal; clear the scratch list so the next
                 // declaration starts empty.
@@ -5481,7 +5487,10 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
                 position: 0,
             })? as i128;
             let value = if is_negative { -value } else { value };
-            return Ok((&input[next..], Expr::Int(value, crate::ast::fresh_node_unlocated())));
+            // A type suffix, as on a decimal: `0x1234.U64`. Left unread, it reached
+            // the checker as a field access on a numeral, so `0x1234.U64.is_multiple_of(2)`
+            // dispatched on a `Dec`.
+            return Ok(integer_with_suffix(&input[next..], value, crate::ast::fresh_node_unlocated()));
         }
     }
 
@@ -5587,10 +5596,15 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
     let node = crate::ast::fresh_node_unlocated();
     NUMERAL_TEXT.with(|t| t.borrow_mut().push((node, signed_text(is_negative, &number))));
 
-    // An integer type suffix, e.g. `255.U8`. The VALUE is unchanged — one integer
-    // representation — but the TYPE is not: a suffixed literal is not a numeral waiting
-    // to be defaulted, it has already been told what it is.
-    let remaining = &input[pos..];
+    Ok(integer_with_suffix(&input[pos..], value, node))
+}
+
+/// An integer literal's node, with its type suffix if one follows: `255.U8`.
+///
+/// The VALUE is unchanged — one integer representation — but the TYPE is not: a
+/// suffixed literal is not a numeral waiting to be defaulted, it has already been told
+/// what it is.
+fn integer_with_suffix(remaining: &str, value: i128, node: crate::ast::NodeId) -> (&str, Expr) {
     if remaining.starts_with('.') {
         let after = &remaining[1..];
         for suffix in [
@@ -5606,23 +5620,15 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
                         OVERFLOWED_NODES.with(|o| o.borrow_mut().push(node));
                     }
                     return if suffix.starts_with('F') || suffix == "Dec" {
-                        Ok((
-                            rest,
-                            Expr::Float(
-                                value as f64,
-                                value.saturating_mul(crate::eval::DEC_SCALE),
-                                node,
-                            ),
-                        ))
+                        (rest, Expr::Float(value as f64, value.saturating_mul(crate::eval::DEC_SCALE), node))
                     } else {
-                        Ok((rest, Expr::Int(value, node)))
+                        (rest, Expr::Int(value, node))
                     };
                 }
             }
         }
     }
-
-    Ok((remaining, Expr::Int(value, node)))
+    (remaining, Expr::Int(value, node))
 }
 
 fn signed_text(is_negative: bool, number: &str) -> String {
@@ -5803,9 +5809,10 @@ fn substitute_type_vars(ty: &Type, pairs: &[(u32, Type)]) -> Type {
             .unwrap_or_else(|| ty.clone()),
         Type::List(inner) => Type::List(Box::new(substitute_type_vars(inner, pairs))),
         Type::Optional(inner) => Type::Optional(Box::new(substitute_type_vars(inner, pairs))),
-        Type::Nominal { name, backing } => Type::Nominal {
+        Type::Nominal { name, backing, args } => Type::Nominal {
             name: *name,
             backing: Box::new(substitute_type_vars(backing, pairs)),
+            args: args.iter().map(|t| substitute_type_vars(t, pairs)).collect(),
         },
         // `open` is carried: `R(x) : { a : I64, ..x }` applied to anything produced a
         // CLOSED `{ a : I64 }`, so the extension's own fields were then rejected.
@@ -5823,36 +5830,48 @@ fn substitute_type_vars(ty: &Type, pairs: &[(u32, Type)]) -> Type {
             Box::new(substitute_type_vars(a, pairs)),
             Box::new(substitute_type_vars(b, pairs)),
         ),
-        Type::TagUnion { tags, open } => Type::TagUnion {
-            tags: tags
+        Type::TagUnion { tags, open, row } => {
+            let mut tags: Vec<(&'static str, Vec<Type>)> = tags
                 .iter()
                 .map(|(n, ts)| {
                     (*n, ts.iter().map(|t| substitute_type_vars(t, pairs)).collect())
                 })
-                .collect(),
-            open: *open,
-        },
+                .collect();
+            // An extension parameter, `T(x) : [A, ..x]`, applied: its argument's tags
+            // join the union, and its row or its closedness is the union's.
+            match row.and_then(|r| pairs.iter().find(|(p, _)| *p == r)).map(|(_, t)| t) {
+                Some(Type::TagUnion { tags: more, open, row }) => {
+                    tags.extend(more.iter().filter(|(n, _)| !tags.iter().any(|(m, _)| m == n)).cloned().collect::<Vec<_>>());
+                    tags.sort_by(|a, b| a.0.cmp(&b.0));
+                    Type::TagUnion { tags, open: *open, row: *row }
+                }
+                Some(Type::TypeVar(v)) => Type::TagUnion { tags, open: true, row: Some(*v) },
+                _ => Type::TagUnion { tags, open: *open, row: *row },
+            }
+        }
         other => other.clone(),
     }
 }
 
+/// Two spellings of one nominal: `Mod.Name` and `Name`.
+fn same_name(a: &str, b: &str) -> bool {
+    a == b || a.rsplit('.').next() == b.rsplit('.').next()
+}
+
 fn named_type(name: &str, args: Vec<Type>, fresh: impl FnMut() -> Type) -> Type {
     let mut args = args;
-    // `unwrap_or_ELSE`: the fallback was built eagerly, so every type atom in the file
-    // allocated a `String` for its name and a `Box` for a placeholder backing, and then
-    // threw both away the moment `builtin_type` answered — which for `I64`, `Str`,
-    // `List` and friends is every time.
-    builtin_type(name, &mut args, fresh).unwrap_or_else(||
-        // Every other name is a TYPE, not an unknown: a user's own nominal has already
-        // been resolved by its declaration before this is reached. Answering a fresh
-        // variable threw the name away, which is what left `fruit_dict : Dict(Str, U64)`
-        // with no type at all and `fruit_dict.get(k)` with nothing to dispatch on.
-        //
-        // ponytail: the arguments are dropped — `Dict(Str, U64)` and `Dict(I64, Bool)`
-        // are the same type here. The NAME is what dispatch needs; carrying the
-        // arguments needs a parameterised type, and nothing yet asks for one.
-        Type::Nominal { name: string_pool::intern(name), backing: Box::new(Type::TypeVar(u32::MAX)) },
-    )
+    if let Some(builtin) = builtin_type(name, &mut args, fresh) {
+        return builtin;
+    }
+    // Every other name is a TYPE, not an unknown: a user's own nominal has already
+    // been resolved by its declaration before this is reached. Answering a fresh
+    // variable threw the name away, which is what left `fruit_dict : Dict(Str, U64)`
+    // with no type at all and `fruit_dict.get(k)` with nothing to dispatch on.
+    //
+    // The arguments are kept: `Step(a)` named before `Step` is declared is `Step` at
+    // `a`, which the checker's `expand` puts in place of the declaration's
+    // parameters once it knows them.
+    Type::Nominal { name: string_pool::intern(name), backing: Box::new(Type::TypeVar(u32::MAX)), args }
 }
 
 /// The types Roc names and rocflight models directly. `None` for anything else.
@@ -5885,17 +5904,16 @@ fn builtin_type(name: &str, args: &mut Vec<Type>, mut fresh: impl FnMut() -> Typ
         // A boxed value is the value here — `Box.box` and `Box.unbox` are the identity
         // at run time — so `Box(I64 -> I64)` types as the function it holds.
         ("Box", 1) => args.pop().expect("arity 1"),
-        // An iterator is walked with the List methods, so it IS the list it behaves
-        // like here. As a nameless nominal its element was dropped, and a lambda
-        // handed to `.iter().map(..)` was checked against nothing — `x * 2` never
-        // learnt it was an I64 and printed `4.0`.
-        ("Iter", 1) => Type::List(Box::new(args.pop().expect("arity 1"))),
+        // An iterator is its own type, with the `Iter` block's methods: its element is
+        // its argument, so a lambda handed to `.iter().map(..)` learns what it is given.
+        ("Iter", 1) => Type::iter(args.pop().expect("arity 1")),
         // `Range(num)` over a third-party numeric type keeps its element in the backing,
         // so `range : Range(Distance)` pins the numbers inside a `Range.custom` config
         // to `Distance`. rocflight's own integer ranges never write the name.
         ("Range", 1) => Type::Nominal {
             name: "Range",
             backing: Box::new(args.pop().expect("arity 1")),
+            args: Vec::new(),
         },
         ("Try", 2) => {
             // `pop` takes from the END, so the error type comes off first.
@@ -5905,6 +5923,7 @@ fn builtin_type(name: &str, args: &mut Vec<Type>, mut fresh: impl FnMut() -> Typ
             Type::TagUnion {
                 tags: vec![("Err", vec![err]), ("Ok", vec![ok])],
                 open: false,
+                row: None,
             }
         }
         _ => return None,
