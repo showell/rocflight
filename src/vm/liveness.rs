@@ -66,6 +66,9 @@ pub fn mark_takes(code: &mut [Op], n_regs: u16, names: &[&str]) -> Vec<(Vec<Reg>
             {
                 code[ip] = Op::TakePayload { dst, obj, i };
             }
+            Op::GetIndex { dst, obj, i } if component_dead_after(code, ip, obj, names, Component::Index(i), None) => {
+                code[ip] = Op::TakeIndex { dst, obj, i };
+            }
             Op::TestTag { obj, name, n, to } => {
                 if let Some(drop) = branch_drops(&live, words, n_regs, ip, to as usize, code.len(), &mut drops) {
                     code[ip] = Op::TestTagDrop { obj, name, n, to, drop };
@@ -82,9 +85,10 @@ pub fn mark_takes(code: &mut [Op], n_regs: u16, names: &[&str]) -> Vec<(Vec<Reg>
             Op::UpdateRecord { dst, obj, name, base, n, take: false } => {
                 // The op reads `obj` twice if the record is also one of the field
                 // values, and taking it would empty the register before the second
-                // read. Only a single read can be a last read.
+                // read. Only a single read can be a last read. Writing the result
+                // back over `obj` ends the old value there whatever is live after.
                 let once = !(base..base.saturating_add(n)).contains(&obj);
-                if once && !get(&out, obj) {
+                if once && (dst == obj || !get(&out, obj)) {
                     code[ip] = Op::UpdateRecord { dst, obj, name, base, n, take: true };
                 }
             }
@@ -122,6 +126,7 @@ fn branch_drops(live: &[u64], words: usize, n_regs: u16, ip: usize, to: usize, l
 enum Component<'a> {
     Field(&'a str),
     Payload(u16),
+    Index(u16),
 }
 
 fn field_dead_after(code: &[Op], ip: usize, obj: Reg, names: &[&str], name: u16) -> bool {
@@ -181,7 +186,16 @@ fn jump_targets(code: &[Op]) -> Vec<bool> {
 /// well-typed program cannot do.
 fn component_dead_after(code: &[Op], ip: usize, obj: Reg, names: &[&str], part: Component, tag: Option<u16>) -> bool {
     // The instruction itself overwrites the register: nothing can read the rest.
-    if matches!(code[ip], Op::GetField { dst, .. } | Op::GetPayload { dst, .. } | Op::TakeField { dst, .. } | Op::TakePayload { dst, .. } if dst == obj) {
+    if matches!(
+        code[ip],
+        Op::GetField { dst, .. }
+            | Op::GetPayload { dst, .. }
+            | Op::GetIndex { dst, .. }
+            | Op::TakeField { dst, .. }
+            | Op::TakePayload { dst, .. }
+            | Op::TakeIndex { dst, .. }
+            if dst == obj
+    ) {
         return true;
     }
     let name = |i: u16| names.get(i as usize).copied();
@@ -234,13 +248,30 @@ fn component_dead_after(code: &[Op], ip: usize, obj: Reg, names: &[&str], part: 
                 !matches!(part, Component::Field(f) if Some(f) != name(n))
             }
             Op::GetPayload { obj: o, i, .. } | Op::TakePayload { obj: o, i, .. } if o == obj => {
-                part == Component::Payload(i)
+                !matches!(part, Component::Payload(p) if p != i)
+            }
+            Op::GetIndex { obj: o, i, .. } | Op::TakeIndex { obj: o, i, .. } if o == obj => {
+                !matches!(part, Component::Index(p) if p != i)
             }
             Op::GetRest { obj: o, name: n, n: count, .. } if o == obj => match part {
                 Component::Field(f) => !(n..n.saturating_add(count)).any(|k| name(k) == Some(f)),
-                Component::Payload(_) => true,
+                Component::Payload(_) | Component::Index(_) => true,
             },
-            Op::TestTag { obj: o, .. } | Op::TestTagDrop { obj: o, .. } | Op::TestRecord { obj: o, .. } | Op::NoMatch { obj: o }
+            // A record update copies every field except the ones it replaces, so a
+            // field it replaces may already have been moved out. The new values are
+            // read too, and one of them may be the whole record.
+            Op::UpdateRecord { obj: o, name: n, n: count, base, .. } if o == obj => {
+                (base..base.saturating_add(count)).contains(&obj)
+                    || match part {
+                        Component::Field(f) => !(n..n.saturating_add(count)).any(|k| name(k) == Some(f)),
+                        Component::Payload(_) | Component::Index(_) => true,
+                    }
+            }
+            Op::TestTag { obj: o, .. }
+            | Op::TestTagDrop { obj: o, .. }
+            | Op::TestRecord { obj: o, .. }
+            | Op::TestTuple { obj: o, .. }
+            | Op::NoMatch { obj: o }
                 if o == obj =>
             {
                 false
@@ -411,6 +442,7 @@ pub(super) fn successors(op: &Op, ip: usize, len: usize, mut f: impl FnMut(usize
         | Op::TakeField { .. }
         | Op::GetOptField { .. }
         | Op::GetIndex { .. }
+        | Op::TakeIndex { .. }
         | Op::GetPayload { .. }
         | Op::TakePayload { .. }
         | Op::GetRest { .. }
@@ -507,6 +539,7 @@ fn reads(op: &Op, out: &mut Vec<Reg>) {
         | Op::TakeField { obj, .. }
         | Op::GetOptField { obj, .. }
         | Op::GetIndex { obj, .. }
+        | Op::TakeIndex { obj, .. }
         | Op::GetPayload { obj, .. }
         | Op::TakePayload { obj, .. }
         | Op::GetFieldOr { obj, .. }
@@ -570,6 +603,7 @@ fn kills(op: &Op, out: &mut Vec<Reg>) {
         | Op::TakeField { dst, .. }
         | Op::GetOptField { dst, .. }
         | Op::GetIndex { dst, .. }
+        | Op::TakeIndex { dst, .. }
         | Op::GetPayload { dst, .. }
         | Op::TakePayload { dst, .. }
         | Op::GetRest { dst, .. }
@@ -799,5 +833,91 @@ mod tests {
         ];
         mark_takes(&mut code, 4, &[]);
         assert!(matches!(code[0], Op::UpdateRecord { take: false, .. }), "{:?}", code[0]);
+    }
+
+    /// `{ ..r, xs: r.xs.append(x) }`: the update copies every field except `xs`, so
+    /// the `xs` read before it is the last one and may move the list out.
+    #[test]
+    fn a_field_the_update_replaces_is_taken() {
+        let mut code = vec![
+            Op::GetField { dst: 3, obj: 1, name: 0 },
+            Op::UpdateRecord { dst: 2, obj: 1, name: 1, base: 3, n: 1, take: false },
+            Op::Ret { src: 2 },
+        ];
+        mark_takes(&mut code, 8, &["xs", "xs"]);
+        assert!(matches!(code[0], Op::TakeField { .. }), "{:?}", code[0]);
+    }
+
+    /// The update keeps `xs` when it replaces only `n`, so `xs` is read again.
+    #[test]
+    fn a_field_the_update_keeps_is_not_taken() {
+        let mut code = vec![
+            Op::GetField { dst: 3, obj: 1, name: 0 },
+            Op::UpdateRecord { dst: 2, obj: 1, name: 1, base: 3, n: 1, take: false },
+            Op::Ret { src: 2 },
+        ];
+        mark_takes(&mut code, 8, &["xs", "n"]);
+        assert!(matches!(code[0], Op::GetField { .. }), "{:?}", code[0]);
+    }
+
+    /// `{ ..r, xs: r.xs.append(x), n: List.len(r.xs) }`: read twice, so neither read
+    /// takes, even though the update itself replaces `xs`.
+    #[test]
+    fn a_replaced_field_read_twice_is_not_taken() {
+        let mut code = vec![
+            Op::GetField { dst: 3, obj: 1, name: 0 },
+            Op::GetField { dst: 4, obj: 1, name: 0 },
+            Op::UpdateRecord { dst: 2, obj: 1, name: 1, base: 3, n: 2, take: false },
+            Op::Ret { src: 2 },
+        ];
+        mark_takes(&mut code, 8, &["xs", "xs", "n"]);
+        assert!(matches!(code[0], Op::GetField { .. }), "{:?}", code[0]);
+    }
+
+    /// `$r = { ..$r, .. }` round a loop: the update writes over its own source, so
+    /// the old record is dead there even though the register is read again.
+    #[test]
+    fn an_update_written_back_over_its_source_is_taken() {
+        let mut code = vec![
+            Op::UpdateRecord { dst: 1, obj: 1, name: 0, base: 2, n: 1, take: false },
+            Op::Jump { to: 0 },
+        ];
+        mark_takes(&mut code, 4, &["xs"]);
+        assert!(matches!(code[0], Op::UpdateRecord { take: true, .. }), "{:?}", code[0]);
+    }
+
+    /// `(t.0.append(x), t.1 + 1)`: a different element is read next, so `t.0` moves.
+    #[test]
+    fn a_tuple_element_nothing_reads_again_is_taken() {
+        let mut code = vec![
+            Op::GetIndex { dst: 2, obj: 1, i: 0 },
+            Op::GetIndex { dst: 3, obj: 1, i: 1 },
+            Op::Ret { src: 1 },
+        ];
+        mark_takes(&mut code, 8, &[]);
+        assert!(matches!(code[0], Op::GetIndex { .. }), "{:?}", code[0]);
+        let mut code = vec![
+            Op::GetIndex { dst: 2, obj: 1, i: 0 },
+            Op::GetIndex { dst: 3, obj: 1, i: 1 },
+            Op::MakeTuple { dst: 1, base: 2, n: 2 },
+            Op::Ret { src: 1 },
+        ];
+        mark_takes(&mut code, 8, &[]);
+        assert!(matches!(code[0], Op::TakeIndex { i: 0, .. }), "{:?}", code[0]);
+        assert!(matches!(code[1], Op::TakeIndex { i: 1, .. }), "{:?}", code[1]);
+    }
+
+    /// The same element read twice: the first read must leave it.
+    #[test]
+    fn a_tuple_element_read_again_is_not_taken() {
+        let mut code = vec![
+            Op::GetIndex { dst: 2, obj: 1, i: 0 },
+            Op::GetIndex { dst: 3, obj: 1, i: 0 },
+            Op::MakeTuple { dst: 1, base: 2, n: 2 },
+            Op::Ret { src: 1 },
+        ];
+        mark_takes(&mut code, 8, &[]);
+        assert!(matches!(code[0], Op::GetIndex { .. }), "{:?}", code[0]);
+        assert!(matches!(code[1], Op::TakeIndex { .. }), "{:?}", code[1]);
     }
 }
