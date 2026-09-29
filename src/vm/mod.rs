@@ -334,6 +334,8 @@ pub enum Op {
     GetFieldOr { dst: Reg, obj: Reg, name: u16, to: u32 },
     /// `GetPayload`, moving a unique container out as `TakeField` does.
     TakePayload { dst: Reg, obj: Reg, i: u16 },
+    /// `GetIndex`, moving a unique container out as `TakeField` does.
+    TakeIndex { dst: Reg, obj: Reg, i: u16 },
     /// `GetFieldOr`, moving a unique container out as `TakeField` does.
     TakeFieldOr { dst: Reg, obj: Reg, name: u16, to: u32 },
     /// `dst =` the record's fields that `names[name .. name + n]` does not name.
@@ -789,6 +791,13 @@ fn take_payload(slot: &mut Value, i: usize) -> Option<Value> {
     worth_taking(value).then(|| std::mem::replace(value, Value::Unit))
 }
 
+/// `take_field` for a tuple's element `i` (`TakeIndex`).
+fn take_index(slot: &mut Value, i: usize) -> Option<Value> {
+    let Value::Tuple(items) = slot else { return None };
+    let value = Rc::get_mut(items)?.get_mut(i)?;
+    worth_taking(value).then(|| std::mem::replace(value, Value::Unit))
+}
+
 /// A value whose uniqueness is worth keeping: the containers an in-place builtin
 /// changes. A scalar is as cheap to copy as to move.
 fn worth_taking(value: &Value) -> bool {
@@ -1241,7 +1250,12 @@ impl Vm {
                     for i in 0..n as usize {
                         let field = names[name as usize + i];
                         match fields.iter_mut().find(|(f, _)| *f == field) {
-                            Some(slot) => slot.1 = regs[base + b as usize + i].clone(),
+                            // Taken, not cloned, as `MakeRecord` does: the compiler
+                            // evaluates the new values into fresh temporaries above
+                            // `obj`, dead once this op runs. A clone left a second
+                            // handle to the new value until the register was reused,
+                            // so `{ ..r, a: r.a.append(x) }` found `a` shared next time.
+                            Some(slot) => slot.1 = std::mem::replace(&mut regs[base + b as usize + i], Value::Unit),
                             None => {
                                 return Err(locate_error(&program, chunk_id, ip, EvalError {
                                     message: format!("Record has no field `{}` to update", field),
@@ -1302,6 +1316,20 @@ impl Vm {
                             Value::Tag(_, payload) => payload[i as usize].clone(),
                             Value::Missing => Value::bare("MissingField"),
                             other => other.clone(),
+                        },
+                    };
+                    regs[base + dst as usize] = value;
+                }
+                Op::TakeIndex { dst, obj, i } => {
+                    let value = match take_index(&mut regs[base + obj as usize], i as usize) {
+                        Some(value) => value,
+                        None => match &regs[base + obj as usize] {
+                            Value::Tuple(items) if (i as usize) < items.len() => items[i as usize].clone(),
+                            other => {
+                                return Err(locate_error(&program, chunk_id, ip, EvalError {
+                                    message: format!("Cannot index .{} on {}", i, other),
+                                }))
+                            }
                         },
                     };
                     regs[base + dst as usize] = value;
