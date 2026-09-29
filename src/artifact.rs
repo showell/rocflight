@@ -22,7 +22,7 @@ use crate::types::Type;
 
 /// Bumped whenever the FORMAT changes, so an artifact from an older tree is rejected by
 /// `build.rs` rather than decoded as nonsense.
-pub const MAGIC: &[u8; 8] = b"ROCFLT09";
+pub const MAGIC: &[u8; 8] = b"ROCFLT10";
 
 /// FNV-1a of the source an artifact was built from. `build.rs` computes the same thing
 /// over `src/roc/Builtin.roc` and refuses to build if they differ.
@@ -1053,6 +1053,7 @@ op_codec! {
     59 TakePayload { dst: r, obj: r, i: u16, },
     60 TestTagDrop { obj: r, name: u16, n: u16, to: u32, drop: u16, },
     61 JumpFalseDrop { cond: r, to: u32, kind: cond, drop: u16, },
+    62 TakeIndex { dst: r, obj: r, i: u16, },
 }
 
 fn binop_tag(op: crate::ast::BinOp) -> u8 {
