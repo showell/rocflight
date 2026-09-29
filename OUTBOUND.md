@@ -11,7 +11,7 @@ What we have out upstream, and which gates each item's current head passed (tier
 | #1 | `module-imports` | `0dfe7fb` | Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
 | #22 | `fast-track-runs` | `484cf04` | Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
 | #23 | `smaller-fixes` | `d5c4fee` | Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
-| #25 | `node-types` | `ecb964e` | Tier 2 in `all-prs` `d85405d` | 2026-09-29 | #23 |
+| #25 | `node-types` | `9172c59` | branch gates under 09-07; Tier 2 in `all-prs` `2c46f6d` | 2026-09-29 | #23 |
 | #27 | `nightly-09-27` | `92dfe53` | branch gates under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-28 | |
 | #28 | `builtin-09-27` | `222afb5` | branch gates and `check_builtin --strict` under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-29 | #27 |
 | #29 | `json-numbers` | `a3f7d09` | branch gates under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-29 | #28 |
@@ -19,13 +19,13 @@ What we have out upstream, and which gates each item's current head passed (tier
 | #31 | `list-copies` | `a824e7b` | branch gates under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-29 | #27 |
 | #32 | `issue-6-list-copy` | `42c53ff` | branch gates under 09-27; Tier 2 in `all-prs` `46ecb76` | 2026-09-29 | #27 |
 | #33 | `num-runtime-sweep` | `314fb60` | branch gates under 09-27; Tier 2 in `all-prs` `8f475fd` | 2026-09-29 | #28, #25 (and #23) |
+| #34 | `record-tuple-moves` | `1a8cdcd` | branch gates under 09-27; Tier 2 in `all-prs` `2c46f6d` | 2026-09-29 | #31 |
 
-The work in #28 to #33 is by the cloud Claude, cherry-picked with `-x`.
+The work in #28 to #34 is by the cloud Claude, cherry-picked with `-x`.
 
 ## Held here, not yet sent
 
-- **`cloud/h2` `75932a9`:** H's moves for record-update syntax and tuple elements. It's for the next batch, then a PR stacked on #31.
-- **`node-types`, uncommitted:** a range answers only `Range`'s methods. It's for the next batch.
+Nothing. The cloud Claude's next work, slice-backed lists (NOTES (18), approved in (20)), isn't started.
 
 ## Issues filed
 
