@@ -505,8 +505,8 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     Ok(Some(Ran { value, is_app: app_entry_point.is_some(), inspected, elapsed: started.elapsed() }))
 }
 
-/// The directory of each package the app header names, by alias: `cdx: "./codex/main.roc"`
-/// is `./codex`, relative to the app; a URL is the directory `roc` extracted it to, when
+/// The directory of each package the app header names, by alias: `lib: "./lib/main.roc"`
+/// is `./lib`, relative to the app; a URL is the directory `roc` extracted it to, when
 /// it has. Platforms are not packages here: `platform::real` loads those.
 fn package_dirs(
     dependencies: &[(String, String, bool)],
